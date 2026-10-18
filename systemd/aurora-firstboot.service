@@ -1,7 +1,7 @@
 [Unit]
 Description=Create the Aurora Linux owner account
 ConditionPathExists=/var/lib/aurora/firstboot/pending
-After=local-fs.target systemd-user-sessions.service
+After=local-fs.target systemd-user-sessions.service systemd-vconsole-setup.service
 Before=display-manager.service getty@tty1.service
 RequiresMountsFor=/boot /boot/efi /home
 

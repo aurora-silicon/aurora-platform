@@ -12,6 +12,13 @@ trap 'unset password confirmation; stty echo 2>/dev/null || true' EXIT
 install -d -m 0700 "$state"
 [[ $(findmnt -nro FSTYPE /) == btrfs ]] || fail 'This image requires a Btrfs root'
 btrfs filesystem resize max /
+# Release the boot splash before this service owns the interactive console.
+if command -v plymouth >/dev/null; then
+  plymouth quit || true
+fi
+if command -v chvt >/dev/null; then
+  chvt 1 || true
+fi
 username=""
 hostname=""
 if [[ -e $state/owner ]]; then
