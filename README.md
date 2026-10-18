@@ -11,3 +11,6 @@ The imported converter is byte-preserved under `vendor/`, with its exact content
 The converter requires cryptsetup 2.8 or newer, matching the target Fedora 44 and current ALARM packages; the native conversion CI uses that target userspace. Older Ubuntu 24.04 cryptsetup rejects the bounded conversion arguments and is not a supported runtime.
 
 Run unprivileged checks with `python3 -m unittest discover -s tests`. `tests/loop-conversion` requires root in a disposable native CI worker and is restricted to its own newly created loop-backed disk. It must not be run on a user's ordinary disk.
+
+
+The privileged conversion test shares the worker's IPC namespace with its udev daemon. Device-mapper uses IPC semaphores for udev completion; a private container IPC namespace can leave `cryptsetup open` waiting after successful conversion. This affects the disposable container test environment; the installed initrd retains ordinary udev synchronization. See [Red Hat's documented container cryptsetup issue](https://docs.redhat.com/en/documentation/red_hat_openstack_platform/12/pdf/release_notes/Red_Hat_OpenStack_Platform-12-Release_Notes-en-US.pdf).

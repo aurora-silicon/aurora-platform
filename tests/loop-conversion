@@ -10,11 +10,11 @@ loop=""
 cleanup() {
   set +e
   for target in /run/aurora-root/root /run/aurora-root/esp /run/aurora-root/boot /run/omarchy-mac-encrypt/probe /run/omarchy-mac-encrypt/shrink "$scratch/mnt"; do
-    mountpoint -q "$target" && umount "$target"
+    mountpoint -q "$target" && timeout --kill-after=2s 5s umount "$target"
   done
   [[ -z $loop ]] || {
-    if cryptsetup status root >/dev/null 2>&1; then cryptsetup close root; fi
-    losetup -d "$loop"
+    if cryptsetup status root >/dev/null 2>&1; then timeout --kill-after=2s 5s cryptsetup close root; fi
+    timeout --kill-after=2s 5s losetup -d "$loop"
   }
 }
 trap cleanup EXIT
