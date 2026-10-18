@@ -24,7 +24,7 @@ jobs:
           docker run --rm --privileged -v /dev:/dev -v /run/udev:/run/udev:ro \
             -v "$PWD:/src" -w /src registry.fedoraproject.org/fedora:44 \
             bash -euo pipefail -c '
-              dnf install -y btrfs-progs cryptsetup dosfstools util-linux systemd-udev findutils gawk
+              dnf install -y btrfs-progs cryptsetup dosfstools e2fsprogs util-linux systemd-udev findutils gawk
               cryptsetup --version
               unshare --mount --propagation private bash tests/loop-conversion
             ' 2>&1 | tee conversion.log
