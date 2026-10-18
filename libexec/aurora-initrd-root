@@ -30,6 +30,7 @@ ESP_PARTUUID=$(tr -d '\000' < "$property")
 [[ $ESP_PARTUUID =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || exit 1
 udevadm settle
 ESP_DEVICE=/dev/disk/by-partuuid/$ESP_PARTUUID
+udevadm wait --timeout=60 "$ESP_DEVICE"
 ESP_UUID=$(blkid -c /dev/null -s UUID -o value "$ESP_DEVICE")
 [[ $ESP_UUID =~ ^[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}$ ]] || exit 1
 
@@ -44,6 +45,7 @@ omarchy_mac_encrypt_mount_esp() {
 
 omarchy_mac_encrypt_mount_boot() {
   local boot_device=/dev/disk/by-uuid/$BOOT_UUID parent esp_parent
+  udevadm wait --timeout=60 "$boot_device"
   [[ -b $boot_device ]] || return 1
   parent=$(lsblk -ndo PKNAME "$boot_device")
   esp_parent=$(lsblk -ndo PKNAME "$ESP_DEVICE")
