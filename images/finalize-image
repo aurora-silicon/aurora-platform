@@ -59,6 +59,8 @@ touch "$scratch/root/var/lib/aurora/firstboot/pending"
 [[ ! -e $scratch/root/boot/omarchy/luks-key ]]
 [[ ! -e $scratch/root/var/lib/aurora/firstboot/luks-key ]]
 chroot "$scratch/root" systemctl enable aurora-firstboot.service
+# Aurora owns account setup on tty1; the generic base wizard must not compete.
+chroot "$scratch/root" systemctl mask systemd-firstboot.service
 if [[ $backend == dracut ]]; then
   chroot "$scratch/root" systemctl disable initial-setup.service initial-setup-graphical.service 2>/dev/null || true
   rm -f "$scratch/root/etc/reconfigSys"
