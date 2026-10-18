@@ -38,7 +38,7 @@ omarchy_mac_encrypt_say() { printf 'aurora-root: %s\n' "$*"; }
 omarchy_mac_encrypt_mount_esp() {
   ESP_MNT=/run/aurora-root/esp
   mkdir -p "$ESP_MNT"
-  mount -o ro -t vfat "$ESP_DEVICE" "$ESP_MNT"
+  mount -o ro -t vfat "$ESP_DEVICE" "$ESP_MNT" || return 1
   ESP_MOUNTED=1
 }
 
@@ -51,7 +51,7 @@ omarchy_mac_encrypt_mount_boot() {
     omarchy_mac_encrypt_fail 'Boot and the handed-off EFI partition are on different disks'
   BOOT_MNT=/run/aurora-root/boot
   mkdir -p "$BOOT_MNT"
-  mount -t ext4 "$boot_device" "$BOOT_MNT"
+  mount -t ext4 "$boot_device" "$BOOT_MNT" || return 1
   BOOT_MOUNTED=1
 }
 
@@ -84,7 +84,7 @@ omarchy_mac_encrypt_fresh_image() {
 omarchy_mac_encrypt_mount_opened() {
   ROOT_MNT=/run/aurora-root/root
   mkdir -p "$ROOT_MNT"
-  mount -o subvol=root /dev/mapper/root "$ROOT_MNT"
+  mount -o subvol=root /dev/mapper/root "$ROOT_MNT" || return 1
   ROOT_MOUNTED=1
 }
 

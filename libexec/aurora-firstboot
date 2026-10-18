@@ -7,6 +7,9 @@ state=/var/lib/aurora/firstboot
 [[ -f $state/pending ]] || exit 0
 [[ -f /usr/lib/aurora/image-format && $(</usr/lib/aurora/image-format) == aurora-btrfs-v1 ]] || exit 1
 fail() { printf '\nAurora setup: %s\n' "$*" >&2; exit 1; }
+for tool in getent findmnt btrfs useradd usermod chpasswd visudo cryptsetup python3 cut sync; do
+  command -v "$tool" >/dev/null || fail "Required setup command is missing: $tool"
+done
 trap 'unset password confirmation; stty echo 2>/dev/null || true' EXIT
 [[ ! -e /run/omarchy-mac-encrypt.failed ]] || fail "Root preparation failed: $(</run/omarchy-mac-encrypt.failed)"
 install -d -m 0700 "$state"
@@ -142,7 +145,9 @@ if command -v restorecon >/dev/null; then
   restorecon -RF "/home/$username" /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers.d
 fi
 printf '%s\n' "$username" > "$state/complete"
-sync "$state/complete" /etc/passwd /etc/shadow /etc/group /etc/gshadow
+account_files=(/etc/passwd /etc/shadow /etc/group)
+[[ ! -e /etc/gshadow ]] || account_files+=(/etc/gshadow)
+sync "$state/complete" "${account_files[@]}"
 rm -- "$state/pending"
 sync "$state"
 printf '\nAurora setup is complete. Sign in as %s.\n' "$username"
