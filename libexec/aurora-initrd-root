@@ -104,10 +104,18 @@ omarchy_mac_encrypt_finish() {
   omarchy_mac_encrypt_write_state configured
 }
 
+aurora_verify_opened_root() {
+  local observed
+  observed=$(blkid -c /dev/null -s UUID -o value /dev/mapper/root)
+  [[ $observed == "$AURORA_ROOT_UUID" ]] ||
+    omarchy_mac_encrypt_fail 'The opened root UUID differs from this image'
+}
+
 omarchy_mac_encrypt_open_continue() {
   if [[ $STATE_PHASE == encrypted ]]; then
     omarchy_mac_encrypt_require_key
     omarchy_mac_encrypt_finish
+    aurora_verify_opened_root
     omarchy_mac_encrypt_point_sysroot
     return
   fi
@@ -115,6 +123,7 @@ omarchy_mac_encrypt_open_continue() {
   if [[ -f $key && ! -L $key && $(stat -c %s "$key") -eq $KEY_BYTES ]]; then
     BOOT_KEY=$key
     if omarchy_mac_encrypt_open; then
+      aurora_verify_opened_root
       omarchy_mac_encrypt_point_sysroot
       return
     fi
@@ -124,6 +133,7 @@ omarchy_mac_encrypt_open_continue() {
     if printf '%s' "$answer" | cryptsetup open --key-file=- "$ROOT_DEV" root; then
       unset answer
       udevadm settle
+      aurora_verify_opened_root
       omarchy_mac_encrypt_point_sysroot
       return
     fi

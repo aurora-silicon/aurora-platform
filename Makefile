@@ -2,7 +2,9 @@ PREFIX ?= /usr
 DESTDIR ?=
 LIBDIR = $(PREFIX)/lib
 
-install:
+install: install-common install-dracut install-mkinitcpio
+
+install-common:
 	install -Dm755 libexec/aurora-initrd-root $(DESTDIR)$(LIBDIR)/aurora/aurora-initrd-root
 	install -Dm755 libexec/aurora-firstboot $(DESTDIR)$(LIBDIR)/aurora/aurora-firstboot
 	install -Dm644 vendor/omarchy-mac-encrypt $(DESTDIR)$(LIBDIR)/aurora/vendor/omarchy-mac-encrypt
@@ -12,5 +14,9 @@ install:
 	install -Dm644 systemd/aurora-firstboot.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-firstboot.service
 	install -Dm644 systemd/aurora-display-manager.conf $(DESTDIR)$(LIBDIR)/systemd/system/display-manager.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-getty.conf $(DESTDIR)$(LIBDIR)/systemd/system/getty@.service.d/aurora-firstboot.conf
+
+install-dracut:
 	install -Dm755 dracut/97aurora-root/module-setup.sh $(DESTDIR)$(LIBDIR)/dracut/modules.d/97aurora-root/module-setup.sh
+
+install-mkinitcpio:
 	install -Dm644 mkinitcpio/aurora-root $(DESTDIR)$(LIBDIR)/initcpio/install/aurora-root

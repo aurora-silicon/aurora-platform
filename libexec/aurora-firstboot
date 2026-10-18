@@ -10,6 +10,8 @@ fail() { printf '\nAurora setup: %s\n' "$*" >&2; exit 1; }
 trap 'unset password confirmation; stty echo 2>/dev/null || true' EXIT
 [[ ! -e /run/omarchy-mac-encrypt.failed ]] || fail "Root preparation failed: $(</run/omarchy-mac-encrypt.failed)"
 install -d -m 0700 "$state"
+[[ $(findmnt -nro FSTYPE /) == btrfs ]] || fail 'This image requires a Btrfs root'
+btrfs filesystem resize max /
 username=""
 hostname=""
 if [[ -e $state/owner ]]; then
@@ -108,10 +110,10 @@ esac
 unset password
 
 if [[ -e /etc/NIXOS ]]; then
-  [[ -f /etc/nixos/machine.nix ]] || fail 'The installed NixOS machine configuration is missing'
+  [[ -f /etc/nixos/owner.nix ]] || fail 'The installed NixOS machine configuration is missing'
   getent shadow "$username" | cut -d: -f2 > /var/lib/aurora/owner-password.hash
   chmod 0600 /var/lib/aurora/owner-password.hash
-  cat > /etc/nixos/machine.nix.new <<EOF
+  cat > /etc/nixos/owner.nix.new <<EOF
 # Aurora image machine configuration
 { ... }: {
   networking.hostName = "$hostname";
@@ -122,7 +124,7 @@ if [[ -e /etc/NIXOS ]]; then
   };
 }
 EOF
-  mv /etc/nixos/machine.nix.new /etc/nixos/machine.nix
+  mv /etc/nixos/owner.nix.new /etc/nixos/owner.nix
   sync /etc/nixos /var/lib/aurora/owner-password.hash
 fi
 if command -v restorecon >/dev/null; then
