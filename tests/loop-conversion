@@ -70,6 +70,17 @@ mount -o subvol=root /dev/mapper/root "$scratch/mnt"
 grep -qx 'Aurora conversion preserves filesystem content' "$scratch/mnt/proof"
 [[ $(stat -c %s "$scratch/mnt/var/lib/aurora/firstboot/luks-key") == 64 ]]
 umount "$scratch/mnt"
+# Resume a configured conversion with its temporary key, then repeat the
+# post-conversion phase to model a stop before its configuration commit.
+cryptsetup close root
+timeout --kill-after=5s 120s bash -x "$repo/libexec/aurora-initrd-root"
+[[ -b /dev/mapper/root ]]
+cryptsetup close root
+mount "$boot" "$scratch/mnt"
+sed -i 's/^phase=configured$/phase=encrypted/' "$scratch/mnt/omarchy/encrypt.state"
+umount "$scratch/mnt"
+timeout --kill-after=5s 120s bash -x "$repo/libexec/aurora-initrd-root"
+[[ -b /dev/mapper/root ]]
 mount "$boot" "$scratch/mnt"
 grep -qx phase=configured "$scratch/mnt/omarchy/encrypt.state"
 key=$scratch/mnt/omarchy/luks-key
@@ -84,4 +95,4 @@ cryptsetup close root
 # Exercise the configured/bootstrap-key resume before owner retirement on a
 # separate owner slot: the revoked key must not be used to open the mapping.
 # Password prompting is verified in a booted initrd/hardware qualification.
-echo 'PASS plaintext decline, real Btrfs-to-LUKS conversion, content preservation and owner-key replacement'
+echo 'PASS plaintext decline, real Btrfs-to-LUKS conversion, content preservation, configured/encrypted resume and owner-key replacement'
