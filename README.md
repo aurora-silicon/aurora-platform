@@ -8,4 +8,6 @@ The image contract uses a Btrfs root subvolume named `root`, an ext4 boot filesy
 
 The imported converter is byte-preserved under `vendor/`, with its exact content digest and source provenance. Aurora's wrapper and distro integrations are new work. Source checks and disposable native loop-device tests are separate from real initrd keyboard, reboot, interruption and hardware qualification. **No new distribution installation is qualified by this repository yet.**
 
+The converter requires cryptsetup 2.8 or newer, matching the target Fedora 44 and current ALARM packages; the native conversion CI uses that target userspace. Older Ubuntu 24.04 cryptsetup rejects the bounded conversion arguments and is not a supported runtime.
+
 Run unprivileged checks with `python3 -m unittest discover -s tests`. `tests/loop-conversion` requires root in a disposable native CI worker and is restricted to its own newly created loop-backed disk. It must not be run on a user's ordinary disk.
