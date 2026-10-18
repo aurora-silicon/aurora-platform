@@ -53,7 +53,7 @@ mkdir -p "$scratch/mnt/omarchy"
 printf 'format=1\nencrypt=0\nlane=edge\n' > "$scratch/mnt/omarchy/install.conf"
 umount "$scratch/mnt"
 before=$(sha256sum "$root")
-bash "$repo/libexec/aurora-initrd-root"
+timeout --kill-after=5s 120s bash -x "$repo/libexec/aurora-initrd-root"
 [[ $(sha256sum "$root") == "$before" ]]
 mount "$boot" "$scratch/mnt"
 grep -qx phase=declined "$scratch/mnt/omarchy/encrypt.state"
@@ -63,7 +63,7 @@ umount "$scratch/mnt"
 mount "$esp" "$scratch/mnt"
 printf 'format=1\nencrypt=1\nlane=edge\n' > "$scratch/mnt/omarchy/install.conf"
 umount "$scratch/mnt"
-bash "$repo/libexec/aurora-initrd-root"
+timeout --kill-after=5s 120s bash -x "$repo/libexec/aurora-initrd-root"
 cryptsetup isLuks "$root"
 [[ -b /dev/mapper/root ]]
 mount -o subvol=root /dev/mapper/root "$scratch/mnt"
