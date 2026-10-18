@@ -1,0 +1,18 @@
+[Unit]
+Description=Prepare and unlock the Aurora root filesystem
+DefaultDependencies=no
+Wants=systemd-udevd.service systemd-udev-trigger.service systemd-udev-settle.service
+After=systemd-udevd.service systemd-udev-trigger.service systemd-udev-settle.service
+After=aurora-vendor-firmware.service aurora-vendorfw-initrd.service omarchy-vendorfw-initrd.service
+After=plymouth-start.service
+Before=cryptsetup-pre.target sysroot.mount initrd-root-device.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=infinity
+ExecStart=/usr/lib/aurora/aurora-initrd-root
+StandardOutput=journal
+StandardError=journal

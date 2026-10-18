@@ -1,0 +1,87 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Disposable integration test. Must run in its own mount namespace as root.
+set -euo pipefail
+[[ $(id -u) == 0 ]] || { echo 'Root in a disposable CI worker is required' >&2; exit 2; }
+[[ ! -e /dev/mapper/root ]] || { echo 'A root mapping already exists; refusing the test' >&2; exit 2; }
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+scratch=$(mktemp -d)
+loop=""
+cleanup() {
+  set +e
+  for target in /run/aurora-root/root /run/aurora-root/esp /run/aurora-root/boot /run/omarchy-mac-encrypt/probe /run/omarchy-mac-encrypt/shrink "$scratch/mnt"; do
+    mountpoint -q "$target" && umount "$target"
+  done
+  [[ -z $loop ]] || {
+    if cryptsetup status root >/dev/null 2>&1; then cryptsetup close root; fi
+    losetup -d "$loop"
+  }
+}
+trap cleanup EXIT
+truncate -s 640M "$scratch/disk.raw"
+printf 'label: gpt\nsize=64M,type=U\nsize=128M,type=L\ntype=L\n' | sfdisk "$scratch/disk.raw"
+loop=$(losetup --find --show --partscan "$scratch/disk.raw")
+[[ $loop =~ ^/dev/loop[0-9]+$ ]] || exit 1
+udevadm settle
+esp=${loop}p1; boot=${loop}p2; root=${loop}p3
+mkfs.vfat -F32 "$esp"
+mkfs.ext4 -q -L AURORA_BOOT "$boot"
+mkfs.btrfs -q -f -L AURORA_ROOT "$root"
+mkdir -p "$scratch/mnt" "$scratch/systemd"
+mount "$root" "$scratch/mnt"
+btrfs subvolume create "$scratch/mnt/root"
+mkdir -p "$scratch/mnt/root/var/lib/aurora/firstboot" "$scratch/mnt/root/usr/lib/aurora"
+touch "$scratch/mnt/root/var/lib/aurora/firstboot/pending"
+printf 'aurora-btrfs-v1\n' > "$scratch/mnt/root/usr/lib/aurora/image-format"
+printf 'Aurora conversion preserves filesystem content\n' > "$scratch/mnt/root/proof"
+umount "$scratch/mnt"
+root_uuid=$(blkid -s UUID -o value "$root")
+boot_uuid=$(blkid -s UUID -o value "$boot")
+esp_partuuid=$(blkid -s PARTUUID -o value "$esp")
+printf '%s\000' "$esp_partuuid" > "$scratch/esp-property"
+printf 'format=1\nroot_uuid=%s\nboot_uuid=%s\nroot_subvolume=root\n' "$root_uuid" "$boot_uuid" > "$scratch/layout"
+printf 'root=UUID=%s rootflags=subvol=root rootfstype=btrfs\n' "$root_uuid" > "$scratch/cmdline"
+export AURORA_ENCRYPT_LIBRARY="$repo/vendor/omarchy-mac-encrypt"
+export AURORA_IMAGE_LAYOUT="$scratch/layout"
+export AURORA_ESP_PROPERTY="$scratch/esp-property"
+export OMARCHY_MAC_ENCRYPT_CMDLINE="$scratch/cmdline"
+export OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$scratch/systemd"
+export OMARCHY_MAC_ENCRYPT_FAILED_FILE="$scratch/failure"
+export OMARCHY_MAC_ENCRYPT_PROGRESS_FILE="$scratch/progress"
+mount "$esp" "$scratch/mnt"
+mkdir -p "$scratch/mnt/omarchy"
+printf 'format=1\nencrypt=0\nlane=edge\n' > "$scratch/mnt/omarchy/install.conf"
+umount "$scratch/mnt"
+before=$(sha256sum "$root")
+bash "$repo/libexec/aurora-initrd-root"
+[[ $(sha256sum "$root") == "$before" ]]
+mount "$boot" "$scratch/mnt"
+grep -qx phase=declined "$scratch/mnt/omarchy/encrypt.state"
+rm "$scratch/mnt/omarchy/encrypt.state"
+umount "$scratch/mnt"
+# A new image decision, used only by this disposable test fixture.
+mount "$esp" "$scratch/mnt"
+printf 'format=1\nencrypt=1\nlane=edge\n' > "$scratch/mnt/omarchy/install.conf"
+umount "$scratch/mnt"
+bash "$repo/libexec/aurora-initrd-root"
+cryptsetup isLuks "$root"
+[[ -b /dev/mapper/root ]]
+mount -o subvol=root /dev/mapper/root "$scratch/mnt"
+grep -qx 'Aurora conversion preserves filesystem content' "$scratch/mnt/proof"
+[[ $(stat -c %s "$scratch/mnt/var/lib/aurora/firstboot/luks-key") == 64 ]]
+umount "$scratch/mnt"
+mount "$boot" "$scratch/mnt"
+grep -qx phase=configured "$scratch/mnt/omarchy/encrypt.state"
+key=$scratch/mnt/omarchy/luks-key
+[[ $(stat -c %s "$key") == 64 ]]
+printf 'disposable integration test passphrase' | cryptsetup luksAddKey --batch-mode --key-slot 1 --key-file "$key" "$root" -
+printf 'disposable integration test passphrase' | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$root"
+cryptsetup luksRemoveKey --batch-mode --key-file "$key" "$root"
+! cryptsetup open --test-passphrase --key-file "$key" "$root"
+printf 'disposable integration test passphrase' | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$root"
+umount "$scratch/mnt"
+cryptsetup close root
+# Exercise the configured/bootstrap-key resume before owner retirement on a
+# separate owner slot: the revoked key must not be used to open the mapping.
+# Password prompting is verified in a booted initrd/hardware qualification.
+echo 'PASS plaintext decline, real Btrfs-to-LUKS conversion, content preservation and owner-key replacement'

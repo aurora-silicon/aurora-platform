@@ -1,0 +1,136 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Linux account setup; macOS owner credentials never enter this interface.
+set -euo pipefail
+umask 077
+state=/var/lib/aurora/firstboot
+[[ -f $state/pending ]] || exit 0
+[[ -f /usr/lib/aurora/image-format && $(</usr/lib/aurora/image-format) == aurora-btrfs-v1 ]] || exit 1
+fail() { printf '\nAurora setup: %s\n' "$*" >&2; exit 1; }
+trap 'unset password confirmation; stty echo 2>/dev/null || true' EXIT
+[[ ! -e /run/omarchy-mac-encrypt.failed ]] || fail "Root preparation failed: $(</run/omarchy-mac-encrypt.failed)"
+install -d -m 0700 "$state"
+username=""
+hostname=""
+if [[ -e $state/owner ]]; then
+  [[ -f $state/owner && ! -L $state/owner ]] || fail 'Owner journal is invalid'
+  mapfile -t owner < "$state/owner"
+  (( ${#owner[@]} == 2 )) || fail 'Owner journal is incomplete'
+  username=${owner[0]}
+  hostname=${owner[1]}
+fi
+printf '\nWelcome to Aurora\n\nCreate your Linux account. Your macOS account stays separate.\n'
+if [[ -z $username ]]; then
+  read -r -p 'Linux username: ' username
+  [[ $username =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || fail 'Use a lowercase username, starting with a letter'
+  ! getent passwd "$username" >/dev/null || fail 'That username already exists'
+  read -r -p 'Computer name [aurora]: ' hostname
+  hostname=${hostname:-aurora}
+  [[ $hostname =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fail 'Use a computer name containing letters, numbers and hyphens'
+  printf '%s\n%s\n' "$username" "$hostname" > "$state/owner.new"
+  sync "$state/owner.new"
+  mv "$state/owner.new" "$state/owner"
+  sync "$state"
+else
+  [[ $username =~ ^[a-z][a-z0-9_-]{0,30}$ && $hostname =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fail 'Owner journal fields are invalid'
+  printf 'Resuming setup for %s on %s.\n' "$username" "$hostname"
+fi
+read -r -s -p 'Linux password (also unlocks an encrypted root): ' password
+printf '\n'
+read -r -s -p 'Retype password: ' confirmation
+printf '\n'
+[[ -n $password && $password == "$confirmation" ]] || fail 'Passwords do not match or are empty'
+unset confirmation
+if ! id "$username" >/dev/null 2>&1; then
+  shell=/bin/bash
+  [[ ! -x /run/current-system/sw/bin/bash ]] || shell=/run/current-system/sw/bin/bash
+  useradd --create-home --shell "$shell" "$username"
+fi
+uid=$(id -u "$username")
+(( uid >= 1000 && uid < 60000 )) || fail 'Owner account has an unexpected user ID'
+usermod --append --groups wheel "$username"
+printf '%s:%s\n' "$username" "$password" | chpasswd
+printf '%s\n' "$hostname" > /etc/hostname
+install -d -m 0755 /etc/sudoers.d
+printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-aurora-owner
+chmod 0440 /etc/sudoers.d/10-aurora-owner
+visudo -cf /etc/sudoers.d/10-aurora-owner >/dev/null
+
+# Read data, never source instructions, from the durable encryption journal.
+journal=/boot/omarchy/encrypt.state
+[[ -f $journal && ! -L $journal ]] || fail 'Root preparation journal is missing'
+phase=""; partition=""; uuid=""; format=""
+while IFS='=' read -r key value; do
+  case $key in
+    format) format=$value ;;
+    phase) phase=$value ;;
+    partition) partition=$value ;;
+    luks_uuid) uuid=$value ;;
+  esac
+done < "$journal"
+[[ $format == 1 ]] || fail 'Root preparation journal has an unsupported format'
+case $phase in
+  declined) ;;
+  configured|rekeyed|finished)
+    [[ $partition =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ &&
+       $uuid =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || fail 'Encrypted-root identity is invalid'
+    device=/dev/disk/by-partuuid/$partition
+    [[ $(cryptsetup luksUUID "$device") == "$uuid" ]] || fail 'Encrypted-root UUID differs from its journal'
+    key=$state/luks-key
+    if ! printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device"; then
+      [[ -f $key && ! -L $key ]] || fail 'The temporary encryption key is unavailable; use the original setup password to resume'
+      # An occupied owner slot is never replaced implicitly.
+      if cryptsetup luksDump --dump-json-metadata "$device" | python3 -c 'import json,sys; sys.exit(0 if "1" in json.load(sys.stdin)["keyslots"] else 1)'; then
+        fail 'Enter the password already used for this installation to resume'
+      fi
+      printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-slot 1 --key-file "$key" "$device" -
+    fi
+    printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Owner password did not unlock root'
+    if [[ -f $key ]]; then
+      if cryptsetup open --test-passphrase --key-file "$key" "$device"; then
+        cryptsetup luksRemoveKey --batch-mode --key-file "$key" "$device"
+      fi
+      if cryptsetup open --test-passphrase --key-file "$key" "$device"; then
+        fail 'The temporary encryption key is still usable'
+      fi
+    fi
+    printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Owner unlock failed after temporary-key removal'
+    # Both copies are retired only after the replacement unlock is proven.
+    rm -f -- "$state/luks-key" /boot/omarchy/luks-key
+    sync "$state" /boot/omarchy
+    printf 'format=1\nphase=finished\npartition=%s\nluks_uuid=%s\n' "$partition" "$uuid" > "$journal.new"
+    sync "$journal.new"
+    mv "$journal.new" "$journal"
+    sync /boot/omarchy
+    ;;
+  *) fail "Root preparation is incomplete (phase=$phase)" ;;
+esac
+unset password
+
+if [[ -e /etc/NIXOS ]]; then
+  [[ -f /etc/nixos/machine.nix ]] || fail 'The installed NixOS machine configuration is missing'
+  getent shadow "$username" | cut -d: -f2 > /var/lib/aurora/owner-password.hash
+  chmod 0600 /var/lib/aurora/owner-password.hash
+  cat > /etc/nixos/machine.nix.new <<EOF
+# Aurora image machine configuration
+{ ... }: {
+  networking.hostName = "$hostname";
+  users.users.$username = {
+    isNormalUser = true;
+    extraGroups = [ "wheel" ];
+    hashedPasswordFile = "/var/lib/aurora/owner-password.hash";
+  };
+}
+EOF
+  mv /etc/nixos/machine.nix.new /etc/nixos/machine.nix
+  sync /etc/nixos /var/lib/aurora/owner-password.hash
+fi
+if command -v restorecon >/dev/null; then
+  restorecon -RF "/home/$username" /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers.d
+fi
+printf '%s\n' "$username" > "$state/complete"
+sync "$state/complete" /etc/passwd /etc/shadow /etc/group /etc/gshadow
+rm -- "$state/pending"
+sync "$state"
+printf '\nAurora setup is complete. Sign in as %s.\n' "$username"
+systemctl start --no-block getty@tty1.service

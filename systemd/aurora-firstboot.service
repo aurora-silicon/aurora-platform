@@ -1,0 +1,22 @@
+[Unit]
+Description=Create the Aurora Linux owner account
+ConditionPathExists=/var/lib/aurora/firstboot/pending
+After=local-fs.target systemd-user-sessions.service
+Before=display-manager.service getty@tty1.service
+RequiresMountsFor=/boot /boot/efi /home
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/aurora/aurora-firstboot
+TimeoutStartSec=infinity
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=no
+
+[Install]
+WantedBy=multi-user.target

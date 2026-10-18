@@ -1,0 +1,31 @@
+name: Aurora first-boot checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          python3 -m unittest discover -s tests
+          bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion
+  conversion:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install native integration-test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs cryptsetup dosfstools fdisk util-linux
+      - name: Convert only the disposable loop-backed fixture
+        run: sudo unshare --mount --propagation private bash tests/loop-conversion 2>&1 | tee conversion.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: firstboot-conversion-evidence
+          path: conversion.log

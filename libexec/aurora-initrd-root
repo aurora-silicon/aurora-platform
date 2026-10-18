@@ -1,0 +1,137 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Aurora image adapter for the captured Btrfs conversion state machine.
+set -euo pipefail
+library=${AURORA_ENCRYPT_LIBRARY:-/usr/lib/aurora/vendor/omarchy-mac-encrypt}
+layout=${AURORA_IMAGE_LAYOUT:-/etc/aurora/image-layout}
+[[ -e $layout ]] || exit 0
+[[ -f $layout && ! -L $layout ]] || { echo 'Aurora image layout is not a regular file' >&2; exit 1; }
+source "$library"
+ROOT_PARTLABEL=AURORA_ROOT
+PROVISIONING_DIR=/var/lib/aurora/firstboot
+ROOT_SUBVOLUME=root
+AURORA_ROOT_UUID=""
+BOOT_UUID=""
+format=""
+while IFS='=' read -r key value; do
+  case $key in
+    format) [[ -z $format && $value == 1 ]] || exit 1; format=$value ;;
+    root_uuid) [[ -z $AURORA_ROOT_UUID && $value =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || exit 1; AURORA_ROOT_UUID=$value ;;
+    boot_uuid) [[ -z $BOOT_UUID && $value =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || exit 1; BOOT_UUID=$value ;;
+    root_subvolume) [[ $value == root ]] || exit 1 ;;
+    '') ;;
+    *) echo 'Unsupported Aurora image layout field' >&2; exit 1 ;;
+  esac
+done < "$layout"
+[[ $format == 1 && -n $BOOT_UUID && -n $AURORA_ROOT_UUID ]] || exit 1
+property=${AURORA_ESP_PROPERTY:-/sys/firmware/devicetree/base/chosen/asahi,efi-system-partition}
+[[ -r $property ]] || { echo 'Apple EFI partition handoff is missing' >&2; exit 1; }
+ESP_PARTUUID=$(tr -d '\000' < "$property")
+[[ $ESP_PARTUUID =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || exit 1
+udevadm settle
+ESP_DEVICE=/dev/disk/by-partuuid/$ESP_PARTUUID
+ESP_UUID=$(blkid -c /dev/null -s UUID -o value "$ESP_DEVICE")
+[[ $ESP_UUID =~ ^[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}$ ]] || exit 1
+
+omarchy_mac_encrypt_say() { printf 'aurora-root: %s\n' "$*"; }
+
+omarchy_mac_encrypt_mount_esp() {
+  ESP_MNT=/run/aurora-root/esp
+  mkdir -p "$ESP_MNT"
+  mount -o ro -t vfat "$ESP_DEVICE" "$ESP_MNT"
+  ESP_MOUNTED=1
+}
+
+omarchy_mac_encrypt_mount_boot() {
+  local boot_device=/dev/disk/by-uuid/$BOOT_UUID parent esp_parent
+  [[ -b $boot_device ]] || return 1
+  parent=$(lsblk -ndo PKNAME "$boot_device")
+  esp_parent=$(lsblk -ndo PKNAME "$ESP_DEVICE")
+  [[ -n $parent && $parent == "$esp_parent" ]] ||
+    omarchy_mac_encrypt_fail 'Boot and the handed-off EFI partition are on different disks'
+  BOOT_MNT=/run/aurora-root/boot
+  mkdir -p "$BOOT_MNT"
+  mount -t ext4 "$boot_device" "$BOOT_MNT"
+  BOOT_MOUNTED=1
+}
+
+omarchy_mac_encrypt_check_root_device() {
+  local type parent esp_parent uuid
+  type=$(lsblk -ndo TYPE "$ROOT_DEV")
+  parent=$(lsblk -ndo PKNAME "$ROOT_DEV")
+  esp_parent=$(lsblk -ndo PKNAME "$ESP_DEVICE")
+  [[ $type == part && -n $parent && $parent == "$esp_parent" ]] ||
+    omarchy_mac_encrypt_fail 'Root is not a partition on the handed-off EFI disk'
+  if [[ $(omarchy_mac_encrypt_fstype "$ROOT_DEV") == btrfs ]]; then
+    uuid=$(blkid -c /dev/null -s UUID -o value "$ROOT_DEV")
+    [[ $uuid == "$AURORA_ROOT_UUID" ]] || omarchy_mac_encrypt_fail 'Root UUID differs from this image'
+  fi
+}
+
+omarchy_mac_encrypt_fresh_image() {
+  local probe=/run/omarchy-mac-encrypt/probe fresh=1
+  mkdir -p "$probe"
+  mount -o ro,rescue=nologreplay,subvol=root "$ROOT_DEV" "$probe" || return 1
+  PROBE_MOUNTED=1
+  [[ -f $probe/var/lib/aurora/firstboot/pending &&
+     -f $probe/usr/lib/aurora/image-format &&
+     $(<"$probe/usr/lib/aurora/image-format") == aurora-btrfs-v1 ]] || fresh=0
+  umount "$probe"
+  PROBE_MOUNTED=0
+  (( fresh == 1 ))
+}
+
+omarchy_mac_encrypt_mount_opened() {
+  ROOT_MNT=/run/aurora-root/root
+  mkdir -p "$ROOT_MNT"
+  mount -o subvol=root /dev/mapper/root "$ROOT_MNT"
+  ROOT_MOUNTED=1
+}
+
+# The installed initrd retains this service on every kernel generation. It
+# opens the root before its normal filesystem UUID/label is resolved. No
+# temporary key is baked into an initramfs or a Nix store path.
+omarchy_mac_encrypt_finish() {
+  LUKS_UUID=$(cryptsetup luksUUID "$ROOT_DEV")
+  omarchy_mac_encrypt_write_state encrypted
+  omarchy_mac_encrypt_open
+  omarchy_mac_encrypt_resize_luks
+  omarchy_mac_encrypt_mount_opened
+  install -d -m 0700 "$ROOT_MNT$PROVISIONING_DIR"
+  install -m 0600 "$BOOT_KEY" "$ROOT_MNT$PROVISIONING_DIR/luks-key"
+  sync "$ROOT_MNT$PROVISIONING_DIR/luks-key"
+  omarchy_mac_encrypt_umount_root
+  omarchy_mac_encrypt_write_state configured
+}
+
+omarchy_mac_encrypt_open_continue() {
+  if [[ $STATE_PHASE == encrypted ]]; then
+    omarchy_mac_encrypt_require_key
+    omarchy_mac_encrypt_finish
+    omarchy_mac_encrypt_point_sysroot
+    return
+  fi
+  local key=$BOOT_MNT/omarchy/luks-key answer attempt
+  if [[ -f $key && ! -L $key && $(stat -c %s "$key") -eq $KEY_BYTES ]]; then
+    BOOT_KEY=$key
+    if omarchy_mac_encrypt_open; then
+      omarchy_mac_encrypt_point_sysroot
+      return
+    fi
+  fi
+  for attempt in 1 2 3; do
+    answer=$(systemd-ask-password --timeout=0 --id=aurora-root 'Unlock Aurora root:') || return 1
+    if printf '%s' "$answer" | cryptsetup open --key-file=- "$ROOT_DEV" root; then
+      unset answer
+      udevadm settle
+      omarchy_mac_encrypt_point_sysroot
+      return
+    fi
+    unset answer
+  done
+  omarchy_mac_encrypt_fail 'The root passphrase did not unlock this installation'
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  omarchy_mac_encrypt_main "$@"
+fi
