@@ -1,0 +1,110 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Seal a builder-owned raw image for the native Aurora installer.
+set -euo pipefail
+image=$(realpath "${1:?raw image required}")
+profile=${2:?installation profile required}
+output=$(realpath -m "${3:?new output directory required}")
+case $profile in fedora-kde|fedora-gnome|fedora-minimal) backend=dracut;; arch-kde|arch-gnome|arch-minimal) backend=mkinitcpio;; *) echo 'Unsupported image finalizer profile' >&2; exit 2;; esac
+[[ $(id -u) == 0 && $(uname -m) == aarch64 ]] || { echo 'Requires a disposable privileged native AArch64 builder' >&2; exit 2; }
+[[ -f $image && ! -L $image && ! -e $output ]] || exit 2
+mkdir -p "$output"
+scratch=$(mktemp -d)
+loop=''
+cleanup() {
+  local status=$?
+  trap - EXIT
+  local clean=1
+  for mount in dev proc sys run boot/efi boot ''; do
+    if mountpoint -q "$scratch/root${mount:+/$mount}"; then
+      umount -R "$scratch/root${mount:+/$mount}" || clean=0
+    fi
+  done
+  if (( clean == 1 )); then
+    [[ -z $loop ]] || losetup -d "$loop"
+    rm -rf "$scratch"
+  else
+    echo "Image mounts remain at $scratch; preserving them for recovery" >&2
+    status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+loop=$(losetup --find --show --partscan --sector-size 4096 "$image")
+udevadm settle
+[[ $(lsblk -dnro TYPE "$loop") == loop ]]
+[[ $(lsblk -nro TYPE "$loop" | grep -c '^part$') == 3 ]]
+for number in 1 2 3; do [[ -b ${loop}p$number ]]; done
+[[ $(blkid -s TYPE -o value "${loop}p1") == vfat ]]
+[[ $(blkid -s TYPE -o value "${loop}p2") == ext4 ]]
+[[ $(blkid -s TYPE -o value "${loop}p3") == btrfs ]]
+root_uuid=$(blkid -s UUID -o value "${loop}p3")
+boot_uuid=$(blkid -s UUID -o value "${loop}p2")
+efi_uuid=$(blkid -s UUID -o value "${loop}p1")
+mkdir -p "$scratch/root"
+mount -o subvol=root "${loop}p3" "$scratch/root"
+mount "${loop}p2" "$scratch/root/boot"
+mount "${loop}p1" "$scratch/root/boot/efi"
+for path in dev proc sys run; do mkdir -p "$scratch/root/$path"; done
+mount --rbind /dev "$scratch/root/dev"
+mount -t proc proc "$scratch/root/proc"
+mount --rbind /sys "$scratch/root/sys"
+mount -t tmpfs tmpfs "$scratch/root/run"
+install -d -m 0755 "$scratch/root/etc/aurora" "$scratch/root/usr/lib/aurora"
+install -d -m 0700 "$scratch/root/var/lib/aurora/firstboot"
+printf 'format=1\nroot_uuid=%s\nboot_uuid=%s\nroot_subvolume=root\n' "$root_uuid" "$boot_uuid" > "$scratch/root/etc/aurora/image-layout"
+printf 'aurora-btrfs-v1\n' > "$scratch/root/usr/lib/aurora/image-format"
+touch "$scratch/root/var/lib/aurora/firstboot/pending"
+# Images carry no account, encryption key, machine identity or builder keyring.
+[[ ! -e $scratch/root/boot/omarchy/luks-key ]]
+[[ ! -e $scratch/root/var/lib/aurora/firstboot/luks-key ]]
+chroot "$scratch/root" systemctl enable aurora-firstboot.service
+if [[ $backend == dracut ]]; then
+  chroot "$scratch/root" systemctl disable initial-setup.service initial-setup-graphical.service 2>/dev/null || true
+  rm -f "$scratch/root/etc/reconfigSys"
+  kernels=("$scratch/root/usr/lib/modules/"*)
+  (( ${#kernels[@]} == 1 ))
+  kernel=${kernels[0]##*/}
+  chroot "$scratch/root" dracut --force --no-hostonly --add 'aurora-root systemd-ask-password' "/boot/initramfs-$kernel.img" "$kernel"
+  chroot "$scratch/root" lsinitrd "/boot/initramfs-$kernel.img" > "$output/initramfs-inventory.txt"
+  grep -q 'aurora-initrd-root.service' "$output/initramfs-inventory.txt"
+  grep -q 'aurora/image-layout' "$output/initramfs-inventory.txt"
+  chroot "$scratch/root" restorecon -RF /etc/aurora /usr/lib/aurora /var/lib/aurora
+else
+  chroot "$scratch/root" mkinitcpio -P
+  # Each installed Mac creates its own pacman master key; only public keyrings ship.
+  rm -rf "$scratch/root/etc/pacman.d/gnupg"
+fi
+# The ESP is formatted afresh by macOS; its volume_id is preserved in metadata.
+[[ -s $scratch/root/boot/efi/m1n1/boot.bin && -s $scratch/root/boot/efi/EFI/BOOT/BOOTAA64.EFI ]]
+cp -a "$scratch/root/boot/efi" "$output/esp"
+install -Dm644 "$scratch/root/usr/share/aura/stage1/aura-raw.bin" "$output/esp/aurora/stage1.bin"
+cp "$scratch/root/etc/aurora/image-layout" "$output/image-layout"
+cp "$scratch/root/etc/fstab" "$output/fstab"
+if [[ $backend == dracut ]]; then
+  chroot "$scratch/root" rpm -qa --qf '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > "$output/packages.txt"
+else
+  chroot "$scratch/root" pacman -Q > "$output/packages.txt"
+fi
+sync
+# Unmount the filesystems before copying their final byte identities.
+for path in dev proc sys run boot/efi boot ''; do
+  if mountpoint -q "$scratch/root${path:+/$path}"; then umount -R "$scratch/root${path:+/$path}"; fi
+done
+dd if="${loop}p2" of="$output/boot.img" bs=4M conv=sparse status=none
+dd if="${loop}p3" of="$output/root.img" bs=4M conv=sparse status=none
+python3 - "$output" "$profile" "$root_uuid" "$boot_uuid" "$efi_uuid" "$(blockdev --getsize64 "${loop}p1")" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+out=Path(sys.argv[1]); profile=sys.argv[2]
+images={}
+for name in ('boot.img','root.img'):
+ path=out/name
+ with path.open('rb') as stream: digest=hashlib.file_digest(stream,'sha256').hexdigest()
+ images[name]={'bytes':path.stat().st_size,'sha256':digest}
+(out/'image.json').write_text(json.dumps({'schema':1,'installation_profile':profile,
+ 'layout_kind':('fedora' if profile.startswith('fedora-') else 'alarm')+'-btrfs-v1',
+ 'root_uuid':sys.argv[3],'boot_uuid':sys.argv[4],'efi_uuid':sys.argv[5],
+ 'efi_volume_id':sys.argv[5].replace('-',''),'efi_bytes':int(sys.argv[6]),
+ 'root_subvolume':'root','home_subvolume':'home','images':images},indent=2)+'\n')
+PY
