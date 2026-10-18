@@ -59,7 +59,11 @@ uid=$(id -u "$username")
 (( uid >= 1000 && uid < 60000 )) || fail 'Owner account has an unexpected user ID'
 usermod --append --groups wheel "$username"
 printf '%s:%s\n' "$username" "$password" | chpasswd
-printf '%s\n' "$hostname" > /etc/hostname
+# Replace NixOS's generated /etc symlink atomically without writing into its store.
+printf '%s\n' "$hostname" > /etc/hostname.aurora-new
+chmod 0644 /etc/hostname.aurora-new
+mv -Tf /etc/hostname.aurora-new /etc/hostname
+printf '%s\n' "$hostname" > /proc/sys/kernel/hostname
 install -d -m 0755 /etc/sudoers.d
 printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-aurora-owner
 chmod 0440 /etc/sudoers.d/10-aurora-owner
@@ -124,7 +128,7 @@ if [[ -e /etc/NIXOS ]]; then
 # Aurora image machine configuration
 { ... }: {
   networking.hostName = "$hostname";
-  users.users.$username = {
+  users.users."$username" = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];
     hashedPasswordFile = "/var/lib/aurora/owner-password.hash";
