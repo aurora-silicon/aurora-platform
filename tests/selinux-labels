@@ -10,9 +10,9 @@ cp -a /etc/selinux/targeted/contexts/files/. "$fixture/etc/selinux/targeted/cont
 touch "$fixture/etc/aurora/image-layout" "$fixture/usr/lib/aurora/image-format" "$fixture/var/lib/aurora/firstboot/pending"
 # A regular file in the excluded ESP must remain untouched.
 touch "$fixture/boot/efi/ESP-fixture"
-before=$(stat -c %C "$fixture/boot/efi/ESP-fixture")
+before=$(stat -c %C "$fixture/boot/efi/ESP-fixture" 2>/dev/null || true)
 bash "$source_root/images/label-fedora-rootfs" "$fixture"
-[[ $(stat -c %C "$fixture/boot/efi/ESP-fixture") == "$before" ]]
+[[ $(stat -c %C "$fixture/boot/efi/ESP-fixture" 2>/dev/null || true) == "$before" ]]
 # The gate must reject absent policy before accepting an exported filesystem.
 rm "$fixture/etc/selinux/targeted/contexts/files/file_contexts"
 if bash "$source_root/images/label-fedora-rootfs" "$fixture"; then
