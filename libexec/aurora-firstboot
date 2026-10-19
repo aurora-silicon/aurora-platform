@@ -5,6 +5,14 @@ set -euo pipefail
 umask 077
 state=/var/lib/aurora/firstboot
 [[ -f $state/pending ]] || exit 0
+# The unit has acquired the console; release the splash before validation so
+# setup failures remain visible rather than hiding behind a spinner.
+if command -v plymouth >/dev/null; then
+  plymouth quit || true
+fi
+if command -v chvt >/dev/null; then
+  chvt 1 || true
+fi
 [[ -f /usr/lib/aurora/image-format && $(</usr/lib/aurora/image-format) == aurora-btrfs-v1 ]] || exit 1
 fail() { printf '\nAurora setup: %s\n' "$*" >&2; exit 1; }
 for tool in getent findmnt btrfs useradd usermod chpasswd visudo cryptsetup python3 cut sync; do
@@ -15,13 +23,6 @@ trap 'unset password confirmation; stty echo 2>/dev/null || true' EXIT
 install -d -m 0700 "$state"
 [[ $(findmnt -nro FSTYPE /) == btrfs ]] || fail 'This image requires a Btrfs root'
 btrfs filesystem resize max /
-# Release the boot splash before this service owns the interactive console.
-if command -v plymouth >/dev/null; then
-  plymouth quit || true
-fi
-if command -v chvt >/dev/null; then
-  chvt 1 || true
-fi
 username=""
 hostname=""
 if [[ -e $state/owner ]]; then
@@ -93,7 +94,7 @@ case $phase in
     device=/dev/disk/by-partuuid/$partition
     [[ $(cryptsetup luksUUID "$device") == "$uuid" ]] || fail 'Encrypted-root UUID differs from its journal'
     key=$state/luks-key
-    if ! printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device"; then
+    if ! printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" 2>/dev/null; then
       [[ -f $key && ! -L $key ]] || fail 'The temporary encryption key is unavailable; use the original setup password to resume'
       # An occupied owner slot is never replaced implicitly.
       if cryptsetup luksDump --dump-json-metadata "$device" | python3 -c 'import json,sys; sys.exit(0 if "1" in json.load(sys.stdin)["keyslots"] else 1)'; then
@@ -103,10 +104,10 @@ case $phase in
     fi
     printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Owner password did not unlock root'
     if [[ -f $key ]]; then
-      if cryptsetup open --test-passphrase --key-file "$key" "$device"; then
+      if cryptsetup open --test-passphrase --key-file "$key" "$device" 2>/dev/null; then
         cryptsetup luksRemoveKey --batch-mode --key-file "$key" "$device"
       fi
-      if cryptsetup open --test-passphrase --key-file "$key" "$device"; then
+      if cryptsetup open --test-passphrase --key-file "$key" "$device" 2>/dev/null; then
         fail 'The temporary encryption key is still usable'
       fi
     fi
@@ -151,4 +152,4 @@ sync "$state/complete" "${account_files[@]}"
 rm -- "$state/pending"
 sync "$state"
 printf '\nAurora setup is complete. Sign in as %s.\n' "$username"
-systemctl start --no-block getty@tty1.service
+"$(dirname -- "${BASH_SOURCE[0]}")/aurora-firstboot-handoff"

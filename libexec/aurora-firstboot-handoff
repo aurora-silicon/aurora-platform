@@ -1,0 +1,10 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Queue the configured login after the account service releases its console.
+set -euo pipefail
+if [[ $(systemctl get-default) == graphical.target ]] &&
+   systemctl cat display-manager.service >/dev/null 2>&1; then
+  systemctl start --no-block display-manager.service
+else
+  systemctl start --no-block getty@tty1.service
+fi
