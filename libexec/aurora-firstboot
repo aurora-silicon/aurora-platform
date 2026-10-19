@@ -143,7 +143,7 @@ EOF
   sync /etc/nixos /var/lib/aurora/owner-password.hash
 fi
 if command -v restorecon >/dev/null; then
-  restorecon -RF "/home/$username" /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers.d
+  restorecon -RF "/home/$username" /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers.d /etc/hostname "$state"
 fi
 printf '%s\n' "$username" > "$state/complete"
 account_files=(/etc/passwd /etc/shadow /etc/group)

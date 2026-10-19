@@ -71,7 +71,7 @@ if [[ $backend == dracut ]]; then
   chroot "$scratch/root" lsinitrd "/boot/initramfs-$kernel.img" > "$output/initramfs-inventory.txt"
   grep -q 'aurora-initrd-root.service' "$output/initramfs-inventory.txt"
   grep -q 'aurora/image-layout' "$output/initramfs-inventory.txt"
-  chroot "$scratch/root" restorecon -RF /etc/aurora /usr/lib/aurora /var/lib/aurora
+  chroot "$scratch/root" /bin/bash -s -- / < "$(dirname -- "${BASH_SOURCE[0]}")/label-fedora-rootfs"
 else
   chroot "$scratch/root" mkinitcpio -P
   # Each installed Mac creates its own pacman master key; only public keyrings ship.

@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v5
       - run: |
           python3 -m unittest discover -s tests
-          bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion
+          bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion tests/selinux-labels images/*
   console:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -40,3 +40,21 @@ jobs:
         with:
           name: firstboot-conversion-evidence
           path: conversion.log
+  selinux-labels:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify finalizer labels with real Fedora targeted policy
+        run: |
+          set -euo pipefail
+          docker run --rm --privileged -v "$PWD:/src:ro" -w /src \
+            registry.fedoraproject.org/fedora:44 bash -euo pipefail -c '
+              dnf install -y policycoreutils selinux-policy-targeted
+              bash tests/selinux-labels
+            ' 2>&1 | tee selinux-labels.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: firstboot-selinux-labels
+          path: selinux-labels.log

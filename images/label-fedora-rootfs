@@ -1,0 +1,24 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Label finalizer additions even when the build host has SELinux disabled.
+set -euo pipefail
+root=$(realpath "${1:-/}")
+[[ $(id -u) == 0 ]] || { echo 'Offline labelling requires root' >&2; exit 1; }
+prefix=${root%/}
+policy=$prefix/etc/selinux/targeted/contexts/files/file_contexts
+[[ -f $policy && ! -L $policy ]] || { echo 'Fedora targeted file contexts are missing' >&2; exit 1; }
+paths=()
+for path in /etc/aurora /usr/lib/aurora /var/lib/aurora /boot /etc/systemd; do
+  paths+=("$prefix$path")
+done
+options=()
+[[ $root == / ]] || options+=(-r "$root")
+# The ESP is FAT and cannot carry SELinux xattrs.
+setfiles -F "${options[@]}" -e "$prefix/boot/efi" "$policy" "${paths[@]}"
+# A successful no-op (restorecon on a disabled builder) is not qualification.
+for path in /etc/aurora/image-layout /usr/lib/aurora/image-format /var/lib/aurora/firstboot/pending; do
+  [[ $(stat -c %C "$prefix$path") == "$(matchpathcon -n "$path")" ]] || {
+    echo "SELinux context verification failed for $path" >&2
+    exit 1
+  }
+done
