@@ -59,7 +59,8 @@ def main():
                 units.append(unit)
                 marker = Path(temporary) / kind
                 run('systemd-run', '--no-block', '--unit=' + unit,
-                    '--property=Type=oneshot', '--property=StandardInput=' + kind,
+                    '--property=Type=oneshot', '--property=RemainAfterExit=yes',
+                    '--property=StandardInput=' + kind,
                     '--property=TTYPath=' + tty, '--property=StandardOutput=journal',
                     '--property=StandardError=journal', '--property=TimeoutStartSec=8s',
                     '--property=TimeoutStopSec=2s', '/usr/bin/touch', str(marker))
