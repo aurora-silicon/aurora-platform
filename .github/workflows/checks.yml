@@ -13,6 +13,13 @@ jobs:
       - run: |
           python3 -m unittest discover -s tests
           bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion
+  console:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify handoff from an existing console owner
+        run: sudo python3 tests/console-handoff.py
   conversion:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15

@@ -1,7 +1,7 @@
 [Unit]
 Description=Create the Aurora Linux owner account
 ConditionPathExists=/var/lib/aurora/firstboot/pending
-After=local-fs.target systemd-user-sessions.service systemd-vconsole-setup.service
+After=local-fs.target systemd-user-sessions.service systemd-vconsole-setup.service plymouth-start.service
 Before=display-manager.service getty@tty1.service
 RequiresMountsFor=/boot /boot/efi /home
 
@@ -10,7 +10,8 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/lib/aurora/aurora-firstboot
 TimeoutStartSec=infinity
-StandardInput=tty
+# First boot must acquire the console before its script can release Plymouth.
+StandardInput=tty-force
 StandardOutput=tty
 StandardError=tty
 TTYPath=/dev/tty1
