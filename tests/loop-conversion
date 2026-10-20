@@ -34,6 +34,12 @@ mkdir -p "$scratch/mnt/root/var/lib/aurora/firstboot" "$scratch/mnt/root/usr/lib
 touch "$scratch/mnt/root/var/lib/aurora/firstboot/pending"
 printf 'aurora-btrfs-v1\n' > "$scratch/mnt/root/usr/lib/aurora/image-format"
 printf 'Aurora conversion preserves filesystem content\n' > "$scratch/mnt/root/proof"
+if [[ ${AURORA_TEST_SMALL_IMAGE:-0} == 1 ]]; then
+  # Installer images carry a filesystem smaller than the approved Root GPT
+  # partition. Keep that geometry through first-boot encryption.
+  btrfs filesystem resize 320M "$scratch/mnt"
+  printf 'Testing a 320 MiB image filesystem in a larger Root partition\n'
+fi
 umount "$scratch/mnt"
 root_uuid=$(blkid -s UUID -o value "$root")
 boot_uuid=$(blkid -s UUID -o value "$boot")
@@ -63,7 +69,53 @@ umount "$scratch/mnt"
 mount "$esp" "$scratch/mnt"
 printf 'format=1\nencrypt=1\nlane=edge\n' > "$scratch/mnt/omarchy/install.conf"
 umount "$scratch/mnt"
+if [[ ${AURORA_TEST_INTERRUPT:-0} == 1 ]]; then
+  # Kill only this disposable cryptsetup process after its conversion starts,
+  # then exercise the image adapter's durable Boot journal and resume path.
+  export REAL_CRYPTSETUP
+  REAL_CRYPTSETUP=$(command -v cryptsetup)
+  mkdir -p "$scratch/wrappers"
+  cat > "$scratch/wrappers/cryptsetup" <<'EOF'
+#!/bin/bash
+if [[ $1 == reencrypt && $2 == --encrypt ]]; then
+  device=${@: -1}
+  "$REAL_CRYPTSETUP" "$@" &
+  child=$!
+  for _ in {1..200}; do
+    if "$REAL_CRYPTSETUP" isLuks "$device"; then
+      sleep 1
+      kill -KILL "$child"
+      wait "$child" 2>/dev/null
+      exit 137
+    fi
+    sleep 0.1
+  done
+  wait "$child"
+  exit 1
+fi
+exec "$REAL_CRYPTSETUP" "$@"
+EOF
+  chmod 0755 "$scratch/wrappers/cryptsetup"
+  export PATH="$scratch/wrappers:$PATH"
+  if timeout --kill-after=5s 120s bash -x "$repo/libexec/aurora-initrd-root"; then
+    echo 'Expected to interrupt active reencryption' >&2
+    exit 1
+  fi
+  cryptsetup isLuks "$root"
+  mount "$boot" "$scratch/mnt"
+  grep -qx phase=reencrypting "$scratch/mnt/omarchy/encrypt.state"
+  [[ $(stat -c %s "$scratch/mnt/omarchy/luks-key") == 64 ]]
+  umount "$scratch/mnt"
+  printf 'Resuming interrupted conversion with the saved Boot key\n'
+fi
 timeout --kill-after=5s 120s bash -x "$repo/libexec/aurora-initrd-root"
+if [[ ${AURORA_TEST_INTERRUPT:-0} == 1 ]]; then
+  mount "$boot" "$scratch/mnt"
+  grep -Fq 'Device requires reencryption recovery. Run repair first.' \
+    "$scratch/mnt/omarchy/reencrypt-last-error.txt"
+  [[ $(stat -c %s "$scratch/mnt/omarchy/luks-header-before-recovery.bin") -ge 16777216 ]]
+  umount "$scratch/mnt"
+fi
 cryptsetup isLuks "$root"
 [[ -b /dev/mapper/root ]]
 mount -o subvol=root /dev/mapper/root "$scratch/mnt"

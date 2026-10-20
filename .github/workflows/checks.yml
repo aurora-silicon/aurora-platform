@@ -28,13 +28,17 @@ jobs:
       - name: Convert the disposable fixture with the target Fedora toolchain
         run: |
           set -euo pipefail
-          docker run --rm --privileged --ipc=host -v /dev:/dev -v /run/udev:/run/udev:ro \
-            -v "$PWD:/src" -w /src registry.fedoraproject.org/fedora:44 \
-            bash -euo pipefail -c '
-              dnf install -y btrfs-progs cryptsetup dosfstools e2fsprogs util-linux systemd-udev findutils gawk
-              cryptsetup --version
-              timeout --kill-after=10s 5m unshare --mount --propagation private bash tests/loop-conversion
-            ' 2>&1 | tee conversion.log
+          for small_image in 0 1; do
+            docker run --rm --privileged --ipc=host -v /dev:/dev -v /run/udev:/run/udev:ro \
+              -v "$PWD:/src" -w /src -e AURORA_TEST_SMALL_IMAGE="$small_image" \
+              -e AURORA_TEST_INTERRUPT="$small_image" \
+              registry.fedoraproject.org/fedora:44 \
+              bash -euo pipefail -c '
+                dnf install -y btrfs-progs cryptsetup dosfstools e2fsprogs util-linux systemd-udev findutils gawk
+                cryptsetup --version
+                timeout --kill-after=10s 5m unshare --mount --propagation private bash tests/loop-conversion
+              '
+          done 2>&1 | tee conversion.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
