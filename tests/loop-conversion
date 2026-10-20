@@ -34,6 +34,12 @@ mkdir -p "$scratch/mnt/root/var/lib/aurora/firstboot" "$scratch/mnt/root/usr/lib
 touch "$scratch/mnt/root/var/lib/aurora/firstboot/pending"
 printf 'aurora-btrfs-v1\n' > "$scratch/mnt/root/usr/lib/aurora/image-format"
 printf 'Aurora conversion preserves filesystem content\n' > "$scratch/mnt/root/proof"
+if [[ ${AURORA_TEST_SMALL_IMAGE:-0} == 1 ]]; then
+  # Installer images carry a filesystem smaller than the approved Root GPT
+  # partition. Keep that geometry through first-boot encryption.
+  btrfs filesystem resize 320M "$scratch/mnt"
+  printf 'Testing a 320 MiB image filesystem in a larger Root partition\n'
+fi
 umount "$scratch/mnt"
 root_uuid=$(blkid -s UUID -o value "$root")
 boot_uuid=$(blkid -s UUID -o value "$boot")
