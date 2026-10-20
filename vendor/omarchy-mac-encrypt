@@ -537,12 +537,13 @@ omarchy_mac_encrypt_reencrypt() {
                 [[ -f $backup && ! -L $backup && $(stat -c %s "$backup") -ge 16777216 ]] ||
                     omarchy_mac_encrypt_fail "the pre-recovery LUKS header backup is unsafe"
             else
-                temp=$(mktemp "$BOOT_MNT/omarchy/.luks-header.XXXXXX")
-                cryptsetup luksHeaderBackup --header-backup-file "$temp" "$ROOT_DEV" ||
+                temp=$(mktemp -d "$BOOT_MNT/omarchy/.luks-header.XXXXXX")
+                cryptsetup luksHeaderBackup --header-backup-file "$temp/header.bin" "$ROOT_DEV" ||
                     omarchy_mac_encrypt_fail "could not back up the LUKS header before recovery"
-                chmod 0600 "$temp"
-                sync "$temp"
-                mv -T "$temp" "$backup"
+                chmod 0600 "$temp/header.bin"
+                sync "$temp/header.bin"
+                mv -T "$temp/header.bin" "$backup"
+                rmdir "$temp"
                 sync "$BOOT_MNT/omarchy"
             fi
             cryptsetup luksDump --header "$backup" "$ROOT_DEV" >/dev/null ||
