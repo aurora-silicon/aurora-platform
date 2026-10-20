@@ -515,15 +515,51 @@ omarchy_mac_encrypt_require_key() {
 }
 
 omarchy_mac_encrypt_reencrypt() {
-    local mode=${1:-encrypt} start now elapsed
+    local mode=${1:-encrypt} start now elapsed error_file backup temp saved_uuid current_uuid
     omarchy_mac_encrypt_ensure_key
     omarchy_mac_encrypt_progress 0 "Encrypting your drive..."
     if [[ $mode == resume ]]; then
         omarchy_mac_encrypt_say "resuming interrupted LUKS2 reencrypt"
         start=$(date +%s)
-        cryptsetup reencrypt --batch-mode --resume-only --key-file "$BOOT_KEY" \
-            --progress-frequency 1 --progress-json "$ROOT_DEV" | omarchy_mac_encrypt_follow_reencrypt ||
-            omarchy_mac_encrypt_fail "cryptsetup reencrypt --resume-only failed"
+        error_file=/run/aurora-root/reencrypt-resume.stderr
+        mkdir -p /run/aurora-root
+        umask 077
+        if ! cryptsetup reencrypt --batch-mode --resume-only --key-file "$BOOT_KEY" \
+            --keyfile-size "$KEY_BYTES" --progress-frequency 1 --progress-json "$ROOT_DEV" \
+            2>"$error_file" | omarchy_mac_encrypt_follow_reencrypt; then
+            cat "$error_file" >&2
+            install -m 0600 "$error_file" "$BOOT_MNT/omarchy/reencrypt-last-error.txt"
+            sync "$BOOT_MNT/omarchy/reencrypt-last-error.txt"
+            grep -Fq 'Device requires reencryption recovery. Run repair first.' "$error_file" ||
+                omarchy_mac_encrypt_fail "cryptsetup reencrypt --resume-only failed"
+            backup=$BOOT_MNT/omarchy/luks-header-before-recovery.bin
+            if [[ -e $backup || -L $backup ]]; then
+                [[ -f $backup && ! -L $backup && $(stat -c %s "$backup") -ge 16777216 ]] ||
+                    omarchy_mac_encrypt_fail "the pre-recovery LUKS header backup is unsafe"
+            else
+                temp=$(mktemp "$BOOT_MNT/omarchy/.luks-header.XXXXXX")
+                cryptsetup luksHeaderBackup --header-backup-file "$temp" "$ROOT_DEV" ||
+                    omarchy_mac_encrypt_fail "could not back up the LUKS header before recovery"
+                chmod 0600 "$temp"
+                sync "$temp"
+                mv -T "$temp" "$backup"
+                sync "$BOOT_MNT/omarchy"
+            fi
+            cryptsetup luksDump --header "$backup" "$ROOT_DEV" >/dev/null ||
+                omarchy_mac_encrypt_fail "the pre-recovery LUKS header backup is invalid"
+            saved_uuid=$(cryptsetup luksUUID --header "$backup" "$ROOT_DEV")
+            current_uuid=$(cryptsetup luksUUID "$ROOT_DEV")
+            [[ $saved_uuid == "$current_uuid" ]] ||
+                omarchy_mac_encrypt_fail "the pre-recovery LUKS header backup targets another root"
+            omarchy_mac_encrypt_say "recovering the interrupted LUKS2 hotzone"
+            cryptsetup repair --batch-mode --key-file "$BOOT_KEY" \
+                --keyfile-size "$KEY_BYTES" "$ROOT_DEV" ||
+                omarchy_mac_encrypt_fail "cryptsetup reencryption recovery failed"
+            cryptsetup reencrypt --batch-mode --resume-only --key-file "$BOOT_KEY" \
+                --keyfile-size "$KEY_BYTES" --progress-frequency 1 --progress-json "$ROOT_DEV" \
+                | omarchy_mac_encrypt_follow_reencrypt ||
+                omarchy_mac_encrypt_fail "cryptsetup reencrypt --resume-only failed after recovery"
+        fi
         now=$(date +%s)
         elapsed=$((now - start))
         omarchy_mac_encrypt_say "resume finished in ${elapsed}s"

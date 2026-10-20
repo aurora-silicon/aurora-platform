@@ -109,6 +109,13 @@ EOF
   printf 'Resuming interrupted conversion with the saved Boot key\n'
 fi
 timeout --kill-after=5s 120s bash -x "$repo/libexec/aurora-initrd-root"
+if [[ ${AURORA_TEST_INTERRUPT:-0} == 1 ]]; then
+  mount "$boot" "$scratch/mnt"
+  grep -Fq 'Device requires reencryption recovery. Run repair first.' \
+    "$scratch/mnt/omarchy/reencrypt-last-error.txt"
+  [[ $(stat -c %s "$scratch/mnt/omarchy/luks-header-before-recovery.bin") -ge 16777216 ]]
+  umount "$scratch/mnt"
+fi
 cryptsetup isLuks "$root"
 [[ -b /dev/mapper/root ]]
 mount -o subvol=root /dev/mapper/root "$scratch/mnt"
