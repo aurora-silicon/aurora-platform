@@ -78,7 +78,20 @@ if [[ ${AURORA_TEST_INTERRUPT:-0} == 1 ]]; then
   cat > "$scratch/wrappers/cryptsetup" <<'EOF'
 #!/bin/bash
 if [[ $1 == reencrypt && $2 == --encrypt ]]; then
-  exec timeout --signal=KILL 3s "$REAL_CRYPTSETUP" "$@"
+  device=${@: -1}
+  "$REAL_CRYPTSETUP" "$@" &
+  child=$!
+  for _ in {1..200}; do
+    if "$REAL_CRYPTSETUP" isLuks "$device"; then
+      sleep 1
+      kill -KILL "$child"
+      wait "$child" 2>/dev/null
+      exit 137
+    fi
+    sleep 0.1
+  done
+  wait "$child"
+  exit 1
 fi
 exec "$REAL_CRYPTSETUP" "$@"
 EOF
