@@ -31,6 +31,7 @@ jobs:
           for small_image in 0 1; do
             docker run --rm --privileged --ipc=host -v /dev:/dev -v /run/udev:/run/udev:ro \
               -v "$PWD:/src" -w /src -e AURORA_TEST_SMALL_IMAGE="$small_image" \
+              -e AURORA_TEST_INTERRUPT="$small_image" \
               registry.fedoraproject.org/fedora:44 \
               bash -euo pipefail -c '
                 dnf install -y btrfs-progs cryptsetup dosfstools e2fsprogs util-linux systemd-udev findutils gawk

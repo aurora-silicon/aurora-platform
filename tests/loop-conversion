@@ -69,6 +69,32 @@ umount "$scratch/mnt"
 mount "$esp" "$scratch/mnt"
 printf 'format=1\nencrypt=1\nlane=edge\n' > "$scratch/mnt/omarchy/install.conf"
 umount "$scratch/mnt"
+if [[ ${AURORA_TEST_INTERRUPT:-0} == 1 ]]; then
+  # Kill only this disposable cryptsetup process after its conversion starts,
+  # then exercise the image adapter's durable Boot journal and resume path.
+  export REAL_CRYPTSETUP
+  REAL_CRYPTSETUP=$(command -v cryptsetup)
+  mkdir -p "$scratch/wrappers"
+  cat > "$scratch/wrappers/cryptsetup" <<'EOF'
+#!/bin/bash
+if [[ $1 == reencrypt && $2 == --encrypt ]]; then
+  exec timeout --signal=KILL 3s "$REAL_CRYPTSETUP" "$@"
+fi
+exec "$REAL_CRYPTSETUP" "$@"
+EOF
+  chmod 0755 "$scratch/wrappers/cryptsetup"
+  export PATH="$scratch/wrappers:$PATH"
+  if timeout --kill-after=5s 120s bash -x "$repo/libexec/aurora-initrd-root"; then
+    echo 'Expected to interrupt active reencryption' >&2
+    exit 1
+  fi
+  cryptsetup isLuks "$root"
+  mount "$boot" "$scratch/mnt"
+  grep -qx phase=reencrypting "$scratch/mnt/omarchy/encrypt.state"
+  [[ $(stat -c %s "$scratch/mnt/omarchy/luks-key") == 64 ]]
+  umount "$scratch/mnt"
+  printf 'Resuming interrupted conversion with the saved Boot key\n'
+fi
 timeout --kill-after=5s 120s bash -x "$repo/libexec/aurora-initrd-root"
 cryptsetup isLuks "$root"
 [[ -b /dev/mapper/root ]]
