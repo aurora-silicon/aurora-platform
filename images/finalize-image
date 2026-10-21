@@ -81,6 +81,10 @@ fi
 [[ -s $scratch/root/boot/efi/m1n1/boot.bin && -s $scratch/root/boot/efi/EFI/BOOT/BOOTAA64.EFI ]]
 cp -a "$scratch/root/boot/efi" "$output/esp"
 install -Dm644 "$scratch/root/usr/share/aura/stage1/aura-raw.bin" "$output/esp/aurora/stage1.bin"
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/prepare-stage2.py" \
+  --combined "$output/esp/m1n1/boot.bin" \
+  --aura "$scratch/root/usr/lib/asahi-boot/m1n1.bin" \
+  --output "$output/esp/m1n1" --manifest "$output/stage2.json"
 cp "$scratch/root/etc/aurora/image-layout" "$output/image-layout"
 cp "$scratch/root/etc/fstab" "$output/fstab"
 if [[ $backend == dracut ]]; then
