@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: MIT
 # Queue the configured login after the account service releases its console.
 set -euo pipefail
-if [[ $(systemctl get-default) == graphical.target ]] &&
+default_target=$(systemctl show --property=Id --value default.target 2>/dev/null || true)
+[[ -n $default_target ]] || default_target=$(systemctl get-default)
+if [[ $default_target == graphical.target ]] &&
    systemctl cat display-manager.service >/dev/null 2>&1; then
   systemctl start --no-block display-manager.service
 else
