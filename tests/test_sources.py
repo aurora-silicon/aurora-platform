@@ -18,6 +18,10 @@ class SourceTests(unittest.TestCase):
             staged = Path(temporary)
             self.assertTrue((staged / 'usr/lib/aurora/aurora-initrd-root').is_file())
             self.assertTrue((staged / 'usr/lib/dracut/modules.d/97aurora-root/module-setup.sh').is_file())
+            mapper = staged / 'usr/lib/aurora/initrd/aurora-root-mapper.conf'
+            self.assertIn('JobRunningTimeoutSec=infinity', mapper.read_text())
+            service = staged / 'usr/lib/aurora/initrd/aurora-initrd-root.service'
+            self.assertIn('ExecStartPre=-/usr/bin/modprobe apple_wdt', service.read_text())
             self.assertFalse((staged / 'etc/aurora/image-layout').exists())
             self.assertFalse((staged / 'var/lib/aurora/firstboot/pending').exists())
 

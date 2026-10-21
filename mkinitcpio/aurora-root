@@ -3,11 +3,12 @@
 build() {
   [[ -f /etc/aurora/image-layout ]] || return 0
   local binary
-  for binary in bash cryptsetup btrfs blkid lsblk awk findmnt mount umount readlink stat \
+  for binary in bash cryptsetup btrfs blkid lsblk awk findmnt mount umount readlink stat modprobe \
     mkdir chmod dd date cat mv sync install grep sed kill sleep tr systemd-ask-password; do
     add_binary "$(command -v "$binary")"
   done
   add_module dm-crypt
+  add_module apple_wdt
   add_module btrfs
   add_module vfat
   add_module ext4
@@ -16,6 +17,7 @@ build() {
   add_file /usr/lib/aurora/aurora-initrd-root
   add_file /usr/lib/aurora/initrd/aurora-initrd-root.service /usr/lib/systemd/system/aurora-initrd-root.service
   add_file /usr/lib/aurora/initrd/aurora-root-sysroot.conf /usr/lib/systemd/system/sysroot.mount.d/aurora-root.conf
+  add_file /usr/lib/aurora/initrd/aurora-root-mapper.conf /usr/lib/systemd/system/dev-mapper-root.device.d/aurora-root.conf
   add_symlink /usr/lib/systemd/system/initrd.target.wants/aurora-initrd-root.service ../aurora-initrd-root.service
 }
 help() { echo 'Prepare and unlock a fresh Aurora Btrfs root using the systemd initrd.'; }
