@@ -134,6 +134,8 @@ choose_mode() {
   [[ $target == graphical.target ]] && systemctl cat display-manager.service >/dev/null 2>&1 || { echo text; return; }
   # The desktop's own setup only runs while the system has no owner.
   ! owner_exists || { echo text; return; }
+  # A distribution that wires up the desktop's setup itself declares it.
+  [[ ! -f /etc/aurora/desktop-account-setup ]] || { echo desktop; return; }
   for unit in plasma-setup.service; do
     enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     if [[ $enabled == enabled && ! -e /etc/plasma-setup-done ]]; then echo desktop; return; fi
