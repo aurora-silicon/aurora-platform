@@ -123,7 +123,7 @@ def write_if_changed(path, text, changed):
         changed.append(path)
 
 
-def harden(root, flavor, boot_uuid, efi_uuid, boot_is_root=False):
+def harden(root, flavor, boot_uuid, efi_uuid, boot_is_root=False, mkimage=None, modules_dir=None):
     changed = []
     boot = root / "boot"
     grub_name = "grub2" if flavor == "fedora" else "grub"
@@ -147,10 +147,14 @@ def harden(root, flavor, boot_uuid, efi_uuid, boot_is_root=False):
         # runs the stub next to it instead; the main configuration's modules
         # still load from the boot filesystem once the stub hands off.
         modules = ["normal", "configfile", "part_gpt", "part_msdos", "fat", "ext2", "probe",
-                   "regexp", "search", "search_fs_uuid", "test", "echo"]
-        subprocess.run(["chroot", str(root), "grub-mkimage", "--format=arm64-efi",
-                        "--directory=/usr/lib/grub/arm64-efi", "--prefix=/EFI/BOOT",
-                        "--output=/boot/efi/EFI/BOOT/BOOTAA64.EFI", *modules], check=True)
+                   "regexp", "search", "search_fs_uuid", "test", "echo", "linux"]
+        if mkimage:
+            # A GRUB outside the target (NixOS keeps it in the store).
+            command = [mkimage, f"--directory={modules_dir}", f"--output={core}"]
+        else:
+            command = ["chroot", str(root), "grub-mkimage", "--directory=/usr/lib/grub/arm64-efi",
+                       "--output=/boot/efi/EFI/BOOT/BOOTAA64.EFI"]
+        subprocess.run([*command, "--format=arm64-efi", "--prefix=/EFI/BOOT", *modules], check=True)
         changed.append(core)
     if main.is_file():
         write_if_changed(main, harden_main(main.read_text(), efi_uuid), changed)
@@ -168,6 +172,8 @@ def main():
     parser.add_argument("--flavor", choices=("fedora", "arch"), required=True)
     parser.add_argument("--boot-uuid", help="filesystem UUID holding /boot (default: detect)")
     parser.add_argument("--efi-uuid", help="EFI partition UUID (default: detect)")
+    parser.add_argument("--grub-mkimage", help="grub-mkimage to run directly instead of in a chroot")
+    parser.add_argument("--grub-modules", help="arm64-efi module directory for --grub-mkimage")
     parser.add_argument("--boot-on-root", action="store_true",
                         help="/boot is a directory of the root filesystem, not its own partition")
     args = parser.parse_args()
@@ -176,7 +182,10 @@ def main():
     efi_uuid = args.efi_uuid or mounted_uuid(root / "boot/efi")
     boot_on_root = args.boot_on_root or (args.boot_uuid is None and
                                          mounted_uuid(root / "boot") == mounted_uuid(root))
-    for path in harden(root, args.flavor, boot_uuid, efi_uuid, boot_on_root):
+    if bool(args.grub_mkimage) != bool(args.grub_modules):
+        parser.error("--grub-mkimage and --grub-modules go together")
+    for path in harden(root, args.flavor, boot_uuid, efi_uuid, boot_on_root,
+                       args.grub_mkimage, args.grub_modules):
         print(f"GRUB lookups confined to the startup disk: {path}")
 
 
