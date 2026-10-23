@@ -1,0 +1,10 @@
+policy_module(aurora_firstboot, 1.0.0)
+
+# Aurora's first-boot programs live under /usr/lib/aurora, which the base
+# policy labels lib_t. systemd runs a lib_t program in its own init_t domain,
+# where account and disk tools such as chpasswd are denied. Labelling these
+# programs as ordinary executables lets systemd start them in
+# unconfined_service_t, like any other administrator-installed service.
+gen_require(`
+	type bin_t;
+')

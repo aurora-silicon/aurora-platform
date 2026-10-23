@@ -1,0 +1,41 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Load the first-boot module into real Fedora targeted policy (offline, in a
+# disposable container) and check the labels and the domain systemd uses.
+set -euo pipefail
+source_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp -a "$source_root/selinux/." "$work/"
+make -s -C "$work" -f /usr/share/selinux/devel/Makefile aurora_firstboot.pp
+semodule -n -i "$work/aurora_firstboot.pp"
+semodule -l | grep -qx aurora_firstboot
+make -s -C "$source_root" install-common DESTDIR="$work/root"
+fail() { echo "SELinux policy check failed: $*" >&2; exit 1; }
+for path in "$work"/root/usr/lib/aurora/aurora-*; do
+  program=/usr/lib/aurora/${path##*/}
+  [[ $(matchpathcon -n "$program") == system_u:object_r:bin_t:s0 ]] || fail "$program is not bin_t"
+  echo "$program: $(matchpathcon -n "$program")"
+done
+[[ $(matchpathcon -n /usr/lib/aurora/vendor/omarchy-mac-encrypt) == system_u:object_r:lib_t:s0 ]] ||
+  fail 'the sourced converter library changed type'
+policy=$(ls /etc/selinux/targeted/policy/policy.* | sort -V | tail -n 1)
+# systemd (init_t) starts bin_t programs in the unconfined service domain.
+sesearch -T -s init_t -t bin_t -c process "$policy" | grep -q 'unconfined_service_t;' ||
+  fail 'init_t does not transition bin_t programs to unconfined_service_t'
+# Before this module the programs were lib_t: no transition, so they ran as init_t.
+! sesearch -T -s init_t -t lib_t -c process "$policy" | grep -q . || fail 'unexpected lib_t transition'
+for target in passwd_exec_t useradd_exec_t lvm_exec_t plymouth_exec_t shell_exec_t; do
+  sesearch -A -s unconfined_service_t -t "$target" -c file -p execute "$policy" | grep -q allow ||
+    fail "unconfined_service_t cannot execute $target"
+done
+sesearch -A -s unconfined_service_t -t shadow_t -c file -p write "$policy" | grep -q allow || fail 'shadow write'
+sesearch -A -s unconfined_service_t -t plymouthd_t -c unix_stream_socket -p connectto "$policy" | grep -q allow ||
+  fail 'plymouth socket'
+# What setup creates gets these labels from restorecon.
+for path in /etc/hostname /etc/sudoers.d/10-aurora-owner /var/lib/aurora/firstboot/owner \
+            /var/lib/aurora/firstboot/complete /boot/omarchy/encrypt.state /boot/grub2/aurora-boot-x; do
+  echo "$path: $(matchpathcon -n "$path")"
+done
+[[ $(matchpathcon -n /etc/hostname) == system_u:object_r:hostname_etc_t:s0 ]] || fail '/etc/hostname'
+echo 'First-boot programs run in unconfined_service_t under Fedora targeted policy.'
