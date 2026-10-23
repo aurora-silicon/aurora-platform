@@ -83,9 +83,19 @@ PY
 # prompts. Mute both while setup owns it; restore them when it finishes.
 show_status=''
 console_level=''
+# Images boot with systemd.show_status=auto: status stays quiet until a job is
+# slow, and then systemd prints status lines and "A start job is running for
+# Aurora first-boot setup" over the prompts. Turn status output off while
+# setup owns the console, whatever it reads now, and afterwards reset it to
+# the configured mode (an empty mode).
+show_status_call() {
+  busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
+    SetShowStatus s "$1" >/dev/null 2>&1
+}
 quiet_console() {
+  # ShowStatus reads yes while status is shown, including auto's temporary on.
   show_status=$(systemctl show --property=ShowStatus --value 2>/dev/null || true)
-  [[ $show_status != yes ]] || kill -s SIGRTMIN+21 1 2>/dev/null || true
+  show_status_call no || kill -s SIGRTMIN+21 1 2>/dev/null || true
   if [[ -w /proc/sys/kernel/printk ]]; then
     read -r console_level _ < /proc/sys/kernel/printk || console_level=''
     printf '1\n' > /proc/sys/kernel/printk 2>/dev/null || console_level=''
@@ -93,7 +103,8 @@ quiet_console() {
 }
 restore_console() {
   [[ -z $console_level ]] || printf '%s\n' "$console_level" > /proc/sys/kernel/printk 2>/dev/null || true
-  [[ $show_status != yes ]] || kill -s SIGRTMIN+20 1 2>/dev/null || true
+  # Without the D-Bus call, the signals can only switch status fully on.
+  show_status_call '' || [[ $show_status != yes ]] || kill -s SIGRTMIN+20 1 2>/dev/null || true
   console_level=''
   show_status=''
 }

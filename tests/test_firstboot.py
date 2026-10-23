@@ -153,6 +153,23 @@ class UnitTests(unittest.TestCase):
         script = (ROOT / 'libexec/aurora-firstboot').read_text()
         self.assertIn('exec 0<>"$console" 1>&0 2>&0', script)
 
+    def test_status_output_is_off_while_setup_owns_the_console(self):
+        # Images boot with systemd.show_status=auto; once setup had waited a
+        # few seconds, status lines and "A start job is running" covered the
+        # text wizard's prompts. Status is turned off whatever it reads when
+        # setup starts, then reset to the configured mode.
+        script = (ROOT / 'libexec/aurora-firstboot').read_text()
+        functions = re.search(r'(?ms)^show_status_call\(\) \{.*?^restore_console\(\) \{.*?^\}$', script).group(0)
+        for shown in ('yes', 'no'):
+            with self.subTest(shown=shown), tempfile.TemporaryDirectory() as temporary:
+                log = Path(temporary) / 'modes'
+                subprocess.run(['bash', '-c', f"""
+                    systemctl() {{ echo {shown}; }}
+                    busctl() {{ [[ $5 == SetShowStatus && $6 == s ]] && echo "mode=$7" >> {log}; }}
+                    {functions}
+                    quiet_console; restore_console"""], check=True)
+                self.assertEqual(log.read_text().split(), ['mode=no', 'mode='])
+
     def test_text_wizard_can_be_asked_for_recovery(self):
         service = (ROOT / 'systemd/aurora-firstboot.service').read_text()
         self.assertIn('ConditionPathExists=|/var/lib/aurora/firstboot/pending', service)
