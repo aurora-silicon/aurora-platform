@@ -131,8 +131,12 @@ class UnitTests(unittest.TestCase):
 
     def test_setup_releases_the_splash_with_a_bound(self):
         service = (ROOT / 'systemd/aurora-firstboot.service').read_text()
-        self.assertIn('plymouth-quit.service', service)
-        self.assertNotIn('plymouth-quit-wait.service', service)
+        # The stock quit waits for setup, never the other way round, so the
+        # splash survives until the disk-password prompt is done.
+        after = next(line for line in service.splitlines() if line.startswith('After='))
+        self.assertNotIn('plymouth-quit', after)
+        self.assertIn('After=aurora-firstboot.service',
+                      (ROOT / 'systemd/aurora-plymouth-quit.conf').read_text())
         script = (ROOT / 'libexec/aurora-firstboot').read_text()
         self.assertIn('timeout --kill-after=2 10 plymouth quit', script)
         self.assertIsNone(re.search(r'(?m)^\s*plymouth quit', script))
