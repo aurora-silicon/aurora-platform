@@ -5,130 +5,223 @@ set -euo pipefail
 umask 077
 state=/var/lib/aurora/firstboot
 [[ -f $state/pending ]] || exit 0
-# The unit has acquired the console; release the splash before validation so
-# setup failures remain visible rather than hiding behind a spinner.
-if command -v plymouth >/dev/null; then
-  plymouth quit || true
-fi
-if command -v chvt >/dev/null; then
-  chvt 1 || true
-fi
-[[ -f /usr/lib/aurora/image-format && $(</usr/lib/aurora/image-format) == aurora-btrfs-v1 ]] || exit 1
+console=${AURORA_FIRSTBOOT_TTY:-/dev/tty1}
+
+log() { logger -t aurora-firstboot -- "$*" 2>/dev/null || true; }
+
+# Give the console a bounded chance to come back from the boot splash. A splash
+# that does not quit is stopped, so it can never hide this setup indefinitely.
+release_splash() {
+  local attempt pid=''
+  command -v plymouth >/dev/null 2>&1 || return 0
+  [[ ! -r /run/plymouth/pid ]] || pid=$(tr -cd '0-9' < /run/plymouth/pid)
+  [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null || pid=$(pgrep -x plymouthd 2>/dev/null | head -n 1 || true)
+  if timeout 5 plymouth --ping 2>/dev/null; then
+    timeout --kill-after=2 10 plymouth quit 2>/dev/null || log 'plymouth quit did not complete'
+  elif [[ -n $pid ]]; then
+    log "the boot splash (pid $pid) is not responding"
+  fi
+  [[ -n $pid ]] || return 0
+  for attempt in {1..20}; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.25
+  done
+  log "stopping the boot splash (pid $pid)"
+  kill -TERM "$pid" 2>/dev/null || true
+  for attempt in {1..10}; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+# A splash that was stopped can leave the virtual terminal in graphics mode,
+# where text is never drawn. KDSETMODE(KD_TEXT) makes the prompts visible.
+show_text_console() {
+  [[ $console == /dev/tty[0-9]* && -c $console ]] || return 0
+  python3 - "$console" <<'PY' 2>/dev/null || true
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY)
+fcntl.ioctl(fd, 0x4B3A, 0)  # KDSETMODE, KD_TEXT
+os.close(fd)
+PY
+}
+
+# systemd status lines and kernel messages share this console with the
+# prompts. Mute both while setup owns it; restore them when it finishes.
+show_status=''
+console_level=''
+quiet_console() {
+  show_status=$(systemctl show --property=ShowStatus --value 2>/dev/null || true)
+  [[ $show_status != yes ]] || kill -s SIGRTMIN+21 1 2>/dev/null || true
+  if [[ -w /proc/sys/kernel/printk ]]; then
+    read -r console_level _ < /proc/sys/kernel/printk || console_level=''
+    printf '1\n' > /proc/sys/kernel/printk 2>/dev/null || console_level=''
+  fi
+}
+restore_console() {
+  [[ -z $console_level ]] || printf '%s\n' "$console_level" > /proc/sys/kernel/printk 2>/dev/null || true
+  [[ $show_status != yes ]] || kill -s SIGRTMIN+20 1 2>/dev/null || true
+  console_level=''
+  show_status=''
+}
+
+# Fedora enforces SELinux: give each file setup creates its policy label at
+# once, so an interrupted setup never leaves a mislabelled system file behind.
+label() {
+  command -v restorecon >/dev/null 2>&1 || return 0
+  command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled || return 0
+  restorecon -F "$@"
+}
+
 fail() { printf '\nAurora setup: %s\n' "$*" >&2; exit 1; }
-for tool in getent findmnt btrfs useradd usermod chpasswd visudo cryptsetup python3 cut sync; do
-  command -v "$tool" >/dev/null || fail "Required setup command is missing: $tool"
-done
-trap 'unset password confirmation; stty echo 2>/dev/null || true' EXIT
-[[ ! -e /run/omarchy-mac-encrypt.failed ]] || fail "Root preparation failed: $(</run/omarchy-mac-encrypt.failed)"
-install -d -m 0700 "$state"
-[[ $(findmnt -nro FSTYPE /) == btrfs ]] || fail 'This image requires a Btrfs root'
-btrfs filesystem resize max /
-username=""
-hostname=""
-if [[ -e $state/owner ]]; then
-  [[ -f $state/owner && ! -L $state/owner ]] || fail 'Owner journal is invalid'
-  mapfile -t owner < "$state/owner"
-  (( ${#owner[@]} == 2 )) || fail 'Owner journal is incomplete'
-  username=${owner[0]}
-  hostname=${owner[1]}
-fi
-printf '\nWelcome to Aurora\n\nCreate your Linux account. Your macOS account stays separate.\n'
-if [[ -z $username ]]; then
-  read -r -p 'Linux username: ' username
-  [[ $username =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || fail 'Use a lowercase username, starting with a letter'
-  ! getent passwd "$username" >/dev/null || fail 'That username already exists'
-  read -r -p 'Computer name [aurora]: ' hostname
-  hostname=${hostname:-aurora}
-  [[ $hostname =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fail 'Use a computer name containing letters, numbers and hyphens'
-  printf '%s\n%s\n' "$username" "$hostname" > "$state/owner.new"
-  sync "$state/owner.new"
-  mv "$state/owner.new" "$state/owner"
-  sync "$state"
-else
-  [[ $username =~ ^[a-z][a-z0-9_-]{0,30}$ && $hostname =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fail 'Owner journal fields are invalid'
-  printf 'Resuming setup for %s on %s.\n' "$username" "$hostname"
-fi
-read -r -s -p 'Linux password (also unlocks an encrypted root): ' password
-printf '\n'
-read -r -s -p 'Retype password: ' confirmation
-printf '\n'
-[[ -n $password && $password == "$confirmation" ]] || fail 'Passwords do not match or are empty'
-unset confirmation
-if ! id "$username" >/dev/null 2>&1; then
-  shell=/bin/bash
-  [[ ! -x /run/current-system/sw/bin/bash ]] || shell=/run/current-system/sw/bin/bash
-  useradd --create-home --shell "$shell" "$username"
-fi
-uid=$(id -u "$username")
-(( uid >= 1000 && uid < 60000 )) || fail 'Owner account has an unexpected user ID'
-usermod --append --groups wheel "$username"
-printf '%s:%s\n' "$username" "$password" | chpasswd
-# Replace NixOS's generated /etc symlink atomically without writing into its store.
-printf '%s\n' "$hostname" > /etc/hostname.aurora-new
-chmod 0644 /etc/hostname.aurora-new
-mv -Tf /etc/hostname.aurora-new /etc/hostname
-printf '%s\n' "$hostname" > /proc/sys/kernel/hostname
-install -d -m 0755 /etc/sudoers.d
-printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-aurora-owner
-chmod 0440 /etc/sudoers.d/10-aurora-owner
-visudo -cf /etc/sudoers.d/10-aurora-owner >/dev/null
 
-# Read data, never source instructions, from the durable encryption journal.
-journal=/boot/omarchy/encrypt.state
-[[ -f $journal && ! -L $journal ]] || fail 'Root preparation journal is missing'
-phase=""; partition=""; uuid=""; format=""
-while IFS='=' read -r key value; do
-  case $key in
-    format) format=$value ;;
-    phase) phase=$value ;;
-    partition) partition=$value ;;
-    luks_uuid) uuid=$value ;;
+setup() {
+  set -E
+  trap 'printf "\nAurora setup: a setup step failed (status %s): %s\n" "$?" "$BASH_COMMAND" >&2' ERR
+  trap 'unset password confirmation; stty echo 2>/dev/null || true' EXIT
+  [[ -f /usr/lib/aurora/image-format && $(</usr/lib/aurora/image-format) == aurora-btrfs-v1 ]] ||
+    fail 'This installation is not an Aurora image'
+  local tool
+  for tool in getent findmnt btrfs useradd usermod chpasswd visudo cryptsetup python3 cut sync; do
+    command -v "$tool" >/dev/null || fail "Required setup command is missing: $tool"
+  done
+  [[ ! -e /run/omarchy-mac-encrypt.failed ]] || fail "Root preparation failed: $(</run/omarchy-mac-encrypt.failed)"
+  install -d -m 0700 "$state"
+  label "$state"
+  [[ $(findmnt -nro FSTYPE /) == btrfs ]] || fail 'This image requires a Btrfs root'
+  btrfs filesystem resize max / >/dev/null
+  local username='' hostname='' owner=()
+  if [[ -e $state/owner ]]; then
+    [[ -f $state/owner && ! -L $state/owner ]] || fail 'Owner journal is invalid'
+    mapfile -t owner < "$state/owner"
+    (( ${#owner[@]} == 2 )) || fail 'Owner journal is incomplete'
+    username=${owner[0]}
+    hostname=${owner[1]}
+  fi
+  printf '\nWelcome to Aurora\n\nCreate your Linux account. Your macOS account stays separate.\n'
+  if [[ -z $username ]]; then
+    while :; do
+      read -r -p 'Linux username: ' username
+      if [[ ! $username =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; then
+        printf 'Use a lowercase username, starting with a letter.\n'
+      elif getent passwd "$username" >/dev/null; then
+        printf 'That username already exists.\n'
+      else
+        break
+      fi
+    done
+    while :; do
+      read -r -p 'Computer name [aurora]: ' hostname
+      hostname=${hostname:-aurora}
+      [[ ! $hostname =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || break
+      printf 'Use a computer name containing letters, numbers and hyphens.\n'
+    done
+    printf '%s\n%s\n' "$username" "$hostname" > "$state/owner.new"
+    sync "$state/owner.new"
+    mv "$state/owner.new" "$state/owner"
+    label "$state/owner"
+    sync "$state"
+  else
+    [[ $username =~ ^[a-z][a-z0-9_-]{0,30}$ && $hostname =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fail 'Owner journal fields are invalid'
+    printf 'Resuming setup for %s on %s.\n' "$username" "$hostname"
+  fi
+  local password confirmation
+  while :; do
+    read -r -s -p 'Linux password (also unlocks an encrypted root): ' password
+    printf '\n'
+    read -r -s -p 'Retype password: ' confirmation
+    printf '\n'
+    [[ -z $password || $password != "$confirmation" ]] || break
+    printf 'The passwords do not match or are empty. Try again.\n'
+  done
+  unset confirmation
+
+  # Read data, never source instructions, from the durable encryption journal.
+  # The disk is rekeyed before the account password is set, so a resumed
+  # setup can never leave the account and the disk with different passwords.
+  local journal=/boot/omarchy/encrypt.state key value phase='' partition='' uuid='' format='' device keyfile
+  [[ -f $journal && ! -L $journal ]] || fail 'Root preparation journal is missing'
+  while IFS='=' read -r key value; do
+    case $key in
+      format) format=$value ;;
+      phase) phase=$value ;;
+      partition) partition=$value ;;
+      luks_uuid) uuid=$value ;;
+    esac
+  done < "$journal"
+  [[ $format == 1 ]] || fail 'Root preparation journal has an unsupported format'
+  case $phase in
+    declined) ;;
+    configured|rekeyed|finished)
+      [[ $partition =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ &&
+         $uuid =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || fail 'Encrypted-root identity is invalid'
+      device=/dev/disk/by-partuuid/$partition
+      [[ $(cryptsetup luksUUID "$device") == "$uuid" ]] || fail 'Encrypted-root UUID differs from its journal'
+      keyfile=$state/luks-key
+      if ! printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" 2>/dev/null; then
+        [[ -f $keyfile && ! -L $keyfile ]] || fail 'The temporary encryption key is unavailable; use the original setup password to resume'
+        # An occupied owner slot is never replaced implicitly.
+        if cryptsetup luksDump --dump-json-metadata "$device" | python3 -c 'import json,sys; sys.exit(0 if "1" in json.load(sys.stdin)["keyslots"] else 1)'; then
+          fail 'Enter the password already used for this installation to resume'
+        fi
+        printf 'Protecting the encrypted disk with your password...\n'
+        printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-slot 1 --key-file "$keyfile" "$device" -
+      fi
+      printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Owner password did not unlock root'
+      if [[ -f $keyfile ]]; then
+        if cryptsetup open --test-passphrase --key-file "$keyfile" "$device" 2>/dev/null; then
+          cryptsetup luksRemoveKey --batch-mode --key-file "$keyfile" "$device"
+        fi
+        if cryptsetup open --test-passphrase --key-file "$keyfile" "$device" 2>/dev/null; then
+          fail 'The temporary encryption key is still usable'
+        fi
+      fi
+      printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Owner unlock failed after temporary-key removal'
+      # Both copies are retired only after the replacement unlock is proven.
+      rm -f -- "$state/luks-key" /boot/omarchy/luks-key
+      sync "$state" /boot/omarchy
+      printf 'format=1\nphase=finished\npartition=%s\nluks_uuid=%s\n' "$partition" "$uuid" > "$journal.new"
+      sync "$journal.new"
+      mv "$journal.new" "$journal"
+      label "$journal"
+      sync /boot/omarchy
+      ;;
+    *) fail "Root preparation is incomplete (phase=$phase)" ;;
   esac
-done < "$journal"
-[[ $format == 1 ]] || fail 'Root preparation journal has an unsupported format'
-case $phase in
-  declined) ;;
-  configured|rekeyed|finished)
-    [[ $partition =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ &&
-       $uuid =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || fail 'Encrypted-root identity is invalid'
-    device=/dev/disk/by-partuuid/$partition
-    [[ $(cryptsetup luksUUID "$device") == "$uuid" ]] || fail 'Encrypted-root UUID differs from its journal'
-    key=$state/luks-key
-    if ! printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" 2>/dev/null; then
-      [[ -f $key && ! -L $key ]] || fail 'The temporary encryption key is unavailable; use the original setup password to resume'
-      # An occupied owner slot is never replaced implicitly.
-      if cryptsetup luksDump --dump-json-metadata "$device" | python3 -c 'import json,sys; sys.exit(0 if "1" in json.load(sys.stdin)["keyslots"] else 1)'; then
-        fail 'Enter the password already used for this installation to resume'
-      fi
-      printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-slot 1 --key-file "$key" "$device" -
-    fi
-    printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Owner password did not unlock root'
-    if [[ -f $key ]]; then
-      if cryptsetup open --test-passphrase --key-file "$key" "$device" 2>/dev/null; then
-        cryptsetup luksRemoveKey --batch-mode --key-file "$key" "$device"
-      fi
-      if cryptsetup open --test-passphrase --key-file "$key" "$device" 2>/dev/null; then
-        fail 'The temporary encryption key is still usable'
-      fi
-    fi
-    printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Owner unlock failed after temporary-key removal'
-    # Both copies are retired only after the replacement unlock is proven.
-    rm -f -- "$state/luks-key" /boot/omarchy/luks-key
-    sync "$state" /boot/omarchy
-    printf 'format=1\nphase=finished\npartition=%s\nluks_uuid=%s\n' "$partition" "$uuid" > "$journal.new"
-    sync "$journal.new"
-    mv "$journal.new" "$journal"
-    sync /boot/omarchy
-    ;;
-  *) fail "Root preparation is incomplete (phase=$phase)" ;;
-esac
-unset password
 
-if [[ -e /etc/NIXOS ]]; then
-  [[ -f /etc/nixos/owner.nix ]] || fail 'The installed NixOS machine configuration is missing'
-  getent shadow "$username" | cut -d: -f2 > /var/lib/aurora/owner-password.hash
-  chmod 0600 /var/lib/aurora/owner-password.hash
-  cat > /etc/nixos/owner.nix.new <<EOF
+  # A resumed setup reuses an account an interrupted run already created.
+  if ! id "$username" >/dev/null 2>&1; then
+    local shell=/bin/bash
+    [[ ! -x /run/current-system/sw/bin/bash ]] || shell=/run/current-system/sw/bin/bash
+    useradd --create-home --shell "$shell" "$username"
+  fi
+  local uid
+  uid=$(id -u "$username")
+  (( uid >= 1000 && uid < 60000 )) || fail 'Owner account has an unexpected user ID'
+  usermod --append --groups wheel "$username"
+  printf '%s:%s\n' "$username" "$password" | chpasswd
+  unset password
+  label -R "/home/$username" /etc/passwd /etc/shadow /etc/group
+  [[ ! -e /etc/gshadow ]] || label /etc/gshadow
+  # Replace NixOS's generated /etc symlink atomically without writing into its store.
+  printf '%s\n' "$hostname" > /etc/hostname.aurora-new
+  chmod 0644 /etc/hostname.aurora-new
+  mv -Tf /etc/hostname.aurora-new /etc/hostname
+  label /etc/hostname
+  printf '%s\n' "$hostname" > /proc/sys/kernel/hostname
+  install -d -m 0755 /etc/sudoers.d
+  printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-aurora-owner.new
+  chmod 0440 /etc/sudoers.d/10-aurora-owner.new
+  visudo -cf /etc/sudoers.d/10-aurora-owner.new >/dev/null
+  mv -f /etc/sudoers.d/10-aurora-owner.new /etc/sudoers.d/10-aurora-owner
+  label /etc/sudoers.d /etc/sudoers.d/10-aurora-owner
+
+  if [[ -e /etc/NIXOS ]]; then
+    [[ -f /etc/nixos/owner.nix ]] || fail 'The installed NixOS machine configuration is missing'
+    getent shadow "$username" | cut -d: -f2 > /var/lib/aurora/owner-password.hash
+    chmod 0600 /var/lib/aurora/owner-password.hash
+    cat > /etc/nixos/owner.nix.new <<EOF
 # Aurora image machine configuration
 { ... }: {
   networking.hostName = "$hostname";
@@ -139,17 +232,39 @@ if [[ -e /etc/NIXOS ]]; then
   };
 }
 EOF
-  mv /etc/nixos/owner.nix.new /etc/nixos/owner.nix
-  sync /etc/nixos /var/lib/aurora/owner-password.hash
+    mv /etc/nixos/owner.nix.new /etc/nixos/owner.nix
+    sync /etc/nixos /var/lib/aurora/owner-password.hash
+  fi
+  printf '%s\n' "$username" > "$state/complete"
+  label "$state/complete"
+  local account_files=(/etc/passwd /etc/shadow /etc/group)
+  [[ ! -e /etc/gshadow ]] || account_files+=(/etc/gshadow)
+  sync "$state/complete" "${account_files[@]}"
+  rm -- "$state/pending"
+  sync "$state"
+  printf '\nAurora setup is complete. Sign in as %s.\n' "$username"
+}
+
+# Each attempt runs as its own process: errexit stays in force there, and a
+# failed attempt cannot leave secrets or half-set state in this one.
+if [[ ${1:-} == --attempt ]]; then
+  setup
+  exit 0
 fi
-if command -v restorecon >/dev/null; then
-  restorecon -RF "/home/$username" /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers.d /etc/hostname "$state"
-fi
-printf '%s\n' "$username" > "$state/complete"
-account_files=(/etc/passwd /etc/shadow /etc/group)
-[[ ! -e /etc/gshadow ]] || account_files+=(/etc/gshadow)
-sync "$state/complete" "${account_files[@]}"
-rm -- "$state/pending"
-sync "$state"
-printf '\nAurora setup is complete. Sign in as %s.\n' "$username"
+
+release_splash
+show_text_console
+# Clear whatever the splash or boot messages left on the console.
+printf '\033[H\033[2J'
+command -v chvt >/dev/null && chvt "${console#/dev/tty}" 2>/dev/null || true
+quiet_console
+trap restore_console EXIT
+# Every step is resumable from the owner and encryption journals, so a failed
+# attempt is retried in place instead of failing the boot behind the greeter.
+until "$BASH" "${BASH_SOURCE[0]}" --attempt; do
+  printf '\nSetup did not finish. Fix the problem above if you can, then press Enter to try again.\n'
+  printf 'Your progress is kept; restarting the computer also resumes setup.\n'
+  read -r _ || exit 1
+done
+restore_console
 "$(dirname -- "${BASH_SOURCE[0]}")/aurora-firstboot-handoff"

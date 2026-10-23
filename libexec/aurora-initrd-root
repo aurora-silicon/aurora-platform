@@ -36,6 +36,73 @@ ESP_UUID=$(blkid -c /dev/null -s UUID -o value "$ESP_DEVICE")
 
 omarchy_mac_encrypt_say() { printf 'aurora-root: %s\n' "$*"; }
 
+# BEGIN Aurora splash presentation
+# Aurora's splash shows only the conversion, so the bar and the message span
+# 0-100% of the encryption pass. Themes that ignore system-update progress,
+# such as Fedora's spinner, still show the percentage in the message text.
+AURORA_SPLASH_MESSAGE=${AURORA_SPLASH_MESSAGE:-/run/aurora-root/splash-message}
+
+aurora_splash_message() {
+  local text=$1 previous=''
+  omarchy_mac_encrypt_splash || return 0
+  previous=$(cat "$AURORA_SPLASH_MESSAGE" 2>/dev/null || true)
+  [[ $previous != "$text" ]] || return 0
+  # Plymouth keeps every displayed message; retire the one this replaces.
+  [[ -z $previous ]] || plymouth hide-message --text="$previous" 2>/dev/null || true
+  plymouth display-message --text="$text" 2>/dev/null || true
+  mkdir -p "${AURORA_SPLASH_MESSAGE%/*}"
+  printf '%s' "$text" > "$AURORA_SPLASH_MESSAGE" 2>/dev/null || true
+}
+
+omarchy_mac_encrypt_progress() {
+  local percent=$1 text=${2:-}
+  { printf '%s\n' "$percent" >"$PROGRESS_FILE"; } 2>/dev/null || true
+  [[ -z $text ]] || AURORA_PROGRESS_LABEL=${text%...}
+  omarchy_mac_encrypt_splash || return 0
+  plymouth system-update --progress="$percent" 2>/dev/null || true
+  [[ -z ${AURORA_PROGRESS_LABEL:-} ]] || aurora_splash_message "$AURORA_PROGRESS_LABEL... $percent%"
+}
+
+# cryptsetup --progress-json prints a JSON line about once a second. Never stop
+# reading: a closed pipe would interrupt the reencryption.
+omarchy_mac_encrypt_follow_reencrypt() (
+  set +e
+  local line percent shown=-1
+  while IFS= read -r line; do
+    if [[ $line =~ \"device_bytes\":\"([0-9]+)\".*\"device_size\":\"([0-9]+)\" ]] &&
+       (( BASH_REMATCH[2] > 0 )); then
+      percent=$(( BASH_REMATCH[1] * 100 / BASH_REMATCH[2] ))
+      (( percent <= 100 )) || percent=100
+      if (( percent != shown )); then
+        shown=$percent
+        omarchy_mac_encrypt_progress "$percent"
+      fi
+    else
+      printf '%s\n' "$line"
+    fi
+  done
+  return 0
+)
+
+omarchy_mac_encrypt_surface_failure() {
+  local marker=${OMARCHY_MAC_ENCRYPT_FAILED_FILE:-/run/omarchy-mac-encrypt.failed}
+  printf '%s\n' "$*" >"$marker" 2>/dev/null || true
+  OMARCHY_MAC_ENCRYPT_SURFACED=1
+  if omarchy_mac_encrypt_splash; then
+    aurora_splash_message "Aurora could not encrypt this Mac: $*"
+  elif [[ -w ${OMARCHY_MAC_ENCRYPT_CONSOLE:-/dev/console} ]]; then
+    printf 'aurora-root: %s\n' "$*" >"${OMARCHY_MAC_ENCRYPT_CONSOLE:-/dev/console}" 2>/dev/null || true
+  fi
+}
+
+omarchy_mac_encrypt_surface_unexpected() {
+  local status=$1
+  (( status != 0 )) || return 0
+  [[ ${OMARCHY_MAC_ENCRYPT_SURFACED:-0} == 1 ]] ||
+    omarchy_mac_encrypt_surface_failure "stopped unexpectedly (status $status); see journalctl -b -u aurora-initrd-root"
+}
+# END Aurora splash presentation
+
 omarchy_mac_encrypt_mount_esp() {
   ESP_MNT=/run/aurora-root/esp
   mkdir -p "$ESP_MNT"
@@ -104,6 +171,10 @@ omarchy_mac_encrypt_finish() {
   sync "$ROOT_MNT$PROVISIONING_DIR/luks-key"
   omarchy_mac_encrypt_umount_root
   omarchy_mac_encrypt_write_state configured
+  # The splash stays up until account setup; say the drive is done rather
+  # than leaving a finished percentage that looks stalled.
+  omarchy_mac_encrypt_progress 100
+  aurora_splash_message 'Your drive is encrypted. Starting Aurora...'
 }
 
 aurora_verify_opened_root() {

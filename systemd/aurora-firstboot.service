@@ -1,7 +1,10 @@
 [Unit]
 Description=Create the Aurora Linux owner account
 ConditionPathExists=/var/lib/aurora/firstboot/pending
-After=local-fs.target systemd-user-sessions.service systemd-vconsole-setup.service plymouth-start.service
+# Plymouth must have started before setup releases it. On console-only boots
+# plymouth-quit.service is ordered first; a display manager replaces that
+# unit, and setup then releases the splash itself, with a time bound.
+After=local-fs.target systemd-user-sessions.service systemd-vconsole-setup.service plymouth-start.service plymouth-quit.service
 Before=display-manager.service getty@tty1.service
 RequiresMountsFor=/boot /boot/efi /home
 

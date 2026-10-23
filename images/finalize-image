@@ -61,6 +61,11 @@ touch "$scratch/root/var/lib/aurora/firstboot/pending"
 chroot "$scratch/root" systemctl enable aurora-firstboot.service
 # Aurora owns account setup on tty1; the generic base wizard must not compete.
 chroot "$scratch/root" systemctl mask systemd-firstboot.service
+# GRUB must never probe other disks or NVMe namespaces; see harden-grub.py.
+flavor=fedora
+[[ $backend == dracut ]] || flavor=arch
+python3 "$(dirname -- "${BASH_SOURCE[0]}")/harden-grub.py" "$scratch/root" --flavor "$flavor" \
+  --boot-uuid "$boot_uuid" --efi-uuid "$efi_uuid"
 if [[ $backend == dracut ]]; then
   chroot "$scratch/root" systemctl disable initial-setup.service initial-setup-graphical.service 2>/dev/null || true
   rm -f "$scratch/root/etc/reconfigSys"
