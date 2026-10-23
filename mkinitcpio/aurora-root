@@ -1,8 +1,9 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 build() {
-  [[ -f /etc/aurora/image-layout ]] || return 0
-  local binary
+  local layout=${AURORA_IMAGE_LAYOUT:-/etc/aurora/image-layout}
+  [[ -f $layout ]] || return 0
+  local binary unit
   for binary in bash cryptsetup btrfs blkid lsblk awk findmnt mount umount readlink stat modprobe \
     mkdir chmod dd date cat mv sync install grep sed kill sleep tr systemd-ask-password; do
     add_binary "$(command -v "$binary")"
@@ -12,12 +13,18 @@ build() {
   add_module btrfs
   add_module vfat
   add_module ext4
-  add_file /etc/aurora/image-layout
+  add_file "$layout" /etc/aurora/image-layout
   add_file /usr/lib/aurora/vendor/omarchy-mac-encrypt
   add_file /usr/lib/aurora/aurora-initrd-root
   add_file /usr/lib/aurora/initrd/aurora-initrd-root.service /usr/lib/systemd/system/aurora-initrd-root.service
   add_file /usr/lib/aurora/initrd/aurora-root-sysroot.conf /usr/lib/systemd/system/sysroot.mount.d/aurora-root.conf
   add_file /usr/lib/aurora/initrd/aurora-root-mapper.conf /usr/lib/systemd/system/dev-mapper-root.device.d/aurora-root.conf
+  # root= names the Btrfs filesystem. Once the root is encrypted that device
+  # appears only after aurora-initrd-root has unlocked it, so waiting for it
+  # must outlast the passphrase prompt instead of failing after 90 seconds.
+  while IFS= read -r unit; do
+    add_file /usr/lib/aurora/initrd/aurora-root-mapper.conf "/usr/lib/systemd/system/$unit.d/aurora-root.conf"
+  done < <("${AURORA_INITRD_ROOT:-/usr/lib/aurora/aurora-initrd-root}" --root-device-units "$layout")
   add_symlink /usr/lib/systemd/system/initrd.target.wants/aurora-initrd-root.service ../aurora-initrd-root.service
 }
 help() { echo 'Prepare and unlock a fresh Aurora Btrfs root using the systemd initrd.'; }
