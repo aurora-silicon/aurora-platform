@@ -2,6 +2,15 @@
 # SPDX-License-Identifier: MIT
 # Aurora image adapter for the captured Btrfs conversion state machine.
 set -euo pipefail
+# For initramfs builders: print the device units that root= can name for this
+# image (its Btrfs UUID and label), one per line.
+if [[ ${1:-} == --root-device-units ]]; then
+  uuid=$(sed -n 's/^root_uuid=//p' "${2:?image layout required}")
+  [[ $uuid =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || { echo 'Aurora image layout has no root UUID' >&2; exit 1; }
+  systemd-escape --path --suffix=device "/dev/disk/by-uuid/$uuid"
+  systemd-escape --path --suffix=device /dev/disk/by-label/AURORA_ROOT
+  exit 0
+fi
 library=${AURORA_ENCRYPT_LIBRARY:-/usr/lib/aurora/vendor/omarchy-mac-encrypt}
 layout=${AURORA_IMAGE_LAYOUT:-/etc/aurora/image-layout}
 [[ -e $layout ]] || exit 0
