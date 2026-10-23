@@ -18,6 +18,7 @@ install-common:
 	install -Dm644 systemd/aurora-firstboot.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-firstboot.service
 	install -Dm644 systemd/aurora-display-manager.conf $(DESTDIR)$(LIBDIR)/systemd/system/display-manager.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-getty.conf $(DESTDIR)$(LIBDIR)/systemd/system/getty@.service.d/aurora-firstboot.conf
+	install -Dm644 systemd/aurora-plasma-setup.conf $(DESTDIR)$(LIBDIR)/systemd/system/plasma-setup.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-getty.conf $(DESTDIR)$(LIBDIR)/systemd/system/serial-getty@.service.d/aurora-firstboot.conf
 
 install-dracut:
