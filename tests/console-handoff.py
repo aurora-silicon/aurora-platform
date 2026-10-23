@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Exercise actual systemd controlling-terminal handoff on a private PTY."""
+"""Exercise the first-boot console takeover on a private PTY under systemd.
+
+The unit never takes tty1 itself (systemd's TTYReset/TTYVHangup would cut the
+boot splash off its keyboard). The text wizard opens the terminal by itself
+once the splash is gone. This checks that a service started with
+StandardInput=null can do that while another session still owns the terminal
+as its controlling terminal, and that the prompt reads what is typed.
+"""
 import fcntl
 import os
 from pathlib import Path
@@ -13,14 +20,10 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(*args, **kwargs):
-    return subprocess.run(args, check=True, **kwargs)
-
-
 def wait_for(path, timeout):
     until = time.monotonic() + timeout
     while time.monotonic() < until:
-        if path.exists():
+        if path.exists() and path.read_text():
             return True
         time.sleep(0.05)
     return False
@@ -28,11 +31,12 @@ def wait_for(path, timeout):
 
 def main():
     assert os.geteuid() == 0, 'test requires a disposable root-capable systemd worker'
-    source = (ROOT / 'systemd/aurora-firstboot.service').read_text()
-    mode = next(line.split('=', 1)[1] for line in source.splitlines()
-                if line.startswith('StandardInput='))
-    assert mode == 'tty-force'
-    assert 'plymouth-start.service' in source
+    service = (ROOT / 'systemd/aurora-firstboot.service').read_text()
+    assert 'StandardInput=null' in service and 'TTYPath' not in service
+    assert 'plymouth-start.service' in service
+    script = (ROOT / 'libexec/aurora-firstboot').read_text()
+    takeover = 'exec 0<>"$console" 1>&0 2>&0'
+    assert takeover in script
     master, slave = pty.openpty()
     tty = os.ttyname(slave)
     ready_r, ready_w = os.pipe()
@@ -50,31 +54,27 @@ def main():
         finally:
             os._exit(0)
     os.close(ready_w)
-    units = []
+    unit = f'aurora-console-fixture-{os.getpid()}.service'
     try:
         assert os.read(ready_r, 1) == b'1'
         with tempfile.TemporaryDirectory(prefix='aurora-console-test-') as temporary:
-            for kind, expected in [('tty', False), (mode, True)]:
-                unit = f'aurora-console-fixture-{os.getpid()}-{kind}.service'
-                units.append(unit)
-                marker = Path(temporary) / kind
-                run('systemd-run', '--no-block', '--unit=' + unit,
-                    '--property=Type=oneshot', '--property=RemainAfterExit=yes',
-                    '--property=StandardInput=' + kind,
-                    '--property=TTYPath=' + tty, '--property=StandardOutput=journal',
-                    '--property=StandardError=journal', '--property=TimeoutStartSec=8s',
-                    '--property=TimeoutStopSec=2s', '/usr/bin/touch', str(marker))
-                started = wait_for(marker, 2)
-                if started != expected:
-                    subprocess.run(['systemctl', 'status', '--no-pager', unit])
-                    subprocess.run(['journalctl', '-u', unit, '--no-pager'])
-                    raise AssertionError(f'{kind}: prompt execution={started}, expected={expected}')
-                run('systemctl', 'stop', unit)
-                print(f'{kind}: existing TTY owner; prompt executed={started}', flush=True)
-        print('Observed tty waiting; actual first-boot tty-force acquired its private console.')
+            marker = Path(temporary) / 'answer'
+            prompt = (f'console={tty}; {takeover}; stty sane; '
+                      f'read -r -p "Linux username: " answer; printf "%s" "$answer" > {marker}')
+            subprocess.run(['systemd-run', '--no-block', '--unit=' + unit,
+                            '--property=Type=oneshot', '--property=StandardInput=null',
+                            '--property=StandardOutput=journal', '--property=TimeoutStartSec=8s',
+                            '/bin/bash', '-c', prompt], check=True)
+            time.sleep(1)
+            os.write(master, b'owner\n')
+            if not wait_for(marker, 5):
+                subprocess.run(['systemctl', 'status', '--no-pager', unit])
+                subprocess.run(['journalctl', '-u', unit, '--no-pager'])
+                raise AssertionError('the prompt did not read the typed answer')
+            assert marker.read_text() == 'owner', marker.read_text()
+        print('A StandardInput=null service took a terminal owned by another session and read the answer.')
     finally:
-        for unit in units:
-            subprocess.run(['systemctl', 'stop', unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['systemctl', 'stop', unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         os.kill(holder, signal.SIGKILL)
         os.waitpid(holder, 0)
         os.close(ready_r)

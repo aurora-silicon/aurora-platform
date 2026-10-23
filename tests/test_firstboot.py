@@ -131,13 +131,50 @@ class UnitTests(unittest.TestCase):
 
     def test_setup_releases_the_splash_with_a_bound(self):
         service = (ROOT / 'systemd/aurora-firstboot.service').read_text()
-        self.assertIn('plymouth-quit.service', service)
-        self.assertNotIn('plymouth-quit-wait.service', service)
+        # The stock quit waits for setup, never the other way round, so the
+        # splash survives until the disk-password prompt is done.
+        after = next(line for line in service.splitlines() if line.startswith('After='))
+        self.assertNotIn('plymouth-quit', after)
+        self.assertIn('After=aurora-firstboot.service',
+                      (ROOT / 'systemd/aurora-plymouth-quit.conf').read_text())
         script = (ROOT / 'libexec/aurora-firstboot').read_text()
         self.assertIn('timeout --kill-after=2 10 plymouth quit', script)
-        self.assertNotRegex(script, r'(?m)^\s*plymouth quit')
+        self.assertIsNone(re.search(r'(?m)^\s*plymouth quit', script))
         # set -e must stay in force, so each attempt runs as its own process.
-        self.assertIn('until "$BASH" "${BASH_SOURCE[0]}" --attempt; do', script)
+        self.assertIn('until "$BASH" "${BASH_SOURCE[0]}" --attempt "$mode"; do', script)
+
+    def test_unit_leaves_tty1_to_the_splash(self):
+        # systemd's TTYReset/TTYVHangup on tty1 cut Plymouth off its keyboard,
+        # so the splash's disk-password prompt never saw a keystroke.
+        service = (ROOT / 'systemd/aurora-firstboot.service').read_text()
+        self.assertIn('StandardInput=null', service)
+        for setting in ('TTYPath', 'TTYReset', 'TTYVHangup', 'tty-force', 'StandardOutput=tty'):
+            self.assertNotIn(setting, service)
+        script = (ROOT / 'libexec/aurora-firstboot').read_text()
+        self.assertIn('exec 0<>"$console" 1>&0 2>&0', script)
+
+    def test_text_wizard_can_be_asked_for_recovery(self):
+        service = (ROOT / 'systemd/aurora-firstboot.service').read_text()
+        self.assertIn('ConditionPathExists=|/var/lib/aurora/firstboot/pending', service)
+        self.assertIn('ConditionKernelCommandLine=|aurora.firstboot=text', service)
+
+    def test_desktop_setup_protects_the_disk_before_the_greeter(self):
+        script = (ROOT / 'libexec/aurora-firstboot').read_text()
+        desktop = script[script.index('setup_desktop() {'):script.index('setup_text() {')]
+        self.assertLess(desktop.index('protect_disk "$password"'), desktop.index('rm -- "$state/pending"'))
+        self.assertIn('plymouth ask-for-password', script)
+        self.assertLess(desktop.index('allow_wheel'), desktop.index('rm -- "$state/pending"'))
+
+    def test_plasma_setup_runs_after_the_disk_step(self):
+        dropin = (ROOT / 'systemd/aurora-plasma-setup.conf').read_text()
+        self.assertIn('After=aurora-firstboot.service', dropin)
+        self.assertIn('ConditionPathExists=!/var/lib/aurora/firstboot/pending', dropin)
+        self.assertIn('ConditionPathExists=!/var/lib/aurora/firstboot/complete', dropin)
+        self.assertNotIn('Requires=', dropin)
+        with tempfile.TemporaryDirectory() as temporary:
+            subprocess.run(['make', '-s', 'install-common', 'DESTDIR=' + temporary], cwd=ROOT, check=True)
+            installed = Path(temporary) / 'usr/lib/systemd/system/plasma-setup.service.d/aurora-firstboot.conf'
+            self.assertEqual(installed.read_text(), dropin)
 
     def test_selinux_labels_every_installed_program(self):
         pattern = (ROOT / 'selinux/aurora_firstboot.fc').read_text().split()[0]

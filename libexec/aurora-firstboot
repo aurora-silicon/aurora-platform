@@ -1,13 +1,38 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
-# Linux account setup; macOS owner credentials never enter this interface.
+# First-boot owner setup; macOS owner credentials never enter this interface.
+#
+# Desktop images: protect the encrypted disk with a password chosen on the
+# boot splash (or the console when there is none), then hand over to the
+# desktop's own graphical setup (Plasma Setup, GNOME Initial Setup), which
+# creates the owner account. Minimal images, and any boot with
+# aurora.firstboot=text on the kernel command line, use the text wizard on
+# tty1, where one password protects both the account and the disk.
 set -euo pipefail
 umask 077
 state=/var/lib/aurora/firstboot
-[[ -f $state/pending ]] || exit 0
 console=${AURORA_FIRSTBOOT_TTY:-/dev/tty1}
+error_file=/run/aurora-firstboot.error
 
 log() { logger -t aurora-firstboot -- "$*" 2>/dev/null || true; }
+
+text_requested() { [[ " $(</proc/cmdline) " == *" aurora.firstboot=text "* ]]; }
+
+# A person's account: a regular UID and a login shell (NixOS build users and
+# other service accounts in that range use nologin).
+owner_exists() {
+  getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { found = 1 } END { exit !found }'
+}
+
+if [[ ! -f $state/pending ]]; then
+  # Recovery: the text wizard can be asked for while no owner exists, for
+  # example when the desktop's own setup cannot run.
+  [[ ${1:-} != --attempt ]] && text_requested && ! owner_exists || exit 0
+  install -d -m 0700 "$state"
+  touch "$state/pending"
+fi
+
+splash_up() { command -v plymouth >/dev/null 2>&1 && timeout 5 plymouth --ping 2>/dev/null; }
 
 # Give the console a bounded chance to come back from the boot splash. A splash
 # that does not quit is stopped, so it can never hide this setup indefinitely.
@@ -35,16 +60,23 @@ release_splash() {
   kill -KILL "$pid" 2>/dev/null || true
 }
 
+# Take tty1 for the prompts once nothing else (the splash) reads from it.
 # A splash that was stopped can leave the virtual terminal in graphics mode,
-# where text is never drawn. KDSETMODE(KD_TEXT) makes the prompts visible.
+# where text is never drawn; KDSETMODE(KD_TEXT) makes the prompts visible.
 show_text_console() {
   [[ $console == /dev/tty[0-9]* && -c $console ]] || return 0
+  exec 0<>"$console" 1>&0 2>&0
+  stty sane 2>/dev/null || true
+  ! command -v kbd_mode >/dev/null || kbd_mode -u 2>/dev/null || true
   python3 - "$console" <<'PY' 2>/dev/null || true
 import fcntl, os, sys
 fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY)
 fcntl.ioctl(fd, 0x4B3A, 0)  # KDSETMODE, KD_TEXT
 os.close(fd)
 PY
+  # Clear whatever the splash or boot messages left on the console.
+  printf '\033[H\033[2J'
+  ! command -v chvt >/dev/null || chvt "${console#/dev/tty}" 2>/dev/null || true
 }
 
 # systemd status lines and kernel messages share this console with the
@@ -74,16 +106,57 @@ label() {
   restorecon -F "$@"
 }
 
-fail() { printf '\nAurora setup: %s\n' "$*" >&2; exit 1; }
+# Say something where the person can see it: the splash while it is up,
+# otherwise the console.
+splash_message=''
+say() {
+  if splash_up; then
+    [[ -z $splash_message ]] || plymouth hide-message --text="$splash_message" 2>/dev/null || true
+    splash_message=$*
+    plymouth display-message --text="$*" 2>/dev/null || true
+  else
+    printf '%s\n' "$*"
+  fi
+}
 
-setup() {
+fail() {
+  printf 'Aurora setup: %s\n' "$*" > "$error_file" 2>/dev/null || true
+  say "Aurora setup: $*"
+  printf '\nAurora setup: %s\n' "$*" >&2
+  exit 1
+}
+
+# Each mode desktop | text decides who creates the owner account.
+choose_mode() {
+  local target unit enabled directory
+  text_requested && { echo text; return; }
+  target=$(systemctl show --property=Id --value default.target 2>/dev/null || true)
+  [[ $target == graphical.target ]] && systemctl cat display-manager.service >/dev/null 2>&1 || { echo text; return; }
+  # The desktop's own setup only runs while the system has no owner.
+  ! owner_exists || { echo text; return; }
+  # A distribution that wires up the desktop's setup itself declares it.
+  [[ ! -f /etc/aurora/desktop-account-setup ]] || { echo desktop; return; }
+  for unit in plasma-setup.service; do
+    enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    if [[ $enabled == enabled && ! -e /etc/plasma-setup-done ]]; then echo desktop; return; fi
+  done
+  # GDM runs GNOME Initial Setup while the system has no owner.
+  if [[ $(systemctl show --property=Id --value display-manager.service 2>/dev/null) == gdm.service ]]; then
+    for directory in /usr/share /run/current-system/sw/share; do
+      [[ ! -f $directory/gnome-session/sessions/gnome-initial-setup.session ]] || { echo desktop; return; }
+    done
+  fi
+  echo text
+}
+
+prepare() {
   set -E
-  trap 'printf "\nAurora setup: a setup step failed (status %s): %s\n" "$?" "$BASH_COMMAND" >&2' ERR
+  trap 'printf "Aurora setup: a setup step failed (status %s): %s\n" "$?" "$BASH_COMMAND" | tee "$error_file" >&2' ERR
   trap 'unset password confirmation; stty echo 2>/dev/null || true' EXIT
   [[ -f /usr/lib/aurora/image-format && $(</usr/lib/aurora/image-format) == aurora-btrfs-v1 ]] ||
     fail 'This installation is not an Aurora image'
   local tool
-  for tool in getent findmnt btrfs useradd usermod chpasswd visudo cryptsetup python3 cut sync; do
+  for tool in "$@" getent findmnt btrfs visudo cryptsetup python3 cut sync; do
     command -v "$tool" >/dev/null || fail "Required setup command is missing: $tool"
   done
   [[ ! -e /run/omarchy-mac-encrypt.failed ]] || fail "Root preparation failed: $(</run/omarchy-mac-encrypt.failed)"
@@ -91,6 +164,130 @@ setup() {
   label "$state"
   [[ $(findmnt -nro FSTYPE /) == btrfs ]] || fail 'This image requires a Btrfs root'
   btrfs filesystem resize max / >/dev/null
+}
+
+# Read data, never source instructions, from the durable encryption journal.
+journal=/boot/omarchy/encrypt.state
+phase='' partition='' uuid='' device=''
+read_journal() {
+  local key value format=''
+  [[ -f $journal && ! -L $journal ]] || fail 'Root preparation journal is missing'
+  while IFS='=' read -r key value; do
+    case $key in
+      format) format=$value ;;
+      phase) phase=$value ;;
+      partition) partition=$value ;;
+      luks_uuid) uuid=$value ;;
+    esac
+  done < "$journal"
+  [[ $format == 1 ]] || fail 'Root preparation journal has an unsupported format'
+  case $phase in
+    declined) ;;
+    configured|rekeyed|finished)
+      [[ $partition =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ &&
+         $uuid =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || fail 'Encrypted-root identity is invalid'
+      device=/dev/disk/by-partuuid/$partition
+      [[ $(cryptsetup luksUUID "$device") == "$uuid" ]] || fail 'Encrypted-root UUID differs from its journal'
+      ;;
+    *) fail "Root preparation is incomplete (phase=$phase)" ;;
+  esac
+}
+
+# The disk still opens with the temporary key until the owner's password has
+# replaced it.
+disk_needs_password() {
+  [[ $phase != declined ]] || return 1
+  [[ $phase != finished || -e $state/luks-key || -e /boot/omarchy/luks-key ]]
+}
+
+# Enroll the password in key slot 1, prove it unlocks, then destroy both copies
+# of the temporary key. Every step can be resumed.
+protect_disk() {
+  local password=$1 keyfile=$state/luks-key
+  if ! printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" 2>/dev/null; then
+    [[ -f $keyfile && ! -L $keyfile ]] || fail 'The temporary encryption key is unavailable; use the original setup password to resume'
+    # An occupied owner slot is never replaced implicitly.
+    if cryptsetup luksDump --dump-json-metadata "$device" | python3 -c 'import json,sys; sys.exit(0 if "1" in json.load(sys.stdin)["keyslots"] else 1)'; then
+      fail 'Enter the password already used for this installation to resume'
+    fi
+    say 'Protecting the encrypted disk with your password...'
+    printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-slot 1 --key-file "$keyfile" "$device" -
+  fi
+  printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'The new password did not unlock the disk'
+  if [[ -f $keyfile ]]; then
+    if cryptsetup open --test-passphrase --key-file "$keyfile" "$device" 2>/dev/null; then
+      cryptsetup luksRemoveKey --batch-mode --key-file "$keyfile" "$device"
+    fi
+    if cryptsetup open --test-passphrase --key-file "$keyfile" "$device" 2>/dev/null; then
+      fail 'The temporary encryption key is still usable'
+    fi
+  fi
+  printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Unlock failed after temporary-key removal'
+  # Both copies are retired only after the replacement unlock is proven.
+  rm -f -- "$state/luks-key" /boot/omarchy/luks-key
+  sync "$state" /boot/omarchy
+  printf 'format=1\nphase=finished\npartition=%s\nluks_uuid=%s\n' "$partition" "$uuid" > "$journal.new"
+  sync "$journal.new"
+  mv "$journal.new" "$journal"
+  label "$journal"
+  sync /boot/omarchy
+}
+
+# Arch's sudoers does not enable the wheel group; the owner is created in it.
+allow_wheel() {
+  install -d -m 0755 /etc/sudoers.d
+  printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-aurora-owner.new
+  chmod 0440 /etc/sudoers.d/10-aurora-owner.new
+  visudo -cf /etc/sudoers.d/10-aurora-owner.new >/dev/null
+  mv -f /etc/sudoers.d/10-aurora-owner.new /etc/sudoers.d/10-aurora-owner
+  label /etc/sudoers.d /etc/sudoers.d/10-aurora-owner
+}
+
+# Ask twice for the disk password: on the splash when it is up, otherwise on
+# the console. The person at the first boot is the owner.
+ask_disk_password() {
+  local confirmation
+  while :; do
+    if splash_up; then
+      say 'Choose a password for this Mac'"'"'s disk. You will enter it whenever the Mac starts.'
+      password=$(plymouth ask-for-password --prompt='New disk password') || fail 'The disk password prompt was closed'
+      confirmation=$(plymouth ask-for-password --prompt='Retype the disk password') || fail 'The disk password prompt was closed'
+    else
+      printf '\nChoose a password for this Mac'"'"'s disk. You will enter it whenever the Mac starts.\n'
+      read -r -s -p 'Disk password: ' password
+      printf '\n'
+      read -r -s -p 'Retype disk password: ' confirmation
+      printf '\n'
+    fi
+    [[ -z $password || $password != "$confirmation" ]] || break
+    say 'The passwords did not match or were empty. Try again.'
+  done
+  unset confirmation
+}
+
+# Desktop images: the desktop's own setup creates the owner account.
+setup_desktop() {
+  local password=''
+  prepare
+  read_journal
+  if disk_needs_password; then
+    ask_disk_password
+    protect_disk "$password"
+    unset password
+  fi
+  allow_wheel
+  # The disk password was chosen on its own; the text wizard, if it is ever
+  # used for recovery, does not tie the account password to it.
+  printf 'desktop\n' > "$state/desktop"
+  label "$state/desktop"
+  sync "$state/desktop"
+  rm -- "$state/pending"
+  sync "$state"
+  say 'Starting setup...'
+}
+
+setup_text() {
+  prepare useradd usermod chpasswd
   local username='' hostname='' owner=()
   if [[ -e $state/owner ]]; then
     [[ -f $state/owner && ! -L $state/owner ]] || fail 'Owner journal is invalid'
@@ -137,58 +334,13 @@ setup() {
   done
   unset confirmation
 
-  # Read data, never source instructions, from the durable encryption journal.
   # The disk is rekeyed before the account password is set, so a resumed
   # setup can never leave the account and the disk with different passwords.
-  local journal=/boot/omarchy/encrypt.state key value phase='' partition='' uuid='' format='' device keyfile
-  [[ -f $journal && ! -L $journal ]] || fail 'Root preparation journal is missing'
-  while IFS='=' read -r key value; do
-    case $key in
-      format) format=$value ;;
-      phase) phase=$value ;;
-      partition) partition=$value ;;
-      luks_uuid) uuid=$value ;;
-    esac
-  done < "$journal"
-  [[ $format == 1 ]] || fail 'Root preparation journal has an unsupported format'
-  case $phase in
-    declined) ;;
-    configured|rekeyed|finished)
-      [[ $partition =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ &&
-         $uuid =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || fail 'Encrypted-root identity is invalid'
-      device=/dev/disk/by-partuuid/$partition
-      [[ $(cryptsetup luksUUID "$device") == "$uuid" ]] || fail 'Encrypted-root UUID differs from its journal'
-      keyfile=$state/luks-key
-      if ! printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" 2>/dev/null; then
-        [[ -f $keyfile && ! -L $keyfile ]] || fail 'The temporary encryption key is unavailable; use the original setup password to resume'
-        # An occupied owner slot is never replaced implicitly.
-        if cryptsetup luksDump --dump-json-metadata "$device" | python3 -c 'import json,sys; sys.exit(0 if "1" in json.load(sys.stdin)["keyslots"] else 1)'; then
-          fail 'Enter the password already used for this installation to resume'
-        fi
-        printf 'Protecting the encrypted disk with your password...\n'
-        printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-slot 1 --key-file "$keyfile" "$device" -
-      fi
-      printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Owner password did not unlock root'
-      if [[ -f $keyfile ]]; then
-        if cryptsetup open --test-passphrase --key-file "$keyfile" "$device" 2>/dev/null; then
-          cryptsetup luksRemoveKey --batch-mode --key-file "$keyfile" "$device"
-        fi
-        if cryptsetup open --test-passphrase --key-file "$keyfile" "$device" 2>/dev/null; then
-          fail 'The temporary encryption key is still usable'
-        fi
-      fi
-      printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Owner unlock failed after temporary-key removal'
-      # Both copies are retired only after the replacement unlock is proven.
-      rm -f -- "$state/luks-key" /boot/omarchy/luks-key
-      sync "$state" /boot/omarchy
-      printf 'format=1\nphase=finished\npartition=%s\nluks_uuid=%s\n' "$partition" "$uuid" > "$journal.new"
-      sync "$journal.new"
-      mv "$journal.new" "$journal"
-      label "$journal"
-      sync /boot/omarchy
-      ;;
-    *) fail "Root preparation is incomplete (phase=$phase)" ;;
-  esac
+  # After a desktop setup protected the disk, the account password is free.
+  read_journal
+  if [[ ! -e $state/desktop && $phase != declined ]]; then
+    protect_disk "$password"
+  fi
 
   # A resumed setup reuses an account an interrupted run already created.
   if ! id "$username" >/dev/null 2>&1; then
@@ -210,12 +362,7 @@ setup() {
   mv -Tf /etc/hostname.aurora-new /etc/hostname
   label /etc/hostname
   printf '%s\n' "$hostname" > /proc/sys/kernel/hostname
-  install -d -m 0755 /etc/sudoers.d
-  printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-aurora-owner.new
-  chmod 0440 /etc/sudoers.d/10-aurora-owner.new
-  visudo -cf /etc/sudoers.d/10-aurora-owner.new >/dev/null
-  mv -f /etc/sudoers.d/10-aurora-owner.new /etc/sudoers.d/10-aurora-owner
-  label /etc/sudoers.d /etc/sudoers.d/10-aurora-owner
+  allow_wheel
 
   if [[ -e /etc/NIXOS ]]; then
     [[ -f /etc/nixos/owner.nix ]] || fail 'The installed NixOS machine configuration is missing'
@@ -248,20 +395,33 @@ EOF
 # Each attempt runs as its own process: errexit stays in force there, and a
 # failed attempt cannot leave secrets or half-set state in this one.
 if [[ ${1:-} == --attempt ]]; then
-  setup
+  rm -f -- "$error_file"
+  case ${2:-text} in
+    desktop) setup_desktop ;;
+    *) setup_text ;;
+  esac
   exit 0
 fi
 
-release_splash
-show_text_console
-# Clear whatever the splash or boot messages left on the console.
-printf '\033[H\033[2J'
-command -v chvt >/dev/null && chvt "${console#/dev/tty}" 2>/dev/null || true
+mode=$(choose_mode)
+log "first-boot mode: $mode"
 quiet_console
 trap restore_console EXIT
+if [[ $mode == text ]]; then
+  release_splash
+  show_text_console
+elif ! splash_up; then
+  show_text_console
+fi
 # Every step is resumable from the owner and encryption journals, so a failed
 # attempt is retried in place instead of failing the boot behind the greeter.
-until "$BASH" "${BASH_SOURCE[0]}" --attempt; do
+until "$BASH" "${BASH_SOURCE[0]}" --attempt "$mode"; do
+  if splash_up; then
+    # The splash would hide the failure; continue on the console.
+    release_splash
+    show_text_console
+    [[ ! -s $error_file ]] || cat -- "$error_file" >&2
+  fi
   printf '\nSetup did not finish. Fix the problem above if you can, then press Enter to try again.\n'
   printf 'Your progress is kept; restarting the computer also resumes setup.\n'
   read -r _ || exit 1

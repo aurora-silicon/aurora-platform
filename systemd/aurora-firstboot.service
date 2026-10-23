@@ -1,10 +1,14 @@
 [Unit]
-Description=Create the Aurora Linux owner account
-ConditionPathExists=/var/lib/aurora/firstboot/pending
-# Plymouth must have started before setup releases it. On console-only boots
-# plymouth-quit.service is ordered first; a display manager replaces that
-# unit, and setup then releases the splash itself, with a time bound.
-After=local-fs.target systemd-user-sessions.service systemd-vconsole-setup.service plymouth-start.service plymouth-quit.service
+Description=Aurora first-boot setup
+# Runs while setup is pending; aurora.firstboot=text also starts the text
+# wizard for recovery while the system has no owner.
+ConditionPathExists=|/var/lib/aurora/firstboot/pending
+ConditionKernelCommandLine=|aurora.firstboot=text
+# Plymouth must have started before setup uses or releases it. The stock
+# plymouth-quit.service waits for setup (plymouth-quit.service.d), so the
+# disk-password prompt keeps its splash; the text wizard releases the splash
+# itself, with a time bound.
+After=local-fs.target systemd-user-sessions.service systemd-vconsole-setup.service plymouth-start.service
 Before=display-manager.service getty@tty1.service
 RequiresMountsFor=/boot /boot/efi /home
 
@@ -13,14 +17,12 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/lib/aurora/aurora-firstboot
 TimeoutStartSec=infinity
-# First boot must acquire the console before its script can release Plymouth.
-StandardInput=tty-force
-StandardOutput=tty
-StandardError=tty
-TTYPath=/dev/tty1
-TTYReset=yes
-TTYVHangup=yes
-TTYVTDisallocate=no
+# The unit itself never takes tty1: on desktop images Plymouth reads the
+# disk-password prompt's keystrokes from it. The text wizard opens tty1 only
+# after it has released the splash.
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
