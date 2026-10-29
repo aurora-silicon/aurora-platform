@@ -14,7 +14,9 @@ make -s -C "$source_root" install-common DESTDIR="$work/root"
 fail() { echo "SELinux policy check failed: $*" >&2; exit 1; }
 for path in "$work"/root/usr/lib/aurora/aurora-*; do
   program=/usr/lib/aurora/${path##*/}
-  [[ $(matchpathcon -n "$program") == system_u:object_r:bin_t:s0 ]] || fail "$program is not bin_t"
+  expected=bin_t
+  [[ $program != /usr/lib/aurora/aurora-password-hook ]] || expected=aurora_password_hook_exec_t
+  [[ $(matchpathcon -n "$program") == system_u:object_r:$expected:s0 ]] || fail "$program is not $expected"
   echo "$program: $(matchpathcon -n "$program")"
 done
 [[ $(matchpathcon -n /usr/lib/aurora/vendor/omarchy-mac-encrypt) == system_u:object_r:lib_t:s0 ]] ||
@@ -23,6 +25,14 @@ policy=$(ls /etc/selinux/targeted/policy/policy.* | sort -V | tail -n 1)
 # systemd (init_t) starts bin_t programs in the unconfined service domain.
 sesearch -T -s init_t -t bin_t -c process "$policy" | grep -q 'unconfined_service_t;' ||
   fail 'init_t does not transition bin_t programs to unconfined_service_t'
+# PAM runs the password hook from the greeters (xdm_t); only it enters the
+# service domain from there.
+for source in xdm_t; do
+  sesearch -T -s "$source" -t aurora_password_hook_exec_t -c process "$policy" |
+    grep -q 'unconfined_service_t;' || fail "$source does not run the password hook as a service"
+  ! sesearch -T -s "$source" -t bin_t -c process "$policy" | grep -q 'unconfined_service_t;' ||
+    fail "$source enters the service domain through any bin_t program"
+done
 # Before this module the programs were lib_t: no transition, so they ran as init_t.
 ! sesearch -T -s init_t -t lib_t -c process "$policy" | grep -q . || fail 'unexpected lib_t transition'
 for target in passwd_exec_t useradd_exec_t lvm_exec_t plymouth_exec_t shell_exec_t; do

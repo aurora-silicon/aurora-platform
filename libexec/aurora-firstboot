@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: MIT
 # First-boot owner setup; macOS owner credentials never enter this interface.
 #
-# Desktop images: protect the encrypted disk with a password chosen on the
-# boot splash (or the console when there is none), then hand over to the
-# desktop's own graphical setup (Plasma Setup, GNOME Initial Setup), which
-# creates the owner account. Minimal images, and any boot with
-# aurora.firstboot=text on the kernel command line, use the text wizard on
-# tty1, where one password protects both the account and the disk.
+# Desktop images: hand over to the desktop's own graphical setup (Plasma
+# Setup, GNOME Initial Setup), which creates the owner account. The password
+# the person chooses there also becomes the disk password: PAM passes it to
+# this script as it is set or first used, and the disk is rekeyed then. Where
+# PAM cannot be hooked (a generated, read-only configuration), the disk
+# password is asked for on the boot splash instead. Minimal images, and any
+# boot with aurora.firstboot=text on the kernel command line, use the text
+# wizard on tty1, where one password protects both the account and the disk.
 set -euo pipefail
 umask 077
 state=/var/lib/aurora/firstboot
@@ -24,7 +26,7 @@ owner_exists() {
   getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { found = 1 } END { exit !found }'
 }
 
-if [[ ! -f $state/pending ]]; then
+if [[ ${1:-} != --password-hook && ${1:-} != --rekey && ! -f $state/pending ]]; then
   # Recovery: the text wizard can be asked for while no owner exists, for
   # example when the desktop's own setup cannot run.
   [[ ${1:-} != --attempt ]] && text_requested && ! owner_exists || exit 0
@@ -254,6 +256,163 @@ allow_wheel() {
   label /etc/sudoers.d /etc/sudoers.d/10-aurora-owner
 }
 
+# The owner's password reaches the disk through PAM, when the owner first
+# signs in with it at the greeter. Desktop setups sign the new owner in
+# without a password (Plasma Setup's one-time automatic login), so while the
+# disk still opens with its temporary key, a gate fails the owner's
+# automatic login and the greeter asks for the password instead. GNOME
+# Initial Setup signs the owner in with the password it just set. Each hook
+# is one line, first in its stack, removed again once the disk is rekeyed.
+pam_dir=${AURORA_PAM_DIR:-/etc/pam.d}
+pam_vendor_dir=${AURORA_PAM_VENDOR_DIR:-/usr/lib/pam.d}
+password_hook=${AURORA_PASSWORD_HOOK:-/usr/lib/aurora/aurora-password-hook}
+rekey_dir=${AURORA_REKEY_DIR:-/run/aurora-firstboot}
+declared_hooks=${AURORA_DECLARED_HOOKS:-/etc/aurora/password-hooks}
+hook_marker='# aurora-firstboot: the owner password also becomes the disk password'
+override_marker='# aurora-firstboot: a temporary copy of the vendor configuration'
+
+# PAM service, stack and hook line.
+hook_services() {
+  printf '%s\n' \
+    "plasmalogin auth optional pam_exec.so quiet expose_authtok $password_hook" \
+    "sddm auth optional pam_exec.so quiet expose_authtok $password_hook" \
+    "gdm-password auth optional pam_exec.so quiet expose_authtok $password_hook" \
+    "plasmalogin-autologin auth requisite pam_exec.so quiet $password_hook --gate" \
+    "sddm-autologin auth requisite pam_exec.so quiet $password_hook --gate"
+}
+
+# The file PAM reads for a service: /etc/pam.d, else the vendor directory.
+# Generated read-only configurations (NixOS) are never edited.
+hook_source() {
+  local service=$1
+  if [[ -e $pam_dir/$service || -L $pam_dir/$service ]]; then
+    [[ -f $pam_dir/$service && ! -L $pam_dir/$service && -w $pam_dir/$service ]] || return 1
+    printf '%s\n' "$pam_dir/$service"
+  elif [[ -f $pam_vendor_dir/$service && -w $pam_dir ]]; then
+    printf '%s\n' "$pam_vendor_dir/$service"
+  else
+    return 1
+  fi
+}
+
+# A desktop whose owner password can be followed: the distribution declares
+# permanent hooks, or a greeter's PAM file can carry one.
+password_hooks_available() {
+  local service rest
+  [[ ! -f $declared_hooks ]] || return 0
+  while read -r service rest; do
+    case $service in plasmalogin | sddm | gdm-password) hook_source "$service" >/dev/null && return 0 ;; esac
+  done < <(hook_services)
+  return 1
+}
+
+# Insert the marker and hook line before the first rule.
+add_hook() {
+  awk -v marker="$hook_marker" -v line="$2" '
+    !done && /^[[:space:]]*[^#[:space:]]/ { print marker; print line; done = 1 }
+    { print }
+    END { if (!done) { print marker; print line } }' "$1"
+}
+
+arm_password_hooks() {
+  local service rest source target armed=1
+  [[ ! -f $declared_hooks ]] || return 0
+  while read -r service rest; do
+    source=$(hook_source "$service") || continue
+    target=$pam_dir/$service
+    if [[ $service != *autologin ]]; then armed=0; fi
+    ! grep -qxF "$hook_marker" "$source" || continue
+    if [[ $source != "$target" ]]; then
+      { printf '%s\n' "$override_marker"; add_hook "$source" "$rest"; } > "$target.aurora-new"
+      chmod 0644 "$target.aurora-new"
+    else
+      add_hook "$target" "$rest" > "$target.aurora-new"
+      chmod "$(stat -c %a "$target")" "$target.aurora-new"
+    fi
+    mv -f "$target.aurora-new" "$target"
+    label "$target"
+  done < <(hook_services)
+  return $armed
+}
+
+disarm_password_hooks() {
+  local service rest target
+  while read -r service rest; do
+    target=$pam_dir/$service
+    [[ -f $target && ! -L $target ]] && grep -qxF "$hook_marker" "$target" || continue
+    if [[ $(head -n 1 "$target") == "$override_marker" ]]; then
+      rm -f -- "$target"
+      continue
+    fi
+    awk -v marker="$hook_marker" -v hook="$password_hook" '
+      $0 == marker { pending = 1; next }
+      pending && index($0, hook) { pending = 0; next }
+      { pending = 0; print }' "$target" > "$target.aurora-new"
+    chmod "$(stat -c %a "$target")" "$target.aurora-new"
+    mv -f "$target.aurora-new" "$target"
+    label "$target"
+  done < <(hook_services)
+}
+
+# A person's account by name: a regular UID and a login shell.
+is_owner() {
+  getent passwd "$1" | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { found = 1 } END { exit !found }'
+}
+
+# While the disk still opens with its temporary key, the owner signs in with
+# a password: the gate fails the owner's automatic login.
+rekey_pending() { [[ -f $state/desktop && ! -f $state/pending && -f $state/luks-key ]]; }
+
+# Called by pam_exec. With --gate it only decides an automatic login.
+# Otherwise it reads the password from stdin, checks it and hands it to
+# aurora-disk-rekey.service, which rekeys in the background; it never delays
+# or fails the sign-in.
+password_hook() {
+  local user=${PAM_USER:-} type=${PAM_TYPE:-} password='' checker candidate
+  if [[ ${1:-} == --gate ]]; then
+    ! { rekey_pending && is_owner "$user"; } || return 1
+    return 0
+  fi
+  rekey_pending || return 0
+  [[ $type == auth || $type == password ]] && is_owner "$user" || return 0
+  IFS= read -r -d '' password || [[ -n $password ]] || return 0
+  [[ -n $password ]] || return 0
+  if [[ $type == auth ]]; then
+    # A sign-in attempt: only the owner's actual password counts.
+    checker=''
+    for candidate in ${AURORA_UNIX_CHKPWD:-} "$(command -v unix_chkpwd || true)" /usr/sbin/unix_chkpwd \
+      /usr/bin/unix_chkpwd /run/wrappers/bin/unix_chkpwd; do
+      [[ -x $candidate ]] && { checker=$candidate; break; }
+    done
+    [[ -n $checker ]] || return 0
+    printf '%s\0' "$password" | "$checker" "$user" nonull || return 0
+  fi
+  install -d -m 0700 "$rekey_dir"
+  printf '%s' "$password" > "$rekey_dir/password.new"
+  unset password
+  mv -f "$rekey_dir/password.new" "$rekey_dir/password"
+  log "rekeying the disk with the password of $user ($type)"
+  systemctl start --no-block aurora-disk-rekey.service
+}
+
+# aurora-disk-rekey.service: enroll the owner's password, retire the
+# temporary key, then remove the PAM hooks.
+rekey_from_owner_password() {
+  local password=''
+  exec 9> /run/aurora-disk-rekey.lock
+  flock 9
+  [[ -f $rekey_dir/password && ! -L $rekey_dir/password ]] || return 0
+  password=$(<"$rekey_dir/password")
+  rm -f -- "$rekey_dir/password"
+  read_journal
+  if disk_needs_password; then
+    protect_disk "$password"
+    log 'the owner password now unlocks the disk; the temporary key is gone'
+  fi
+  unset password
+  disarm_password_hooks
+}
+
 # Ask twice for the disk password: on the splash when it is up, otherwise on
 # the console. The person at the first boot is the owner.
 ask_disk_password() {
@@ -276,15 +435,21 @@ ask_disk_password() {
   unset confirmation
 }
 
-# Desktop images: the desktop's own setup creates the owner account.
+# Desktop images: the desktop's own setup creates the owner account. In
+# account mode its password becomes the disk password later, through PAM;
+# otherwise the disk password is asked for now, on the splash.
 setup_desktop() {
-  local password=''
+  local password='' follow=${1:-}
   prepare
   read_journal
   if disk_needs_password; then
-    ask_disk_password
-    protect_disk "$password"
-    unset password
+    if [[ $follow == account ]]; then
+      arm_password_hooks || fail 'The desktop sign-in cannot set the disk password'
+    else
+      ask_disk_password
+      protect_disk "$password"
+      unset password
+    fi
   fi
   allow_wheel
   # The disk password was chosen on its own; the text wizard, if it is ever
@@ -294,7 +459,7 @@ setup_desktop() {
   sync "$state/desktop"
   rm -- "$state/pending"
   sync "$state"
-  say 'Starting setup...'
+  [[ $follow == account ]] || say 'Starting setup...'
 }
 
 setup_text() {
@@ -408,20 +573,29 @@ EOF
 if [[ ${1:-} == --attempt ]]; then
   rm -f -- "$error_file"
   case ${2:-text} in
+    account) setup_desktop account ;;
     desktop) setup_desktop ;;
     *) setup_text ;;
   esac
   exit 0
 fi
+case ${1:-} in
+  --password-hook) password_hook "${@:2}" || exit 1; exit 0 ;;
+  --rekey) rekey_from_owner_password; exit 0 ;;
+esac
 
 mode=$(choose_mode)
+# The account password the desktop's setup sets also unlocks the disk, so
+# nothing is asked on the splash.
+[[ $mode != desktop ]] || ! password_hooks_available || mode=account
 log "first-boot mode: $mode"
 quiet_console
 trap restore_console EXIT
-if [[ $mode == text ]]; then
+# On the MacBook Neo the boot splash stops updating once the installed
+# system has started, so nothing is ever asked on it: the text wizard and a
+# desktop that must ask for a disk password use the console.
+if [[ $mode == text || $mode == desktop ]]; then
   release_splash
-  show_text_console
-elif ! splash_up; then
   show_text_console
 fi
 # Every step is resumable from the owner and encryption journals, so a failed

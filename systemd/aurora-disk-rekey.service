@@ -1,0 +1,13 @@
+[Unit]
+Description=Let the Aurora owner password unlock the disk
+# Started by aurora-password-hook, which hands over the owner's password in
+# a root-only file under /run. Rekeying takes seconds of key derivation, so
+# it runs here rather than inside the password change or sign-in.
+ConditionPathExists=/run/aurora-firstboot/password
+RequiresMountsFor=/boot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/aurora/aurora-firstboot --rekey
+StandardOutput=journal
+StandardError=journal
