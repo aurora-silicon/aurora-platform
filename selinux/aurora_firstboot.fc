@@ -1,1 +1,2 @@
 /usr/lib/aurora/aurora-[^/]+	--	gen_context(system_u:object_r:bin_t,s0)
+/usr/lib/aurora/aurora-password-hook	--	gen_context(system_u:object_r:aurora_password_hook_exec_t,s0)

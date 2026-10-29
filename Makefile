@@ -9,6 +9,7 @@ install-common:
 	install -Dm755 libexec/aurora-initrd-root $(DESTDIR)$(LIBDIR)/aurora/aurora-initrd-root
 	install -Dm755 libexec/aurora-firstboot $(DESTDIR)$(LIBDIR)/aurora/aurora-firstboot
 	install -Dm755 libexec/aurora-firstboot-handoff $(DESTDIR)$(LIBDIR)/aurora/aurora-firstboot-handoff
+	install -Dm755 libexec/aurora-password-hook $(DESTDIR)$(LIBDIR)/aurora/aurora-password-hook
 	install -Dm755 images/harden-grub.py $(DESTDIR)$(LIBDIR)/aurora/aurora-harden-grub
 	install -Dm644 vendor/omarchy-mac-encrypt $(DESTDIR)$(LIBDIR)/aurora/vendor/omarchy-mac-encrypt
 	install -Dm644 vendor/provenance.json $(DESTDIR)$(PREFIX)/share/doc/aurora-firstboot/provenance.json
@@ -16,6 +17,7 @@ install-common:
 	install -Dm644 systemd/aurora-root-sysroot.conf $(DESTDIR)$(LIBDIR)/aurora/initrd/aurora-root-sysroot.conf
 	install -Dm644 systemd/aurora-root-mapper.conf $(DESTDIR)$(LIBDIR)/aurora/initrd/aurora-root-mapper.conf
 	install -Dm644 systemd/aurora-firstboot.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-firstboot.service
+	install -Dm644 systemd/aurora-disk-rekey.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-disk-rekey.service
 	install -Dm644 systemd/aurora-display-manager.conf $(DESTDIR)$(LIBDIR)/systemd/system/display-manager.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-getty.conf $(DESTDIR)$(LIBDIR)/systemd/system/getty@.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-plasma-setup.conf $(DESTDIR)$(LIBDIR)/systemd/system/plasma-setup.service.d/aurora-firstboot.conf
