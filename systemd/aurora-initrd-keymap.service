@@ -1,0 +1,13 @@
+[Unit]
+Description=Give the Aurora disk password prompt the system keymap
+# Rebuilds the initrds only when the keymap they carry is not the one in
+# /etc/vconsole.conf. Started by aurora-initrd-keymap.path and after the
+# owner's password first unlocks the disk.
+ConditionPathExists=/etc/aurora/image-layout
+RequiresMountsFor=/boot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/aurora/aurora-firstboot --sync-initrd-keymap
+StandardOutput=journal
+StandardError=journal
