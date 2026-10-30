@@ -9,6 +9,8 @@ install() {
     inst_binary "$(command -v "$binary")" || return 1
   done
   inst_binary /usr/bin/systemd-ask-password
+  # The unlock prompt uses the keymap the i18n module copies from vconsole.conf.
+  dracut_module_included i18n || dwarn 'aurora-root: without the i18n module the disk password prompt uses the US keymap'
   inst_simple "$layout" /etc/aurora/image-layout
   inst_script /usr/lib/aurora/aurora-initrd-root
   inst_simple /usr/lib/aurora/vendor/omarchy-mac-encrypt

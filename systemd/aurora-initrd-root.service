@@ -5,6 +5,8 @@ Wants=systemd-udevd.service systemd-udev-trigger.service systemd-udev-settle.ser
 After=systemd-udevd.service systemd-udev-trigger.service systemd-udev-settle.service
 After=aurora-vendor-firmware.service aurora-vendorfw-initrd.service omarchy-vendorfw-initrd.service
 After=plymouth-start.service
+# The unlock prompt reads the disk password with the console keymap.
+After=systemd-vconsole-setup.service
 Before=cryptsetup-pre.target sysroot.mount initrd-root-device.target
 Before=shutdown.target
 Conflicts=shutdown.target

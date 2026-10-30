@@ -1,0 +1,11 @@
+[Unit]
+Description=Follow console keymap changes in the Aurora initrd
+# The disk password prompt runs in the initrd, which carries vconsole.conf as
+# it was when the initrd was built.
+ConditionPathExists=/etc/aurora/image-layout
+
+[Path]
+PathChanged=/etc/vconsole.conf
+
+[Install]
+WantedBy=paths.target

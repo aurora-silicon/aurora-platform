@@ -12,11 +12,18 @@
 # wizard on tty1, where one password protects both the account and the disk.
 set -euo pipefail
 umask 077
-state=/var/lib/aurora/firstboot
+state=${AURORA_FIRSTBOOT_STATE:-/var/lib/aurora/firstboot}
+boot_dir=${AURORA_BOOT_DIR:-/boot}
 console=${AURORA_FIRSTBOOT_TTY:-/dev/tty1}
 error_file=/run/aurora-firstboot.error
 
 log() { logger -t aurora-firstboot -- "$*" 2>/dev/null || true; }
+# A warning reaches the journal at warning priority and, from the text
+# wizard, the console.
+warn() {
+  logger -p user.warning -t aurora-firstboot -- "$*" 2>/dev/null || true
+  printf 'aurora-firstboot: %s\n' "$*" >&2
+}
 
 text_requested() { [[ " $(</proc/cmdline) " == *" aurora.firstboot=text "* ]]; }
 
@@ -26,7 +33,7 @@ owner_exists() {
   getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { found = 1 } END { exit !found }'
 }
 
-if [[ ${1:-} != --password-hook && ${1:-} != --rekey && ! -f $state/pending ]]; then
+if [[ ${1:-} != --password-hook && ${1:-} != --rekey && ${1:-} != --sync-initrd-keymap && ! -f $state/pending ]]; then
   # Recovery: the text wizard can be asked for while no owner exists, for
   # example when the desktop's own setup cannot run.
   [[ ${1:-} != --attempt ]] && text_requested && ! owner_exists || exit 0
@@ -180,7 +187,14 @@ prepare() {
 }
 
 # Read data, never source instructions, from the durable encryption journal.
-journal=/boot/omarchy/encrypt.state
+journal=$boot_dir/omarchy/encrypt.state
+# The temporary key: one copy on the unencrypted boot filesystem, from which
+# the initrd opens the disk without asking, and one inside the encrypted root.
+boot_key=$boot_dir/omarchy/luks-key
+# Written only when an interrupted conversion needed recovery. It holds the
+# temporary key's keyslot, so with any surviving copy of that key it opens
+# the disk even after the keyslot itself is gone.
+header_backup=$boot_dir/omarchy/luks-header-before-recovery.bin
 phase='' partition='' uuid='' device=''
 read_journal() {
   local key value format=''
@@ -210,13 +224,41 @@ read_journal() {
 # replaced it.
 disk_needs_password() {
   [[ $phase != declined ]] || return 1
-  [[ $phase != finished || -e $state/luks-key || -e /boot/omarchy/luks-key ]]
+  [[ $phase != finished || -e $state/luks-key || -e $boot_key ]]
 }
 
-# Enroll the password in key slot 1, prove it unlocks, then destroy both copies
-# of the temporary key. Every step can be resumed.
+# Overwrite, then unlink, every plain-file copy of the temporary key and the
+# pre-recovery header backup. Once the temporary keyslot is gone a key copy no
+# longer opens the disk by itself, but the header backup and a key copy
+# together would. Overwriting is best effort (Btrfs copies on write and flash
+# remaps blocks); removing the keyslot is what actually retires the key.
+retire_key_files() {
+  local file
+  for file in "$state/luks-key" "$boot_key" "$header_backup"; do
+    [[ -e $file || -L $file ]] || continue
+    if [[ -f $file && ! -L $file ]] && command -v shred >/dev/null 2>&1; then
+      shred --iterations=1 --zero --remove=wipesync -- "$file" 2>/dev/null || rm -f -- "$file"
+    else
+      rm -f -- "$file"
+    fi
+  done
+  sync "$state" "$boot_dir/omarchy"
+}
+
+# The key slot a key file opens, from cryptsetup's verbose test; nothing
+# when it opens none.
+key_file_slot() {
+  { cryptsetup open --test-passphrase --verbose --key-file "$1" "$device" 2>&1 || true; } |
+    sed -n 's/^Key slot \([0-9][0-9]*\) unlocked\.$/\1/p' | head -n 1
+}
+
+# Enroll the password in key slot 1, prove it unlocks, then destroy the
+# temporary keyslot and every copy of the temporary key. The disk never
+# loses its last working slot: the temporary slot is removed only after the
+# password has opened slot 1, and slot 1 is tested again afterwards. Every
+# step can be resumed.
 protect_disk() {
-  local password=$1 keyfile=$state/luks-key
+  local password=$1 keyfile=$state/luks-key slot
   if ! printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" 2>/dev/null; then
     [[ -f $keyfile && ! -L $keyfile ]] || fail 'The temporary encryption key is unavailable; use the original setup password to resume'
     # An occupied owner slot is never replaced implicitly.
@@ -227,23 +269,28 @@ protect_disk() {
     printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-slot 1 --key-file "$keyfile" "$device" -
   fi
   printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'The new password did not unlock the disk'
-  if [[ -f $keyfile ]]; then
-    if cryptsetup open --test-passphrase --key-file "$keyfile" "$device" 2>/dev/null; then
-      cryptsetup luksRemoveKey --batch-mode --key-file "$keyfile" "$device"
-    fi
-    if cryptsetup open --test-passphrase --key-file "$keyfile" "$device" 2>/dev/null; then
-      fail 'The temporary encryption key is still usable'
-    fi
-  fi
+  for keyfile in "$state/luks-key" "$boot_key"; do
+    [[ -f $keyfile && ! -L $keyfile ]] || continue
+    slot=$(key_file_slot "$keyfile")
+    [[ -n $slot ]] || continue
+    # The password's own slot is never the one removed, and cryptsetup
+    # removes the temporary slot only on the password's authority: it must
+    # open another slot, so the disk can never be left without one.
+    [[ $slot != 1 ]] || fail 'The temporary encryption key opens the password key slot'
+    printf '%s' "$password" | cryptsetup luksKillSlot --batch-mode --key-file=- "$device" "$slot"
+    [[ -z $(key_file_slot "$keyfile") ]] || fail 'The temporary encryption key is still usable'
+  done
   printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'Unlock failed after temporary-key removal'
-  # Both copies are retired only after the replacement unlock is proven.
-  rm -f -- "$state/luks-key" /boot/omarchy/luks-key
-  sync "$state" /boot/omarchy
+  # The key files are retired only after the replacement unlock is proven.
+  retire_key_files
   printf 'format=1\nphase=finished\npartition=%s\nluks_uuid=%s\n' "$partition" "$uuid" > "$journal.new"
   sync "$journal.new"
   mv "$journal.new" "$journal"
   label "$journal"
-  sync /boot/omarchy
+  sync "$boot_dir/omarchy"
+  printf 'rekeyed\n' > "$state/disk-rekeyed"
+  label "$state/disk-rekeyed"
+  sync "$state/disk-rekeyed"
 }
 
 # Arch's sudoers does not enable the wheel group; the owner is created in it.
@@ -255,6 +302,174 @@ allow_wheel() {
   mv -f /etc/sudoers.d/10-aurora-owner.new /etc/sudoers.d/10-aurora-owner
   label /etc/sudoers.d /etc/sudoers.d/10-aurora-owner
 }
+
+# BEGIN keyboard
+# The disk password is typed at the initrd prompt with the console keymap,
+# which every Aurora initrd copies from /etc/vconsole.conf when it is built,
+# and at the greeter with the desktop's keyboard layout. When the two differ,
+# the same keys give different characters, and the password the greeter
+# hands over would not be what the person types at the next start.
+vconsole_conf=${AURORA_VCONSOLE_CONF:-/etc/vconsole.conf}
+x11_keyboard_conf=${AURORA_X11_KEYBOARD_CONF:-/etc/X11/xorg.conf.d/00-keyboard.conf}
+# A distribution whose localed is read-only declares its layout here (NixOS).
+declared_keyboard=${AURORA_DECLARED_KEYBOARD:-/etc/aurora/keyboard}
+kbd_model_map=${AURORA_KBD_MODEL_MAP:-/usr/share/systemd/kbd-model-map}
+initrd_dir=${AURORA_INITRD_DIR:-/boot}
+run_dir=${AURORA_RUN_DIR:-/run}
+
+# The last KEY=value of a shell-style file, unquoted, without sourcing it.
+setting() {
+  [[ -f $1 ]] || return 0
+  sed -n "s/^[[:space:]]*$2=//p" "$1" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+
+# The desktop's keyboard layout and variant, as the greeter uses them: the
+# first of each list. systemd 255 and later keep them in vconsole.conf;
+# older ones and Xorg in 00-keyboard.conf.
+kb_layout='' kb_variant=''
+xorg_option() {
+  [[ -f $x11_keyboard_conf ]] || return 0
+  sed -n "s/^[[:space:]]*Option[[:space:]]*\"Xkb$1\"[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$x11_keyboard_conf" | tail -n 1
+}
+desktop_keyboard() {
+  if [[ -f $declared_keyboard ]]; then
+    kb_layout=$(setting "$declared_keyboard" layout)
+    kb_variant=$(setting "$declared_keyboard" variant)
+  elif [[ -n $(setting "$vconsole_conf" XKBLAYOUT) ]]; then
+    kb_layout=$(setting "$vconsole_conf" XKBLAYOUT)
+    kb_variant=$(setting "$vconsole_conf" XKBVARIANT)
+  else
+    kb_layout=$(xorg_option Layout)
+    kb_variant=$(xorg_option Variant)
+  fi
+  kb_layout=${kb_layout%%,*}
+  kb_variant=${kb_variant%%,*}
+  [[ -n $kb_layout ]]
+}
+
+# The console keymap; the kernel's default is us.
+console_keymap() {
+  local keymap
+  keymap=$(setting "$vconsole_conf" KEYMAP)
+  printf '%s\n' "${keymap:-us}"
+}
+
+# Dead-key variants type the same printable characters as their layout.
+plain_variant() {
+  case $1 in -|*dead*) ;; *) printf '%s' "$1" ;; esac
+}
+
+# Does the console keymap $3 type what the XKB layout $1 (variant $2) types?
+keymap_matches() {
+  local layout=$1 variant keymap=$3
+  variant=$(plain_variant "$2")
+  # NixOS builds this keymap from its XKB settings (console.useXkbConfig).
+  [[ $keymap != /*-xkb-console-keymap ]] || return 0
+  if [[ -f $kbd_model_map ]] && awk -v keymap="$keymap" -v layout="$layout" -v variant="$variant" '
+      function plain(v) { return (v == "-" || v ~ /dead/) ? "" : v }
+      !/^#/ && $1 == keymap {
+        split($2, l, ","); split($4, v, ",")
+        if (l[1] == layout && plain(v[1]) == variant) found = 1
+      }
+      END { exit !found }' "$kbd_model_map"; then
+    return 0
+  fi
+  # Keymaps converted from XKB, and most others, are named after the layout.
+  [[ $keymap == "$layout" && -z $variant || $keymap == "$layout-$variant" ]] && return 0
+  [[ -z $variant && ${keymap%%-*} == "$layout" ]]
+}
+
+# The console keymap closest to the desktop layout, as systemd-localed would
+# choose it: a keymap converted from XKB if kbd ships one, else the
+# kbd-model-map entry for the layout and variant.
+converted_keymap() {
+  local variant name directory file
+  variant=$(plain_variant "$kb_variant")
+  name=$kb_layout${variant:+-$variant}
+  for directory in /usr/lib/kbd/keymaps/xkb /usr/share/kbd/keymaps/xkb; do
+    for file in "$directory/$name".map*; do
+      [[ -f $file ]] && { printf '%s\n' "$name"; return 0; }
+    done
+  done
+  [[ -f $kbd_model_map ]] || return 1
+  awk -v layout="$kb_layout" -v variant="$variant" '
+    function plain(v) { return (v == "-" || v ~ /dead/) ? "" : v }
+    !/^#/ { split($2, l, ","); split($4, v, ",")
+      if (l[1] == layout && plain(v[1]) == variant) { print $1; found = 1; exit } }
+    END { exit !found }' "$kbd_model_map"
+}
+
+# Before the password is enrolled: a console keymap still at the image
+# default (unset or us) follows the layout the person chose for the desktop;
+# a keymap set on purpose is left alone. Then any remaining difference is
+# reported, since the password will be typed with that keymap at every start.
+follow_desktop_keyboard() {
+  local keymap converted
+  if ! desktop_keyboard; then
+    log 'the desktop keyboard layout is unknown; the disk password prompt uses the console keymap'
+    return 0
+  fi
+  keymap=$(console_keymap)
+  if ! keymap_matches "$kb_layout" "$kb_variant" "$keymap" && [[ $keymap == us && ! -e /etc/NIXOS ]] &&
+     converted=$(converted_keymap) && command -v localectl >/dev/null 2>&1; then
+    if localectl --no-convert set-keymap "$converted" 2>/dev/null; then
+      log "the console keymap now follows the desktop layout ($kb_layout${kb_variant:+ $kb_variant}): $converted"
+      keymap=$(console_keymap)
+    fi
+  fi
+  keymap_matches "$kb_layout" "$kb_variant" "$keymap" && return 0
+  warn "the desktop keyboard layout ($kb_layout${kb_variant:+ $kb_variant}) differs from the console keymap ($keymap) that the disk password prompt uses at every start; type the password there as on a $keymap keyboard, or set a matching keymap with localectl set-keymap"
+}
+
+# The keymap an initrd image was built with, from its copy of vconsole.conf
+# (dracut's lsinitrd, mkinitcpio's lsinitcpio). An image without one uses the
+# kernel's default keymap.
+initrd_keymap() {
+  local text='' extract
+  if command -v lsinitrd >/dev/null 2>&1; then
+    text=$(lsinitrd "$1" -f etc/vconsole.conf 2>/dev/null) || return 1
+  elif command -v lsinitcpio >/dev/null 2>&1; then
+    extract=$(mktemp -d) || return 1
+    if (cd "$extract" && lsinitcpio -x "$1" etc/vconsole.conf) >/dev/null 2>&1; then
+      text=$(cat -- "$extract/etc/vconsole.conf" 2>/dev/null || true)
+    fi
+    rm -rf -- "$extract"
+  else
+    return 1
+  fi
+  printf '%s\n' "$text" | sed -n 's/^[[:space:]]*KEYMAP=//p' | tail -n 1 | tr -d "\"'"
+}
+
+# aurora-initrd-keymap.service: rebuild the initrds when the console keymap
+# they carry is not the system's, so the disk password prompt always uses
+# the system keymap. NixOS builds its initrd from console.keyMap itself.
+sync_initrd_keymap() {
+  local wanted image current stale=0
+  [[ ! -e /etc/NIXOS ]] || return 0
+  [[ -f $journal ]] && ! grep -qx 'phase=declined' "$journal" || return 0
+  exec 8> "$run_dir/aurora-initrd-keymap.lock"
+  flock 8
+  wanted=$(console_keymap)
+  for image in "$initrd_dir"/initramfs-*.img; do
+    [[ -f $image && $image != *rescue* && $image != *kdump* ]] || continue
+    if ! current=$(initrd_keymap "$image"); then
+      warn "cannot read the console keymap in $image"
+      continue
+    fi
+    [[ ${current:-us} == "$wanted" ]] && continue
+    log "$image has the console keymap ${current:-us}; the system uses $wanted"
+    stale=1
+  done
+  (( stale )) || return 0
+  if command -v dracut >/dev/null 2>&1; then
+    dracut --regenerate-all --force && return 0
+  elif command -v mkinitcpio >/dev/null 2>&1; then
+    mkinitcpio -P && return 0
+  fi
+  warn "could not rebuild the initrd with the console keymap $wanted; the disk password prompt still uses the previous one"
+  return 1
+}
+# END keyboard
 
 # The owner's password reaches the disk through PAM, when the owner first
 # signs in with it at the greeter. Desktop setups sign the new owner in
@@ -268,6 +483,9 @@ pam_vendor_dir=${AURORA_PAM_VENDOR_DIR:-/usr/lib/pam.d}
 password_hook=${AURORA_PASSWORD_HOOK:-/usr/lib/aurora/aurora-password-hook}
 rekey_dir=${AURORA_REKEY_DIR:-/run/aurora-firstboot}
 declared_hooks=${AURORA_DECLARED_HOOKS:-/etc/aurora/password-hooks}
+# Written once the owner's password unlocks the disk and the temporary key is
+# gone (protect_disk); the PAM hooks do nothing from then on.
+disk_rekeyed() { [[ -e $state/disk-rekeyed ]]; }
 hook_marker='# aurora-firstboot: the owner password also becomes the disk password'
 override_marker='# aurora-firstboot: a temporary copy of the vendor configuration'
 
@@ -361,7 +579,7 @@ is_owner() {
 
 # While the disk still opens with its temporary key, the owner signs in with
 # a password: the gate fails the owner's automatic login.
-rekey_pending() { [[ -f $state/desktop && ! -f $state/pending && -f $state/luks-key ]]; }
+rekey_pending() { ! disk_rekeyed && [[ -f $state/desktop && ! -f $state/pending && -f $state/luks-key ]]; }
 
 # Called by pam_exec. With --gate it only decides an automatic login.
 # Otherwise it reads the password from stdin, checks it and hands it to
@@ -369,6 +587,9 @@ rekey_pending() { [[ -f $state/desktop && ! -f $state/pending && -f $state/luks-
 # or fails the sign-in.
 password_hook() {
   local user=${PAM_USER:-} type=${PAM_TYPE:-} password='' checker candidate
+  # Once the disk is rekeyed the hooks do nothing, also where they stay
+  # declared until the next rebuild (NixOS).
+  ! disk_rekeyed || return 0
   if [[ ${1:-} == --gate ]]; then
     ! { rekey_pending && is_owner "$user"; } || return 1
     return 0
@@ -395,6 +616,29 @@ password_hook() {
   systemctl start --no-block aurora-disk-rekey.service
 }
 
+# NixOS declares the hooks in its generated PAM configuration. Once they have
+# done their job, the machine configuration switches them off, so the next
+# rebuild drops them; until then the marker keeps them inert. Only the
+# factory owner.nix is rewritten; an edited one gets a note instead.
+nixos_owner=${AURORA_NIXOS_OWNER:-/etc/nixos/owner.nix}
+nixos_hooks_off='aurora.firstboot.passwordHooks = false;'
+retire_declared_hooks() {
+  [[ -f $declared_hooks ]] || return 0
+  [[ -f $nixos_owner && ! -L $nixos_owner ]] || return 0
+  ! grep -qF "$nixos_hooks_off" "$nixos_owner" || return 0
+  if [[ $(<"$nixos_owner") == '{ ... }: {}' ]]; then
+    printf '%s\n' '# Aurora image machine configuration' '{ ... }: {' \
+      '  # The account password unlocks the disk; the first-boot PAM hooks are done.' \
+      "  $nixos_hooks_off" '}' > "$nixos_owner.new"
+    chmod 0644 "$nixos_owner.new"
+    sync "$nixos_owner.new"
+    mv -f "$nixos_owner.new" "$nixos_owner"
+    log "the next rebuild removes the first-boot PAM hooks ($nixos_owner)"
+  else
+    log "add $nixos_hooks_off to $nixos_owner to remove the first-boot PAM hooks at the next rebuild"
+  fi
+}
+
 # aurora-disk-rekey.service: enroll the owner's password, retire the
 # temporary key, then remove the PAM hooks.
 rekey_from_owner_password() {
@@ -406,11 +650,16 @@ rekey_from_owner_password() {
   rm -f -- "$rekey_dir/password"
   read_journal
   if disk_needs_password; then
+    follow_desktop_keyboard
     protect_disk "$password"
     log 'the owner password now unlocks the disk; the temporary key is gone'
   fi
   unset password
   disarm_password_hooks
+  retire_declared_hooks
+  # Rebuilding an initrd takes a while; it runs on its own, and again
+  # whenever vconsole.conf changes (aurora-initrd-keymap.path).
+  [[ -e /etc/NIXOS ]] || systemctl start --no-block aurora-initrd-keymap.service 2>/dev/null || true
 }
 
 # Ask twice for the disk password: on the splash when it is up, otherwise on
@@ -544,10 +793,14 @@ setup_text() {
     [[ -f /etc/nixos/owner.nix ]] || fail 'The installed NixOS machine configuration is missing'
     getent shadow "$username" | cut -d: -f2 > /var/lib/aurora/owner-password.hash
     chmod 0600 /var/lib/aurora/owner-password.hash
+    # Once the password unlocks the disk the first-boot PAM hooks are done.
+    local hooks=''
+    ! disk_rekeyed || hooks="
+  $nixos_hooks_off"
     cat > /etc/nixos/owner.nix.new <<EOF
 # Aurora image machine configuration
 { ... }: {
-  networking.hostName = "$hostname";
+  networking.hostName = "$hostname";$hooks
   users.users."$username" = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];
@@ -582,6 +835,7 @@ fi
 case ${1:-} in
   --password-hook) password_hook "${@:2}" || exit 1; exit 0 ;;
   --rekey) rekey_from_owner_password; exit 0 ;;
+  --sync-initrd-keymap) sync_initrd_keymap; exit $? ;;
 esac
 
 mode=$(choose_mode)

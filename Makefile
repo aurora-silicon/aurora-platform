@@ -18,6 +18,8 @@ install-common:
 	install -Dm644 systemd/aurora-root-mapper.conf $(DESTDIR)$(LIBDIR)/aurora/initrd/aurora-root-mapper.conf
 	install -Dm644 systemd/aurora-firstboot.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-firstboot.service
 	install -Dm644 systemd/aurora-disk-rekey.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-disk-rekey.service
+	install -Dm644 systemd/aurora-initrd-keymap.path $(DESTDIR)$(LIBDIR)/systemd/system/aurora-initrd-keymap.path
+	install -Dm644 systemd/aurora-initrd-keymap.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-initrd-keymap.service
 	install -Dm644 systemd/aurora-display-manager.conf $(DESTDIR)$(LIBDIR)/systemd/system/display-manager.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-getty.conf $(DESTDIR)$(LIBDIR)/systemd/system/getty@.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-plasma-setup.conf $(DESTDIR)$(LIBDIR)/systemd/system/plasma-setup.service.d/aurora-firstboot.conf

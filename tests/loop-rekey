@@ -1,0 +1,134 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Disposable integration test of aurora-disk-rekey.service on a newly created
+# loop-backed LUKS2 disk: the owner's password is enrolled, the temporary
+# keyslot and every copy of the temporary key are retired, the disk never
+# loses its last working slot, and the PAM hooks are switched off. Must run as
+# root in a disposable worker; it touches only its own loop device.
+set -euo pipefail
+[[ $(id -u) == 0 ]] || { echo 'Root in a disposable CI worker is required' >&2; exit 2; }
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+scratch=$(mktemp -d)
+loop=''
+# The rekey's own lock and error files live in /run; leave none behind.
+leftovers=()
+for file in /run/aurora-disk-rekey.lock /run/aurora-firstboot.error; do
+  [[ -e $file ]] || leftovers+=("$file")
+done
+cleanup() {
+  set +e
+  [[ -z $loop ]] || timeout --kill-after=2s 5s losetup -d "$loop"
+  rm -rf -- "$scratch"
+  (( ${#leftovers[@]} == 0 )) || rm -f -- "${leftovers[@]}"
+}
+trap cleanup EXIT
+password='disposable owner password'
+
+# The rekey reaches only the fixture's files; systemctl, localectl and the
+# logger are recorded instead of acting on this machine.
+mkdir -p "$scratch/bin"
+for tool in systemctl localectl logger; do
+  printf '#!/bin/bash\nprintf "%%s %%s\\n" %s "$*" >> %s/calls\n' "$tool" "$scratch" > "$scratch/bin/$tool"
+  chmod 0755 "$scratch/bin/$tool"
+done
+
+new_fixture() {
+  local name=$1 root
+  rm -rf -- "${scratch:?}/$name"
+  mkdir -p "$scratch/$name/state" "$scratch/$name/boot/omarchy" "$scratch/$name/run" "$scratch/$name/pam.d"
+  truncate -s 64M "$scratch/$name/disk.raw"
+  printf 'label: gpt\ntype=L\n' | sfdisk -q "$scratch/$name/disk.raw"
+  [[ -z $loop ]] || losetup -d "$loop"
+  loop=$(losetup --find --show --partscan "$scratch/$name/disk.raw")
+  [[ $loop =~ ^/dev/loop[0-9]+$ ]] || exit 1
+  udevadm settle
+  root=${loop}p1
+  dd if=/dev/urandom of="$scratch/$name/boot/omarchy/luks-key" bs=64 count=1 status=none
+  # The converter formats with the temporary key in slot 0.
+  cryptsetup luksFormat --batch-mode --type luks2 --key-slot 0 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+    --key-file "$scratch/$name/boot/omarchy/luks-key" "$root"
+  install -m 0600 "$scratch/$name/boot/omarchy/luks-key" "$scratch/$name/state/luks-key"
+  cryptsetup luksHeaderBackup --header-backup-file "$scratch/$name/boot/omarchy/luks-header-before-recovery.bin" "$root"
+  partuuid=$(blkid -c /dev/null -s PARTUUID -o value "$root")
+  udevadm wait --timeout=10 "/dev/disk/by-partuuid/$partuuid"
+  printf 'format=1\nphase=configured\npartition=%s\nluks_uuid=%s\n' "$partuuid" "$(cryptsetup luksUUID "$root")" \
+    > "$scratch/$name/boot/omarchy/encrypt.state"
+  printf 'desktop\n' > "$scratch/$name/state/desktop"
+  # An armed greeter, as aurora-firstboot leaves it in account mode.
+  printf '#%%PAM-1.0\n# aurora-firstboot: the owner password also becomes the disk password\nauth optional pam_exec.so quiet expose_authtok /usr/lib/aurora/aurora-password-hook\nauth substack password-auth\n' \
+    > "$scratch/$name/pam.d/sddm"
+  # NixOS: declared hooks and the factory owner.nix.
+  printf 'sddm sddm-autologin gdm-password\n' > "$scratch/$name/password-hooks"
+  printf '{ ... }: {}\n' > "$scratch/$name/owner.nix"
+  # The desktop was set up with a German layout; the console keymap is still the image default.
+  printf 'KEYMAP=us\nXKBLAYOUT=de\n' > "$scratch/$name/vconsole.conf"
+  install -d -m 0700 "$scratch/$name/rekey"
+  printf '%s' "$password" > "$scratch/$name/rekey/password"
+  FIXTURE=$scratch/$name
+  ROOT_DEVICE=$root
+}
+
+rekey() {
+  env PATH="$scratch/bin:$PATH" \
+    AURORA_FIRSTBOOT_STATE="$FIXTURE/state" AURORA_BOOT_DIR="$FIXTURE/boot" \
+    AURORA_REKEY_DIR="$FIXTURE/rekey" AURORA_PAM_DIR="$FIXTURE/pam.d" AURORA_PAM_VENDOR_DIR="$FIXTURE/vendor" \
+    AURORA_DECLARED_HOOKS="$FIXTURE/password-hooks" AURORA_NIXOS_OWNER="$FIXTURE/owner.nix" \
+    AURORA_VCONSOLE_CONF="$FIXTURE/vconsole.conf" AURORA_DECLARED_KEYBOARD="$FIXTURE/none" \
+    AURORA_X11_KEYBOARD_CONF="$FIXTURE/none" AURORA_RUN_DIR="$FIXTURE/run" \
+    bash "$repo/libexec/aurora-firstboot" --rekey
+}
+
+slots() {
+  cryptsetup luksDump --dump-json-metadata "$ROOT_DEVICE" |
+    python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin)["keyslots"])))'
+}
+
+# 1. The owner's first password sign-in rekeys the disk.
+new_fixture fresh
+[[ $(slots) == 0 ]]
+cp "$FIXTURE/boot/omarchy/luks-key" "$scratch/temporary-key"
+rekey
+[[ $(slots) == 1 ]]
+printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$ROOT_DEVICE"
+! cryptsetup open --test-passphrase --key-file "$scratch/temporary-key" "$ROOT_DEVICE" 2>/dev/null
+for file in state/luks-key boot/omarchy/luks-key boot/omarchy/luks-header-before-recovery.bin rekey/password; do
+  [[ ! -e $FIXTURE/$file ]] || { echo "$file survived the rekey" >&2; exit 1; }
+done
+grep -qx 'phase=finished' "$FIXTURE/boot/omarchy/encrypt.state"
+[[ -f $FIXTURE/state/disk-rekeyed ]]
+! grep -q aurora-password-hook "$FIXTURE/pam.d/sddm"
+grep -qF 'aurora.firstboot.passwordHooks = false;' "$FIXTURE/owner.nix"
+# The console keymap was asked to follow the desktop layout before enrolment.
+grep -q '^localectl --no-convert set-keymap de' "$scratch/calls"
+grep -qx 'systemctl start --no-block aurora-initrd-keymap.service' "$scratch/calls"
+# A repeated hand-over finds nothing to do.
+printf '%s' "$password" > "$FIXTURE/rekey/password"
+rekey
+[[ $(slots) == 1 ]]
+printf 'PASS enrolment, temporary keyslot and key file retirement, hook retirement\n'
+
+# 2. An owner slot already holding another password is never replaced, and the
+#    temporary slot stays: the disk always keeps a working slot.
+new_fixture occupied
+printf 'another password' | cryptsetup luksAddKey --batch-mode --key-slot 1 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+  --key-file "$FIXTURE/boot/omarchy/luks-key" "$ROOT_DEVICE" -
+if rekey; then
+  echo 'A rekey over an occupied owner slot must fail' >&2
+  exit 1
+fi
+[[ $(slots) == '0 1' ]]
+cryptsetup open --test-passphrase --key-slot 0 --key-file "$FIXTURE/boot/omarchy/luks-key" "$ROOT_DEVICE"
+[[ -f $FIXTURE/state/luks-key && ! -e $FIXTURE/state/disk-rekeyed ]]
+grep -q aurora-password-hook "$FIXTURE/pam.d/sddm"
+printf 'PASS an occupied owner slot keeps the temporary slot and the hooks\n'
+
+# 3. An interrupted rekey (password enrolled, temporary slot still there)
+#    resumes and finishes.
+new_fixture resumed
+printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-slot 1 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+  --key-file "$FIXTURE/boot/omarchy/luks-key" "$ROOT_DEVICE" -
+rekey
+[[ $(slots) == 1 ]]
+[[ ! -e $FIXTURE/boot/omarchy/luks-key && -f $FIXTURE/state/disk-rekeyed ]]
+printf 'PASS an interrupted rekey resumes\n'
+echo 'PASS loop rekey'

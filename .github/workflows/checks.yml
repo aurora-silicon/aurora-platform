@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v5
       - run: |
           python3 -m unittest discover -s tests
-          bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion tests/selinux-labels tests/selinux-policy images/finalize-image images/label-fedora-rootfs
+          bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion tests/loop-rekey tests/selinux-labels tests/selinux-policy images/finalize-image images/label-fedora-rootfs
           python3 -m py_compile images/*.py
   console:
     runs-on: ubuntu-24.04
@@ -40,6 +40,15 @@ jobs:
                 timeout --kill-after=10s 5m unshare --mount --propagation private bash tests/loop-conversion
               '
           done 2>&1 | tee conversion.log
+      - name: Rekey the disposable fixture with the owner's password
+        run: |
+          set -euo pipefail
+          docker run --rm --privileged --ipc=host -v /dev:/dev -v /run/udev:/run/udev:ro \
+            -v "$PWD:/src" -w /src registry.fedoraproject.org/fedora:44 \
+            bash -euo pipefail -c '
+              dnf install -y cryptsetup util-linux systemd-udev coreutils gawk python3
+              timeout --kill-after=10s 5m bash tests/loop-rekey
+            ' 2>&1 | tee -a conversion.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
