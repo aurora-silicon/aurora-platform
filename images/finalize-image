@@ -69,6 +69,13 @@ python3 "$(dirname -- "${BASH_SOURCE[0]}")/harden-grub.py" "$scratch/root" --fla
 if [[ $backend == dracut ]]; then
   chroot "$scratch/root" systemctl disable initial-setup.service initial-setup-graphical.service 2>/dev/null || true
   rm -f "$scratch/root/etc/reconfigSys"
+  # systemd applies every preset on the first boot, while / is still
+  # read-only, so the image must already be in its preset state.
+  presets=$(chroot "$scratch/root" systemctl preset-all 2>&1) || true
+  if grep -E '^(Created symlink|Removed) ' <<<"$presets" >&2; then
+    echo 'Unit states differ from their presets; the first boot cannot apply them' >&2
+    exit 1
+  fi
   kernels=("$scratch/root/usr/lib/modules/"*)
   (( ${#kernels[@]} == 1 ))
   kernel=${kernels[0]##*/}

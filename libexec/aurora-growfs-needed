@@ -1,0 +1,14 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# ExecCondition for systemd-growfs: succeed only when the Btrfs filesystem at
+# $1 has room to grow. On a keyring-backed LUKS2 root, systemd-growfs logs a
+# resize error even when there is nothing to grow. Other filesystems, and any
+# that cannot be measured, are left to systemd-growfs.
+set -uo pipefail
+mountpoint=${1:?mount point required}
+[[ $(findmnt -no FSTYPE --mountpoint "$mountpoint" 2>/dev/null) == btrfs ]] || exit 0
+slack=$(btrfs device usage -b "$mountpoint" 2>/dev/null |
+  awk '$1 == "Device" && $2 == "slack:" { total += $3; seen = 1 } END { if (seen) print total }')
+[[ $slack =~ ^[0-9]+$ ]] || exit 0
+# Less than 1 MiB is alignment, not space to grow into.
+(( slack >= 1048576 ))
