@@ -175,6 +175,10 @@ omarchy_mac_encrypt_finish() {
   omarchy_mac_encrypt_open
   omarchy_mac_encrypt_resize_luks
   omarchy_mac_encrypt_mount_opened
+  # Fill the mapping while its key is at hand; systemd-growfs cannot resize
+  # a keyring-backed LUKS2 device.
+  btrfs filesystem resize max "$ROOT_MNT" ||
+    omarchy_mac_encrypt_say 'could not grow the root filesystem; systemd-growfs will retry'
   install -d -m 0700 "$ROOT_MNT$PROVISIONING_DIR"
   install -m 0600 "$BOOT_KEY" "$ROOT_MNT$PROVISIONING_DIR/luks-key"
   sync "$ROOT_MNT$PROVISIONING_DIR/luks-key"

@@ -10,6 +10,7 @@ install-common:
 	install -Dm755 libexec/aurora-firstboot $(DESTDIR)$(LIBDIR)/aurora/aurora-firstboot
 	install -Dm755 libexec/aurora-firstboot-handoff $(DESTDIR)$(LIBDIR)/aurora/aurora-firstboot-handoff
 	install -Dm755 libexec/aurora-password-hook $(DESTDIR)$(LIBDIR)/aurora/aurora-password-hook
+	install -Dm755 libexec/aurora-growfs-needed $(DESTDIR)$(LIBDIR)/aurora/aurora-growfs-needed
 	install -Dm755 images/harden-grub.py $(DESTDIR)$(LIBDIR)/aurora/aurora-harden-grub
 	install -Dm644 vendor/omarchy-mac-encrypt $(DESTDIR)$(LIBDIR)/aurora/vendor/omarchy-mac-encrypt
 	install -Dm644 vendor/provenance.json $(DESTDIR)$(PREFIX)/share/doc/aurora-firstboot/provenance.json
@@ -25,6 +26,8 @@ install-common:
 	install -Dm644 systemd/aurora-plasma-setup.conf $(DESTDIR)$(LIBDIR)/systemd/system/plasma-setup.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-plymouth-quit.conf $(DESTDIR)$(LIBDIR)/systemd/system/plymouth-quit.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-getty.conf $(DESTDIR)$(LIBDIR)/systemd/system/serial-getty@.service.d/aurora-firstboot.conf
+	install -Dm644 systemd/aurora-growfs-root.conf $(DESTDIR)$(LIBDIR)/systemd/system/systemd-growfs-root.service.d/aurora-growfs.conf
+	install -Dm644 systemd/aurora-growfs.conf $(DESTDIR)$(LIBDIR)/systemd/system/systemd-growfs@.service.d/aurora-growfs.conf
 
 install-dracut:
 	install -Dm755 dracut/97aurora-root/module-setup.sh $(DESTDIR)$(LIBDIR)/dracut/modules.d/97aurora-root/module-setup.sh
