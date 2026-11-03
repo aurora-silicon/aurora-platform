@@ -93,6 +93,14 @@ fi
 [[ -s $scratch/root/boot/efi/m1n1/boot.bin && -s $scratch/root/boot/efi/EFI/BOOT/BOOTAA64.EFI ]]
 cp -a "$scratch/root/boot/efi" "$output/esp"
 install -Dm644 "$scratch/root/usr/share/aura/stage1/aura-raw.bin" "$output/esp/aurora/stage1.bin"
+# The installer boots this Mach-O form of the same Stage 1 on M4 and later Macs.
+# Older aura packages do not ship it.
+stage1_macho=$scratch/root/usr/share/aura/stage1/aura-boot.macho
+if [[ -s $stage1_macho ]]; then
+  install -Dm644 "$stage1_macho" "$output/esp/aurora/stage1.macho"
+else
+  echo "Warning: no ${stage1_macho#"$scratch/root"} in the image; the ESP has no aurora/stage1.macho" >&2
+fi
 python3 "$(dirname -- "${BASH_SOURCE[0]}")/prepare-stage2.py" \
   --combined "$output/esp/m1n1/boot.bin" \
   --aura "$scratch/root/usr/lib/asahi-boot/m1n1.bin" \
