@@ -3,7 +3,7 @@ DESTDIR ?=
 LIBDIR = $(PREFIX)/lib
 SELINUX_DEVEL ?= /usr/share/selinux/devel/Makefile
 
-install: install-common install-dracut install-mkinitcpio
+install: install-common install-dracut install-mkinitcpio install-power
 
 install-common:
 	install -Dm755 libexec/aurora-initrd-root $(DESTDIR)$(LIBDIR)/aurora/aurora-initrd-root
@@ -28,6 +28,12 @@ install-common:
 	install -Dm644 systemd/aurora-getty.conf $(DESTDIR)$(LIBDIR)/systemd/system/serial-getty@.service.d/aurora-firstboot.conf
 	install -Dm644 systemd/aurora-growfs-root.conf $(DESTDIR)$(LIBDIR)/systemd/system/systemd-growfs-root.service.d/aurora-growfs.conf
 	install -Dm644 systemd/aurora-growfs.conf $(DESTDIR)$(LIBDIR)/systemd/system/systemd-growfs@.service.d/aurora-growfs.conf
+
+install-power:
+	install -Dm755 power/aurora-power-budget $(DESTDIR)$(PREFIX)/libexec/aurora/aurora-power-budget
+	install -Dm644 power/aurora-power-budget.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-power-budget.service
+	install -Dm644 power/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/README.md
+	install -Dm644 power/DESIGN.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/DESIGN.md
 
 install-dracut:
 	install -Dm755 dracut/97aurora-root/module-setup.sh $(DESTDIR)$(LIBDIR)/dracut/modules.d/97aurora-root/module-setup.sh

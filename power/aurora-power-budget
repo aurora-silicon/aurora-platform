@@ -1,0 +1,446 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+"""Package power budget for the power-saver profile on Apple silicon.
+
+macOS Low Power Mode adds a 100 ms package power budget that its performance
+controller splits dynamically across the CPU clusters, the GPU and the ANE.
+It does not pin P-states, move work to the E cores or change the fabric.
+
+This daemon does the CPU part of that on Linux.  While the power profile
+daemon (tuned-ppd or power-profiles-daemon) reports "power-saver", every
+100 ms it
+
+  1. reads each CPU's busy time and each cluster's current frequency,
+  2. estimates each cluster's power demand from the device tree energy model
+     (opp-microwatt of the cluster's operating points),
+  3. spends the budget, step by step, on the frequency increase that buys
+     the most CPU capacity per milliwatt (so the E cores keep their clock
+     and the P cores give way first, as on macOS), and
+  4. caps each cluster at the operating point it bought (scaling_max_freq, a
+     frequency QoS request that composes with thermal limits; the governor
+     stays schedutil).
+
+Under the budget only the biggest cores' ceiling applies.  In every other
+profile the daemon only waits for D-Bus and writes nothing.  The budget is the
+sum of every CPU's energy-model power at a policy fraction of its cluster's
+maximum, and the ceiling a policy fraction of the biggest cores' maximum (see
+budget_mw() and ceilings()); /etc/aurora/power-budget.conf may override both.  GPU and ANE
+shares are not applied: Linux has no qualified actuator for them yet.
+"""
+
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+SYSFS_CPU = '/sys/devices/system/cpu'
+DT_ROOT = '/sys/firmware/devicetree/base'
+CONFIG = '/etc/aurora/power-budget.conf'
+STATUS = '/run/aurora-power-budget/status.json'
+UNBOUNDED = 2147483647  # kHz: removes the user maximum request
+PERIOD = 0.1            # seconds: macOS's Low Power Mode budget window
+RAISE_PERIODS = 2       # periods a higher cap must persist before it is applied
+IDLE_RECHECK = 30.0     # seconds between profile re-reads while not capping
+PPD = (
+    ('org.freedesktop.UPower.PowerProfiles', '/org/freedesktop/UPower/PowerProfiles'),
+    ('net.hadess.PowerProfiles', '/net/hadess/PowerProfiles'),
+)
+
+# Policy, not hardware data (see the README for the macOS measurement behind
+# them).  The budget is the energy-model power of every CPU at FRACTION of its
+# cluster's maximum frequency; the biggest cores are also held at or below
+# CEILING of their maximum, as macOS holds a single busy P core.
+DEFAULT_FRACTION = 0.45
+DEFAULT_CEILING = 0.64
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def be_ints(raw, width):
+    return [int.from_bytes(raw[i:i + width], 'big') for i in range(0, len(raw) - width + 1, width)]
+
+
+def find_phandle(root, phandle, depth=3):
+    """Device tree node directory with this phandle (OPP tables sit near the root)."""
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return None
+    for name in entries:
+        node = os.path.join(root, name)
+        if not os.path.isdir(node) or os.path.islink(node):
+            continue
+        try:
+            with open(os.path.join(node, 'phandle'), 'rb') as f:
+                if be_ints(f.read(), 4)[0] == phandle:
+                    return node
+        except OSError:
+            pass
+        if depth > 1:
+            hit = find_phandle(node, phandle, depth - 1)
+            if hit:
+                return hit
+    return None
+
+
+def energy_model(cpu, dt_root=DT_ROOT, sysfs=SYSFS_CPU):
+    """{kHz: microwatts per CPU} from the CPU's operating-points-v2 table, or None."""
+    try:
+        with open(os.path.join(sysfs, 'cpu%d' % cpu, 'of_node', 'operating-points-v2'), 'rb') as f:
+            phandle = be_ints(f.read(), 4)[0]
+    except OSError:
+        return None
+    table = find_phandle(dt_root, phandle)
+    if not table:
+        return None
+    model = {}
+    for name in os.listdir(table):
+        opp = os.path.join(table, name)
+        try:
+            with open(os.path.join(opp, 'opp-hz'), 'rb') as f:
+                hz = be_ints(f.read(), 8)[0]
+            with open(os.path.join(opp, 'opp-microwatt'), 'rb') as f:
+                uw = sum(be_ints(f.read(), 4))
+        except OSError:
+            continue
+        if hz and uw:
+            model[hz // 1000] = uw
+    return model or None
+
+
+class Cluster:
+    def __init__(self, path, model):
+        self.path = path
+        self.name = os.path.basename(path)
+        self.cpus = [int(c) for c in read(os.path.join(path, 'related_cpus')).split()]
+        lo = int(read(os.path.join(path, 'cpuinfo_min_freq')))
+        hi = int(read(os.path.join(path, 'cpuinfo_max_freq')))
+        # Usable operating points: those the energy model and cpufreq share.
+        self.opps = sorted((f, uw / 1000.0) for f, uw in model.items() if lo <= f <= hi)
+        if not self.opps:
+            raise ValueError('%s: energy model and cpufreq table do not overlap' % self.name)
+        self.fmin, self.fmax = self.opps[0][0], self.opps[-1][0]
+        try:    # the scheduler's relative capacity at fmax (1024 = biggest core)
+            self.capacity = int(read(os.path.join(path, '..', '..', 'cpu%d' % self.cpus[0], 'cpu_capacity')))
+        except (OSError, ValueError):
+            self.capacity = 1024
+        self.written = None     # last value this daemon wrote
+        self.cap = self.fmax
+        self.pending = 0
+
+    def power_at(self, khz):
+        """Per-CPU energy-model power (mW) interpolated at khz."""
+        prev = self.opps[0]
+        for f, mw in self.opps:
+            if f >= khz:
+                if f == prev[0]:
+                    return mw
+                return prev[1] + (mw - prev[1]) * (khz - prev[0]) / (f - prev[0])
+            prev = (f, mw)
+        return self.opps[-1][1]
+
+    def below(self, khz):
+        """Highest operating point at or below khz (the lowest one if none)."""
+        best = self.fmin
+        for f, _ in self.opps:
+            if f <= khz:
+                best = f
+        return best
+
+    def power(self, khz):
+        """Per-CPU energy-model power (mW) at the lowest operating point >= khz."""
+        for f, mw in self.opps:
+            if f >= khz:
+                return mw
+        return self.opps[-1][1]
+
+    def write(self, khz):
+        if khz == self.written:
+            return
+        try:
+            with open(os.path.join(self.path, 'scaling_max_freq'), 'w') as f:
+                f.write(str(khz))
+            self.written = khz
+        except OSError as e:
+            log('%s: cannot set scaling_max_freq=%d: %s' % (self.name, khz, e))
+
+    def begin(self):
+        self.written = None
+        self.cap = self.fmax
+        self.pending = 0
+
+    def end(self):
+        # Drop our request entirely.  scaling_max_freq reads back the resolved
+        # limit (thermal requests included), so the value found at entry is
+        # not a safe thing to restore; the unbounded request is.
+        if self.written is not None:
+            self.write(UNBOUNDED)
+        self.written = None
+
+
+def clusters(sysfs=SYSFS_CPU, dt_root=DT_ROOT):
+    out = []
+    base = os.path.join(sysfs, 'cpufreq')
+    for name in sorted(os.listdir(base)):
+        if not name.startswith('policy'):
+            continue
+        path = os.path.join(base, name)
+        cpu = int(read(os.path.join(path, 'related_cpus')).split()[0])
+        model = energy_model(cpu, dt_root, sysfs)
+        if not model:
+            return None
+        out.append(Cluster(path, model))
+    return out
+
+
+def load_config(path=CONFIG):
+    conf = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.split('#', 1)[0].strip()
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    conf[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return conf
+
+
+def budget_mw(cl, conf):
+    """Power-saver CPU budget in mW: config override, else the policy fraction."""
+    if conf.get('budget_mw'):
+        return float(conf['budget_mw'])
+    frac = float(conf.get('fraction', DEFAULT_FRACTION))
+    return sum(c.power_at(c.fmax * frac) * len(c.cpus) for c in cl)
+
+
+def ceilings(cl, conf):
+    """Per-cluster frequency ceiling in power-saver: the biggest cores only."""
+    frac = float(conf.get('ceiling', DEFAULT_CEILING))
+    top = max(c.capacity for c in cl)
+    return [c.below(c.fmax * frac) if c.capacity == top and frac < 1 else c.fmax for c in cl]
+
+
+def allocate(budget, wants):
+    """One operating point per cluster within the budget, best performance per watt first.
+
+    wants: list of (cluster, busy_cpus, wanted_khz).  Every cluster starts at
+    its lowest point; the budget then buys, one at a time, the step (to any
+    higher point up to what the cluster asks for) that adds the most capacity
+    per milliwatt, until no step fits.  Idle clusters then get the highest
+    point one CPU can afford from what is left, so a new burst is not stuck at
+    the bottom.  Returns kHz per cluster.
+    """
+    level = [0] * len(wants)
+    spent = sum(c.opps[0][1] * max(b, 1.0) for c, b, _ in wants)
+    while True:
+        best = None
+        for k, (c, busy, want) in enumerate(wants):
+            n = max(busy, 1.0)
+            f0, p0 = c.opps[level[k]]
+            for j in range(level[k] + 1, len(c.opps)):
+                f1, p1 = c.opps[j]
+                if c.opps[j - 1][0] >= want:
+                    break
+                cost = (p1 - p0) * n
+                if spent + cost > budget:
+                    break
+                gain = c.capacity * (f1 - f0) / c.fmax * busy
+                ratio = gain / cost if cost > 0 else float('inf')
+                if gain > 0 and (best is None or ratio > best[0]):
+                    best = (ratio, k, j, cost)
+        if best is None:
+            break
+        _, k, j, cost = best
+        level[k] = j
+        spent += cost
+    for k, (c, busy, _) in enumerate(wants):
+        if busy < 0.05:
+            p0 = c.opps[level[k]][1]
+            for j in range(level[k] + 1, len(c.opps)):
+                if spent + c.opps[j][1] - p0 <= budget:
+                    level[k] = j
+            spent += c.opps[level[k]][1] - p0
+    return [c.opps[level[k]][0] for k, (c, _, _) in enumerate(wants)]
+
+
+class CpuTimes:
+    def __init__(self, stat='/proc/stat'):
+        self.stat = stat
+        self.prev = self.sample()
+
+    def sample(self):
+        out = {}
+        with open(self.stat) as f:
+            for line in f:
+                if line.startswith('cpu') and line[3].isdigit():
+                    p = line.split()
+                    v = [int(x) for x in p[1:]]
+                    idle = v[3] + (v[4] if len(v) > 4 else 0)
+                    out[int(p[0][3:])] = (sum(v[:8]), idle)
+        return out
+
+    def busy(self):
+        cur = self.sample()
+        util = {}
+        for cpu, (tot, idle) in cur.items():
+            pt, pi = self.prev.get(cpu, (tot, idle))
+            dt = tot - pt
+            util[cpu] = 0.0 if dt <= 0 else max(0.0, min(1.0, 1.0 - (idle - pi) / dt))
+        self.prev = cur
+        return util
+
+
+def step(cl, times, budget, ceiling):
+    """One 100 ms decision.  Returns (estimated_mw, [(cluster, cap)])."""
+    util = times.busy()
+    wants = []
+    est = demand = 0.0
+    for c, top in zip(cl, ceiling):
+        us = [util.get(cpu, 0.0) for cpu in c.cpus]
+        busy, peak = sum(us), max(us)
+        try:
+            cur = int(read(os.path.join(c.path, 'scaling_cur_freq')))
+        except (OSError, ValueError):
+            cur = c.cap
+        est += c.power(cur) * busy
+        # schedutil's request: 1.25 x the frequency that keeps the busiest CPU at 80 %.
+        want = min(top, max(c.fmin, int(1.25 * cur * peak)))
+        demand += c.power(want) * busy
+        wants.append((c, busy, want))
+    over = demand > budget
+    chosen = allocate(budget, wants) if over else list(ceiling)
+    chosen = [min(f, t) for f, t in zip(chosen, ceiling)]
+    caps = []
+    for c, new in zip(cl, chosen):
+        if new < c.cap:
+            c.cap, c.pending = new, 0
+        elif new > c.cap:
+            c.pending += 1
+            if c.pending >= RAISE_PERIODS:
+                c.cap, c.pending = new, 0
+        else:
+            c.pending = 0
+        c.write(UNBOUNDED if c.cap >= c.fmax else c.cap)
+        caps.append((c.name, c.cap))
+    return est, caps
+
+
+def active_profile():
+    for name, path in PPD:
+        try:
+            out = subprocess.run(['busctl', '--system', 'get-property', name, path, name, 'ActiveProfile'],
+                                 capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.returncode == 0 and out.stdout.startswith('s '):
+            return out.stdout[2:].strip().strip('"')
+    return None
+
+
+def monitor():
+    args = ['busctl', '--system', 'monitor', '--json=short']
+    for _, path in PPD:
+        args.append("--match=type='signal',interface='org.freedesktop.DBus.Properties',"
+                    "member='PropertiesChanged',path='%s'" % path)
+    try:
+        return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
+def write_status(state):
+    try:
+        os.makedirs(os.path.dirname(STATUS), exist_ok=True)
+        tmp = STATUS + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(state, f)
+        os.replace(tmp, STATUS)
+    except OSError:
+        pass
+
+
+def main():
+    cl = clusters()
+    if not cl:
+        log('no device tree energy model for every CPU cluster: power-saver has no CPU budget here')
+        write_status({'profile': None, 'capping': False, 'reason': 'no energy model'})
+        signal.pause()
+        return
+    conf = load_config()
+    budget = budget_mw(cl, conf)
+    ceiling = ceilings(cl, conf)
+    log('clusters: %s; power-saver CPU budget %.0f mW (energy-model units)' % (
+        ', '.join('%s %d-%d kHz x%d, ceiling %d' % (c.name, c.fmin, c.fmax, len(c.cpus), t)
+                  for c, t in zip(cl, ceiling)), budget))
+
+    capping = False
+
+    def stop(*_):
+        for c in cl:
+            c.end()
+        write_status({'profile': None, 'capping': False})
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    mon = monitor()
+    times = CpuTimes()
+    last_status = 0.0
+    est_acc, n_acc = 0.0, 0
+    profile = active_profile()
+    while True:
+        want = profile == 'power-saver'
+        if want and not capping:
+            for c in cl:
+                c.begin()
+            times = CpuTimes()
+            capping = True
+            log('power-saver: CPU budget %.0f mW active' % budget)
+        elif capping and not want:
+            for c in cl:
+                c.end()
+            capping = False
+            log('profile %s: CPU caps released' % profile)
+            write_status({'profile': profile, 'capping': False, 'budget_mw': round(budget)})
+        timeout = PERIOD if capping else IDLE_RECHECK
+        ready = []
+        if mon and mon.stdout:
+            ready, _, _ = select.select([mon.stdout], [], [], timeout)
+        else:
+            time.sleep(timeout)
+        if ready:
+            line = mon.stdout.readline()
+            if not line:    # busctl exited (bus restart): reap it and start another
+                mon.wait()
+                time.sleep(1)
+                mon = monitor()
+            profile = active_profile()
+            continue
+        if not capping:
+            profile = active_profile()
+            continue
+        est, caps = step(cl, times, budget, ceiling)
+        est_acc += est
+        n_acc += 1
+        now = time.monotonic()
+        if now - last_status >= 1.0:
+            write_status({'profile': profile, 'capping': True, 'budget_mw': round(budget),
+                          'estimated_mw': round(est_acc / max(n_acc, 1)),
+                          'caps_khz': dict(caps)})
+            last_status, est_acc, n_acc = now, 0.0, 0
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,19 @@
+[Unit]
+Description=CPU power budget for the power-saver profile (Apple silicon)
+Documentation=https://github.com/aurora-silicon/aurora-platform/blob/main/power/README.md
+ConditionPathExists=/sys/firmware/devicetree/base/cpus
+After=tuned-ppd.service power-profiles-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/aurora/aurora-power-budget
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=aurora-power-budget
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
