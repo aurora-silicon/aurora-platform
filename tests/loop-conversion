@@ -18,7 +18,11 @@ cleanup() {
   }
 }
 trap cleanup EXIT
-truncate -s 640M "$scratch/disk.raw"
+# The interrupt case kills cryptsetup one second after the LUKS header lands.
+# A CI runner reencrypts about 300 MiB per second, so the encrypted extent
+# must take several seconds or the kill can land after the last hotzone and
+# skip the recovery path this test exists to cover.
+truncate -s 2560M "$scratch/disk.raw"
 printf 'label: gpt\nsize=64M,type=U\nsize=128M,type=L\ntype=L\n' | sfdisk "$scratch/disk.raw"
 loop=$(losetup --find --show --partscan "$scratch/disk.raw")
 [[ $loop =~ ^/dev/loop[0-9]+$ ]] || exit 1
@@ -37,8 +41,8 @@ printf 'Aurora conversion preserves filesystem content\n' > "$scratch/mnt/root/p
 if [[ ${AURORA_TEST_SMALL_IMAGE:-0} == 1 ]]; then
   # Installer images carry a filesystem smaller than the approved Root GPT
   # partition. Keep that geometry through first-boot encryption.
-  btrfs filesystem resize 320M "$scratch/mnt"
-  printf 'Testing a 320 MiB image filesystem in a larger Root partition\n'
+  btrfs filesystem resize 1536M "$scratch/mnt"
+  printf 'Testing a 1536 MiB image filesystem in a larger Root partition\n'
 fi
 umount "$scratch/mnt"
 root_uuid=$(blkid -s UUID -o value "$root")
