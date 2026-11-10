@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,6 +19,11 @@ class SourceTests(unittest.TestCase):
             staged = Path(temporary)
             self.assertTrue((staged / 'usr/lib/aurora/aurora-initrd-root').is_file())
             self.assertTrue((staged / 'usr/lib/dracut/modules.d/97aurora-root/module-setup.sh').is_file())
+            budget = staged / 'usr/libexec/aurora/aurora-power-budget'
+            self.assertTrue(budget.is_file() and os.access(budget, os.X_OK))
+            unit = (staged / 'usr/lib/systemd/system/aurora-power-budget.service').read_text()
+            self.assertIn('ExecStart=/usr/libexec/aurora/aurora-power-budget', unit)
+            self.assertNotIn('ProtectKernelTunables', unit)  # it writes cpufreq limits in /sys
             mapper = staged / 'usr/lib/aurora/initrd/aurora-root-mapper.conf'
             self.assertIn('JobRunningTimeoutSec=infinity', mapper.read_text())
             service = staged / 'usr/lib/aurora/initrd/aurora-initrd-root.service'
