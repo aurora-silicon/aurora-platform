@@ -102,6 +102,17 @@ class PowerBudgetTests(unittest.TestCase):
             # P busy and over budget; idle E gets what one CPU can afford from the rest.
             self.assertEqual(pb.allocate(2 * 441 + 351, [(e, 0.0, e.fmin), (p, 2, p.fmax)]), [2424000, 1704000])
 
+    def test_a_kernel_handler_takes_over_the_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(pb.kernel_handler(str(root / 'missing')))
+            (root / 'platform-profile-0').mkdir()
+            (root / 'platform-profile-0' / 'name').write_text('thinkpad-acpi\n')
+            self.assertIsNone(pb.kernel_handler(str(root)))
+            (root / 'platform-profile-1').mkdir()
+            (root / 'platform-profile-1' / 'name').write_text('apple-clpc\n')
+            self.assertEqual(pb.kernel_handler(str(root)), 'apple-clpc')
+
     def test_config_parser_ignores_comments(self):
         with tempfile.TemporaryDirectory() as tmp:
             conf = Path(tmp) / 'power-budget.conf'
