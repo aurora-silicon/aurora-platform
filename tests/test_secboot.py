@@ -848,6 +848,282 @@ class HookTests(TempCase):
         self.assertTrue(fx.uki().exists())
 
 
+# --- Stage 1 for an existing install, Stage 2 signing ---------------------------------------------
+
+AURA = os.environ.get('AURORA_TEST_AURA') or str(ROOT.parent / 'aura')
+HAVE_AURA = all(os.path.exists(os.path.join(AURA, 'tools', n)) for n in
+                ('fill_stage1_config.py', 'secboot_sign.py', 'macho_boot_object.py', 'recovery/enroll-stage1.sh'))
+ESP_UUID = '5a3c8f1e-2b4d-4c6e-8f00-1234567890ab'
+SEED = bytes(range(32))
+
+
+def raw_stage1(flavour='secure', keys=True):
+    """A raw aura Stage 1 with the blocks and strings the tools look for."""
+    raw = bytearray(0x40000)
+    raw[:8] = bytes.fromhex('090680d2b4020014')
+    raw[0x808:0x810] = b'AURALOAD'
+    struct.pack_into('<Q', raw, 0x818, 0x200000)
+    raw[0x20000:0x20014] = b'AURORA-S1-CFG01\0' + struct.pack('<I', 1)
+    if keys:
+        raw[0x21000:0x21014] = b'AURORA-S1-KEY01\0' + struct.pack('<I', 1)
+    if flavour:
+        tag = b'chosen.aurora,stage1-flavour=' + flavour.encode() + b'\0'
+        raw[0x22000:0x22000 + len(tag)] = tag
+    raw[0x23000:0x23008] = b'AURSIGT1'
+    raw[-8:] = b'STACKBOT'
+    return bytes(raw)
+
+
+def stage2_image(old=False):
+    head = bytearray(0x10000)
+    head[0x808:0x810] = b'AURALOAD'
+    if not old:
+        head[0x9000:0x9008] = b'AURSIGT1'
+        head[0x9100:0x9117] = b'aurora,boot-security-v1'
+    return bytes(head) + b'\xd0\x0d\xfe\xed' + bytes(60) + b'\x1f\x8b' + bytes(30) + b'chosen.x=1\n'
+
+
+def key_block(obj):
+    off = obj.index(b'AURORA-S1-KEY01\0') + 16
+    version, count, floor, flags = struct.unpack_from('<IIII', obj, off)
+    return count, floor, flags, obj[off + 16:off + 16 + 32 * count]
+
+
+@unittest.skipUnless(HAVE_AURA, 'needs aura tools (an aura checkout next to this repo, or AURORA_TEST_AURA)')
+class Stage1Tests(TempCase):
+    def ready(self, chip='t8112', board='j413', owner='owner', extra='', flavour='secure', stage2=True):
+        fx = Fixture(tempfile.mkdtemp(dir=self.tmp), owner=owner, extra_conf='ESP=/boot/efi\n' + extra)
+        dt = fx.root / 'proc/device-tree'
+        (dt / 'chosen').mkdir(parents=True)
+        (dt / 'compatible').write_bytes(f'apple,{board}\0apple,{chip}\0apple,arm-platform\0'.encode())
+        (dt / 'chosen/asahi,efi-system-partition').write_bytes(ESP_UUID.encode() + b'\0')
+        aura = fx.root / 'usr/share/aura'
+        (aura / 'stage1').mkdir(parents=True)
+        (aura / 'tools').mkdir()
+        for n in ('fill_stage1_config.py', 'secboot_sign.py', 'macho_boot_object.py'):
+            shutil.copy(os.path.join(AURA, 'tools', n), aura / 'tools' / n)
+        shutil.copy(os.path.join(AURA, 'tools/recovery/enroll-stage1.sh'), aura / 'tools/enroll-stage1.sh')
+        (aura / 'stage1/aura-secure-raw.bin').write_bytes(raw_stage1(flavour))
+        (aura / 'stage1/aura-raw.bin').write_bytes(raw_stage1(None, keys=False))
+        if owner != 'aurora':
+            fx.keys.mkdir(parents=True)
+            (fx.keys / 'stage2.key').write_bytes(SEED)
+            (fx.keys / 'stage2.pub').write_bytes(sb.ed25519_public(SEED))
+        if stage2:
+            name = 'boot-ctxr.bin' if sb.uses_execute_window(int(chip[1:], 16)) else 'boot.bin'
+            (fx.esp / 'm1n1').mkdir(parents=True)
+            (fx.esp / 'm1n1' / name).write_bytes(stage2_image())
+        return fx
+
+    def record(self, fx, verdict='verified', policy='audit', key_id=None):
+        node = fx.root / 'proc/device-tree/chosen/aurora,boot-security'
+        m = node / 'measurement@0'
+        m.mkdir(parents=True)
+        (node / 'state').write_bytes(b'partial\0')
+        (node / 'stage1-flavour').write_bytes(b'secure\0')
+        for k, v in (('stage', 'stage1'), ('policy', policy), ('component', 'next-stage'), ('verdict', verdict)):
+            (m / k).write_bytes(v.encode() + b'\0')
+        kid = key_id or hashlib.sha256(sb.ed25519_public(SEED)).digest()[:8]
+        (m / 'key-id').write_bytes(kid)
+        (m / 'security-version').write_bytes(struct.pack('>I', 1))
+        (m / 'sha256').write_bytes(bytes(32))
+
+    def objects(self, fx):
+        return fx.esp / 'aurora/stage1'
+
+    def test_audit_build_fills_this_install_and_prints_the_1tr_command(self):
+        fx = self.ready()
+        r = fx.run('stage1', 'build', '--audit', '--volume', 'Fedora')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = self.objects(fx)
+        obj = (out / 'stage1-audit.macho').read_bytes()
+        self.assertEqual(obj[:4], struct.pack('<I', 0xFEEDFACF))
+        count, floor, flags, keys = key_block(obj)
+        self.assertEqual((count, floor, flags, keys), (1, 1, 0, sb.ed25519_public(SEED)))
+        self.assertIn(ESP_UUID.encode(), obj)
+        self.assertIn(b';m1n1/boot.bin', obj)
+        stock = (out / 'stage1-stock.macho').read_bytes()
+        self.assertIn(ESP_UUID.encode(), stock)
+        self.assertNotIn(b'AURORA-S1-KEY01', stock)
+        self.assertTrue((out / 'enroll-stage1.sh').exists())
+        md5 = hashlib.md5(obj).hexdigest()
+        smd5 = hashlib.md5(stock).hexdigest()
+        cmd = f'bash enroll-stage1.sh --keep stage1-stock.macho {smd5} Fedora stage1-audit.macho {md5}'
+        self.assertIn(cmd, r.stdout)
+        self.assertIn(cmd, (out / 'ENROLL-audit.txt').read_text())
+        self.assertNotIn('--compress', r.stdout)
+        manifests = list((fx.root / 'var/lib/aurora/secboot/stage1').glob('*-audit.json'))
+        self.assertEqual(len(manifests), 1)
+        m = json.loads(manifests[0].read_text())
+        self.assertEqual((m['object_md5'], m['esp_partuuid'], m['stage2_path'], m['padded']),
+                         (md5, ESP_UUID, 'm1n1/boot.bin', False))
+        self.assertEqual(stat.S_IMODE(manifests[0].stat().st_mode), 0o600)
+
+    def test_m4_object_is_padded_and_loads_the_confined_stage2(self):
+        fx = self.ready(chip='t8132', board='j713')
+        r = fx.run('stage1', 'build', '--audit')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        obj = self.objects(fx) / 'stage1-audit.macho'
+        self.assertGreater(obj.stat().st_size, 146 << 20)
+        with open(obj, 'rb') as f:
+            head = f.read(1 << 20)
+        self.assertIn(b';m1n1/boot-ctxr.bin', head)
+        self.assertIn('enroll-stage1.sh --compress --keep stage1-stock.macho', r.stdout)
+        self.assertIn('<VOLUME>', r.stdout)
+
+    def test_refusals(self):
+        fx = self.ready(owner='aurora')
+        r = fx.run('stage1', 'build', '--audit')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('KEY_OWNER=aurora', r.stderr)
+        fx = self.ready(flavour='dev')
+        r = fx.run('stage1', 'build', '--audit')
+        self.assertIn('dev-flavour', r.stderr)
+        self.assertEqual(fx.run('stage1', 'build', '--audit', '--allow-dev-flavour').returncode, 0)
+
+    def test_m4_without_the_confined_stage2_is_refused(self):
+        fx = self.ready(chip='t8132', board='j713', stage2=False)
+        r = fx.run('stage1', 'build', '--audit')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('confined Stage 2', r.stderr)
+
+    def test_image_checks(self):
+        fx = self.ready()
+        img = fx.root / 'usr/share/aura/stage1/aura-secure-raw.bin'
+        img.write_bytes(raw_stage1(keys=False))
+        self.assertIn('AURORA-S1-KEY01', fx.run('stage1', 'build', '--audit').stderr)
+        img.write_bytes(struct.pack('<I', 0xFEEDFACF) + raw_stage1()[4:])
+        self.assertIn('Mach-O', fx.run('stage1', 'build', '--audit').stderr)
+        (fx.root / 'proc/device-tree/compatible').write_bytes(b'qemu,virt\0')
+        self.assertIn('no Apple chip', fx.run('stage1', 'build', '--audit').stderr)
+
+    def test_no_stage2_key(self):
+        fx = self.ready()
+        (fx.keys / 'stage2.pub').unlink()
+        (fx.keys / 'stage2.key').unlink()
+        self.assertIn('keys create', fx.run('stage1', 'build', '--audit').stderr)
+
+    def test_enforce_needs_a_signed_stage2_and_an_audit_boot_that_verified_it(self):
+        fx = self.ready()
+        self.assertEqual(fx.run('stage1', 'build', '--audit').returncode, 0)
+        r = fx.run('stage1', 'build', '--enforce')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('--sign-stage2-by-hand', r.stderr)
+        (fx.root / 'usr/share/aurora').mkdir(parents=True)
+        (fx.root / 'usr/share/aurora/stage2-sign-hook').touch()
+        r = fx.run('stage1', 'build', '--enforce')
+        self.assertIn('is unsigned', r.stderr)
+        self.assertEqual(fx.run('stage2', 'sign').returncode, 0)
+        r = fx.run('stage1', 'build', '--enforce')
+        self.assertIn('enrol the audit Stage 1 and boot it first', r.stderr)
+        self.record(fx, verdict='unsigned')
+        r = fx.run('stage1', 'build', '--enforce')
+        self.assertIn('recorded Stage 2 as unsigned', r.stderr)
+        shutil.rmtree(fx.root / 'proc/device-tree/chosen/aurora,boot-security')
+        self.record(fx, key_id=b'\x11' * 8)
+        self.assertIn('1111111111111111', fx.run('stage1', 'build', '--enforce').stderr)
+        shutil.rmtree(fx.root / 'proc/device-tree/chosen/aurora,boot-security')
+        self.record(fx)
+        (fx.esp / 'aura-try').write_bytes(b'armed\nm1n1/boot.bin.next\n')
+        self.assertIn('trial is armed', fx.run('stage1', 'build', '--enforce').stderr)
+        (fx.esp / 'aura-try').unlink()
+        r = fx.run('stage1', 'build', '--enforce', '--volume', 'Fedora')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        obj = (self.objects(fx) / 'stage1-enforce.macho').read_bytes()
+        self.assertEqual(key_block(obj)[2], 1)
+        audit_md5 = hashlib.md5((self.objects(fx) / 'stage1-audit.macho').read_bytes()).hexdigest()
+        self.assertIn(f'--keep stage1-audit.macho {audit_md5} Fedora stage1-enforce.macho', r.stdout)
+        self.assertIn('REFUSES', r.stdout)
+
+    def test_enforce_refused_while_stage2_signing_is_off(self):
+        fx = self.ready(extra='STAGE2_SIGN=no\n')
+        self.record(fx)
+        r = fx.run('stage1', 'build', '--enforce', '--sign-stage2-by-hand')
+        self.assertIn('Stage 2 signing is off', r.stderr)
+        self.assertEqual(r.returncode, 1)
+
+    def test_secver_below_the_floor_is_refused(self):
+        fx = self.ready(extra='STAGE2_SECVER=0\n')
+        r = fx.run('stage1', 'build', '--audit', '--min-secver', '2')
+        self.assertIn('below the Stage 1 floor', r.stderr)
+
+    def test_rollback_option_copies_next_to_the_object(self):
+        fx = self.ready()
+        mine = fx.root / 'old.macho'
+        mine.write_bytes(b'old stage 1')
+        r = fx.run('stage1', 'build', '--audit', '--rollback', '/old.macho')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f'--keep old.macho {hashlib.md5(b"old stage 1").hexdigest()} <VOLUME>', r.stdout)
+        self.assertEqual((self.objects(fx) / 'old.macho').read_bytes(), b'old stage 1')
+        self.assertFalse((self.objects(fx) / 'stage1-stock.macho').exists())
+
+    def test_stage2_sign_verify_and_status(self):
+        fx = self.ready()
+        boot = fx.esp / 'm1n1/boot.bin'
+        before = boot.read_bytes()
+        self.assertEqual(fx.run('stage2', 'verify').returncode, 1)
+        nxt = fx.esp / 'm1n1/boot.bin.next'
+        nxt.write_bytes(stage2_image())
+        r = fx.run('stage2', 'sign')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = boot.read_bytes()
+        self.assertTrue(data.startswith(before) and data.endswith(b'AURSIGT1'))
+        v = fx.run('stage2', 'verify')
+        self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
+        self.assertEqual(v.stdout.count(': verified'), 2)
+        chk = subprocess.run([sys.executable, os.path.join(AURA, 'tools/secboot_sign.py'), 'verify', '--pub',
+                              str(fx.keys / 'stage2.pub'), str(boot)], capture_output=True, text=True)
+        self.assertEqual(chk.returncode, 0, chk.stdout)
+        self.assertIn('already signed', fx.run('stage2', 'sign').stdout)
+        self.assertEqual(boot.read_bytes(), data)
+        # Another key: the old trailer is replaced, and the old key no longer verifies it.
+        (fx.keys / 'stage2.key').write_bytes(bytes(32))
+        (fx.keys / 'stage2.pub').write_bytes(sb.ed25519_public(bytes(32)))
+        self.assertEqual(fx.run('stage2', 'sign').returncode, 0)
+        self.assertEqual(boot.read_bytes().count(b'aura_sig'), 1)
+        self.record(fx)
+        st = json.loads(fx.run('status', '--json').stdout)
+        self.assertEqual(st['stage1']['policy'], 'audit')
+        self.assertEqual(st['stage1']['flavour'], 'secure')
+        self.assertEqual(st['stage2']['verdict'], 'verified')
+        self.assertIn('Stage 1: policy audit, secure flavour', fx.run('status').stdout)
+
+    def test_stage2_hook(self):
+        fx = self.ready()
+        src, dst = fx.root / 'in.bin', fx.root / 'out.bin'
+        src.write_bytes(stage2_image())
+        r = fx.run('stage2', 'hook', '/in.bin', '/out.bin')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('signed', r.stdout)
+        self.assertEqual(sb.read_trailer(dst.read_bytes())[0], len(src.read_bytes()))
+        # Deterministic: the same input gives the same bytes (update-m1n1 compares them).
+        first = dst.read_bytes()
+        fx.run('stage2', 'hook', '/in.bin', '/out.bin')
+        self.assertEqual(dst.read_bytes(), first)
+        src.write_bytes(stage2_image(old=True))
+        r = fx.run('stage2', 'hook', '/in.bin', '/out.bin')
+        self.assertEqual((r.returncode, dst.read_bytes()), (0, src.read_bytes()))
+        self.assertIn('older than aura 1.0.0b11', r.stdout)
+        fx.write_conf('owner', 'ESP=/boot/efi\nSTAGE2_SIGN=yes\n')
+        self.assertEqual(fx.run('stage2', 'hook', '/in.bin', '/out.bin').returncode, 1)
+        src.write_bytes(stage2_image())
+        fx.write_conf('owner', 'ESP=/boot/efi\nSTAGE2_SIGN=no\n')
+        fx.run('stage2', 'hook', '/in.bin', '/out.bin')
+        self.assertEqual(dst.read_bytes(), src.read_bytes())
+        (fx.root / 'etc/aurora/secboot.conf').unlink()
+        r = fx.run('stage2', 'hook', '/in.bin', '/out.bin')
+        self.assertEqual((r.returncode, dst.read_bytes()), (0, src.read_bytes()))
+        fx.write_conf('owner', 'ESP=/boot/efi\nSTAGE2_SIGN=yes\n')
+        (fx.keys / 'stage2.key').unlink()
+        self.assertIn('no', fx.run('stage2', 'hook', '/in.bin', '/out.bin').stderr)
+
+    def test_execute_window_bounds_match_the_installer(self):
+        for chip in (0x8103, 0x8112, 0x8122, 0x6000, 0x6020, 0x6031, 0x6034):
+            self.assertFalse(sb.uses_execute_window(chip), hex(chip))
+        for chip in (0x8132, 0x8140, 0x8142, 0x6040, 0x6041, 0x6050):
+            self.assertTrue(sb.uses_execute_window(chip), hex(chip))
+
+
 class InstallTests(unittest.TestCase):
     def test_default_config_is_the_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -882,7 +1158,8 @@ class InstallTests(unittest.TestCase):
                                      'usr/lib/initcpio/post/aurora-secboot',
                                      'usr/lib/kernel/install.d/92-aurora-secboot.install',
                                      'usr/lib/systemd/system/aurora-secboot-adopt.service',
-                                     'usr/share/doc/aurora-secboot/README.md'])
+                                     'usr/share/doc/aurora-secboot/README.md',
+                                     'usr/share/doc/aurora-secboot/stage1-existing-install.md'])
             self.assertEqual(stat.S_IMODE((Path(tmp) / 'var/lib/aurora/secboot').stat().st_mode), 0o700)
             self.assertTrue(os.access(Path(tmp) / 'usr/bin/aurora-secboot', os.X_OK))
 
