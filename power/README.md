@@ -88,6 +88,16 @@ ceiling = 0.64
 Machines whose device tree has no energy model get no CPU budget; the daemon
 says so in the journal and stays idle.
 
+### When the kernel budgets Power Saver itself
+
+On the M5 Pro and Max (T6050) the kernel's CLPC driver registers a platform
+profile (`/sys/class/platform-profile/*/name` reads `apple-clpc`) whose
+low-power profile holds the package to macOS Low Power Mode's measured power
+itself. With that handler present a second budget here would cap the CPU
+twice, so the daemon writes nothing, logs
+`kernel apple-clpc profile handler present; not capping`, and says so in
+`/run/aurora-power-budget/status.json`.
+
 ## Not covered yet
 
 - **GPU and ANE.** macOS also lowers the GPU's power target in Low Power Mode.

@@ -40,6 +40,10 @@ SYSFS_CPU = '/sys/devices/system/cpu'
 DT_ROOT = '/sys/firmware/devicetree/base'
 CONFIG = '/etc/aurora/power-budget.conf'
 STATUS = '/run/aurora-power-budget/status.json'
+PLATFORM_PROFILE = '/sys/class/platform-profile'
+# Kernel platform-profile handlers whose low-power profile limits CPU power
+# itself; with one present a second budget here would cap the CPU twice.
+KERNEL_HANDLERS = ('apple-clpc',)
 UNBOUNDED = 2147483647  # kHz: removes the user maximum request
 PERIOD = 0.1            # seconds: macOS's Low Power Mode budget window
 RAISE_PERIODS = 2       # periods a higher cap must persist before it is applied
@@ -64,6 +68,22 @@ def log(msg):
 def read(path):
     with open(path) as f:
         return f.read().strip()
+
+
+def kernel_handler(root=PLATFORM_PROFILE):
+    """The name of a kernel handler that budgets power-saver itself, or None."""
+    try:
+        devices = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for dev in devices:
+        try:
+            name = read(os.path.join(root, dev, 'name'))
+        except OSError:
+            continue
+        if name in KERNEL_HANDLERS:
+            return name
+    return None
 
 
 def be_ints(raw, width):
@@ -372,6 +392,13 @@ def write_status(state):
 
 
 def main():
+    handler = kernel_handler()
+    if handler:
+        log('kernel %s profile handler present; not capping' % handler)
+        write_status({'profile': None, 'capping': False,
+                      'reason': 'kernel %s profile handler' % handler})
+        signal.pause()
+        return
     cl = clusters()
     if not cl:
         log('no device tree energy model for every CPU cluster: power-saver has no CPU budget here')
