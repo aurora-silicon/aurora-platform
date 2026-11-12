@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: aurora-silicon/aura
-          ref: 1f23306e2888759cda24517c64ab42acbd5065bd  # aura#195
+          ref: f3f38a5a87f2ab25ea3fbfeac6164537b2d10b28  # aura main with #195
           path: .aura
       - run: |
           python3 -m unittest discover -s tests
@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: aurora-silicon/aura
-          ref: 1f23306e2888759cda24517c64ab42acbd5065bd  # aura#195
+          ref: f3f38a5a87f2ab25ea3fbfeac6164537b2d10b28  # aura main with #195
           path: .aura
       - name: Build, sign and verify a real UKI with the Fedora tools
         run: |
