@@ -874,13 +874,18 @@ def raw_stage1(flavour='secure', keys=True):
     return bytes(raw)
 
 
-def stage2_image(old=False):
+def stage2_image(old=False, lines=b'chosen.x=1\n'):
+    """An aura Stage 2 laid out like the build (footprint = image size, STACKBOT at its end); a
+    current one holds the measure line format string in its code, as aura's does."""
     head = bytearray(0x10000)
     head[0x808:0x810] = b'AURALOAD'
+    struct.pack_into('<IIQ', head, 0x810, 1, 1, len(head))
     if not old:
         head[0x9000:0x9008] = b'AURSIGT1'
         head[0x9100:0x9117] = b'aurora,boot-security-v1'
-    return bytes(head) + b'\xd0\x0d\xfe\xed' + bytes(60) + b'\x1f\x8b' + bytes(30) + b'chosen.x=1\n'
+        head[0x9200:0x9220] = b'chosen.aurora,measure-%d=%s;%s;\0'
+    head[-8:] = b'STACKBOT'
+    return bytes(head) + b'\xd0\x0d\xfe\xed' + bytes(60) + b'\x1f\x8b' + bytes(30) + lines
 
 
 def key_block(obj):
@@ -1083,6 +1088,12 @@ class Stage1Tests(TempCase):
                               str(fx.keys / 'stage2.pub'), str(boot)], capture_output=True, text=True)
         self.assertEqual(chk.returncode, 0, chk.stdout)
         self.assertIn('already signed', fx.run('stage2', 'sign').stdout)
+        # A measure line appended after the image is refused, and nothing is written.
+        nxt.write_bytes(stage2_image(lines=b'chosen.aurora,measure-0=x\n'))
+        r = fx.run('stage2', 'sign')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('measure-', r.stderr)
+        nxt.unlink()
         self.assertEqual(boot.read_bytes(), data)
         # Another key: the old trailer is replaced, and the old key no longer verifies it.
         (fx.keys / 'stage2.key').write_bytes(bytes(32))

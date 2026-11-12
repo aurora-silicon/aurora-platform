@@ -1085,26 +1085,50 @@ def stage2_verdict(sysobj, args, path, pub):
     return v, kid, secver
 
 
+def payload_region(data):
+    """What follows an aura image: its payloads and appended config lines. The image runs to the end
+    of its stack (the STACKBOT quad); the load header's footprint is its size (aura's _payload_start).
+    The image itself holds the chosen.aurora,measure- format string, so only this part is searched.
+    Data that is not an aura image is returned whole."""
+    off = AURA_LOAD[0]
+    if data[off:off + 8] == AURA_LOAD[1] and len(data) >= off + 24:
+        footprint = struct.unpack_from('<Q', data, off + 16)[0]
+        if off + 24 <= footprint <= len(data) and data[footprint - 8:footprint] == b'STACKBOT':
+            return data[footprint:]
+    return data
+
+
+def aura_signer(sysobj, args):
+    """aura's tools/secboot_sign.py as a module: the record format and Ed25519 signing stay aura's."""
+    import importlib.util
+    path = aura_tool(sysobj, args, 'secboot_sign.py')
+    spec = importlib.util.spec_from_file_location('aura_secboot_sign', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not all(hasattr(mod, n) for n in ('make_record', 'FOOTER', 'pubkey')):
+        raise Refusal(f'{path} has no make_record: it is not aura\'s secboot_sign.py.')
+    return mod
+
+
 def sign_stage2_bytes(sysobj, cfg, args, data, key, secver):
-    """data with its aura image trailer replaced by one from key."""
+    """data with its aura image trailer replaced by one from key (aura's sign-image format)."""
     t = read_trailer(data)
     if t is not None:
         data = data[:t[0]]
-    if b'chosen.aurora,measure-' in data:
+    # Checked here rather than by sign-image, whose check before aura#197 also matched the format
+    # string in aura's own code and refused every Stage 2.
+    if b'chosen.aurora,measure-' in payload_region(data):
         raise Refusal('this Stage 2 carries chosen.aurora,measure- lines, which only a loading stage may add.')
-    work = tempfile.mkdtemp(prefix='aurora-secboot-s2.')
-    try:
-        src, dst = os.path.join(work, 'in'), os.path.join(work, 'out')
-        with open(src, 'wb') as f:
-            f.write(data)
-        aura_py(sysobj, args, 'secboot_sign.py', 'sign-image', '--key', key, '--secver', str(secver), src, dst)
-        with open(dst, 'rb') as f:
-            out = f.read()
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    mod = aura_signer(sysobj, args)
+    with open(key, 'rb') as f:
+        seed = f.read()
+    if len(seed) != 32:
+        raise Refusal(f'{key} is not a raw 32-byte Ed25519 seed.')
+    rec, _ = mod.make_record(seed, data, secver)
+    out = data + rec + struct.pack('<Q', len(data)) + mod.FOOTER
     t = read_trailer(out)
-    if t is None or t[0] != len(data) or out[:len(data)] != data:
-        raise Refusal('aura\'s secboot_sign.py did not append one image trailer.')
+    if t is None or t[0] != len(data):
+        raise Refusal('aura\'s secboot_sign.py did not make one image trailer.')
     return out
 
 
