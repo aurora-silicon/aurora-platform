@@ -981,6 +981,14 @@ class Stage1Tests(TempCase):
         self.assertIn('dev-flavour', r.stderr)
         self.assertEqual(fx.run('stage1', 'build', '--audit', '--allow-dev-flavour').returncode, 0)
 
+    def test_m4_needs_a_padding_capable_aura(self):
+        fx = self.ready(chip='t8132', board='j713')
+        tool_path = fx.root / 'usr/share/aura/tools/macho_boot_object.py'
+        tool_path.write_text(tool_path.read_text().replace('--execute-window', '--other'))
+        r = fx.run('stage1', 'build', '--audit')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('aura#195', r.stderr)
+
     def test_m4_without_the_confined_stage2_is_refused(self):
         fx = self.ready(chip='t8132', board='j713', stage2=False)
         r = fx.run('stage1', 'build', '--audit')

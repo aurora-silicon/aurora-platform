@@ -1299,6 +1299,11 @@ def cmd_stage1_build(sysobj, cfg, args):
                           'writes with a monitor-free aura, and a padded Stage 1 would load nothing.')
         raise Refusal(f'{stage2} does not exist, so the new Stage 1 would load nothing.')
 
+    if padded:
+        with open(aura_tool(sysobj, args, 'macho_boot_object.py'), 'rb') as f:
+            if b'--execute-window' not in f.read():
+                raise Refusal('this aura\'s macho_boot_object.py cannot pad for the execute window (it predates '
+                              'aura#195); pass --aura-dir with a newer aura checkout.')
     image = args.stage1_image or os.path.join(aura_dir(sysobj, args), 'stage1', 'aura-secure-raw.bin')
     raw = check_stage1_image(image)
     flavour = image_flavour(raw)
