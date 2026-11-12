@@ -1,0 +1,29 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# kernel-install plugin: build (and sign, when the owner's db key exists) the
+# secure-path UKI of each kernel, and remove it with the kernel. It does
+# nothing until /etc/aurora/secboot.conf exists; see aurora-secboot(1).
+#   add KERNEL_VERSION ENTRY_DIR KERNEL_IMAGE [INITRD...] | remove KERNEL_VERSION
+set -u
+command=${1:-} kver=${2:-}
+root=${AURORA_SECBOOT_ROOT:-}
+[[ -f $root/etc/aurora/secboot.conf && -n $kver ]] || exit 0
+cli=${AURORA_SECBOOT_CLI:-/usr/bin/aurora-secboot}
+args=(${root:+--root "$root"} hook)
+case $command in
+  add)
+    args+=(add "$kver")
+    [[ -n ${3:-} ]] && args+=(--entry-dir "$3")
+    [[ -n ${4:-} ]] && args+=(--image "$4")
+    for initrd in "${@:5}"; do
+      args+=(--initrd "$initrd")
+    done
+    ;;
+  remove)
+    args+=(remove "$kver")
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+exec "$cli" "${args[@]}"

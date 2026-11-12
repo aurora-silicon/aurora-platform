@@ -13,7 +13,33 @@ jobs:
       - run: |
           python3 -m unittest discover -s tests
           bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion tests/loop-rekey tests/selinux-labels tests/selinux-policy images/finalize-image images/label-fedora-rootfs
+          bash -n secboot/92-aurora-secboot.install secboot/aurora-secboot.initcpio-post tests/secboot-roundtrip tests/selinux-secboot
           python3 -m py_compile images/*.py
+          python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' secboot/aurora-secboot
+  secboot:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build, sign and verify a real UKI with the Fedora tools
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/src:ro" -w /src registry.fedoraproject.org/fedora:44 \
+            bash -euo pipefail -c '
+              dnf install -y systemd-ukify systemd-boot-unsigned sbsigntools openssl python3 cpio
+              cd /tmp && dnf download kernel-core
+              rpm2cpio kernel-core-*.rpm | cpio -idm "*/modules/*/vmlinuz"
+              image=$(find /tmp -path "*/modules/*/vmlinuz" | head -n 1)
+              kver=$(basename "$(dirname "$image")")
+              head -c 1048576 /dev/urandom > /tmp/initrd.img
+              cd /src && python3 -m unittest tests.test_secboot
+              bash tests/secboot-roundtrip "$image" /tmp/initrd.img "$kver" "$(mktemp -d)"
+            ' 2>&1 | tee secboot.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: secboot-roundtrip
+          path: secboot.log
   console:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -67,6 +93,7 @@ jobs:
               dnf install -y policycoreutils selinux-policy-targeted selinux-policy-devel setools-console make
               bash tests/selinux-labels
               bash tests/selinux-policy
+              bash tests/selinux-secboot
             ' 2>&1 | tee selinux-labels.log
       - uses: actions/upload-artifact@v4
         if: always()

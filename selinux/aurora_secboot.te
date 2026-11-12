@@ -1,0 +1,11 @@
+policy_module(aurora_secboot, 1.0.0)
+
+# The owner's secure boot signing keys (UEFI PK, KEK, db and the Stage 2 key)
+# under /var/lib/aurora/secboot. As security files they stay out of reach of
+# confined services, including those allowed to read every ordinary file.
+# Administrators (unconfined_t), package scriptlets that run kernel-install
+# (rpm_script_t) and the key adoption service (unconfined_service_t) keep full
+# access as unconfined domains. aurora-secboot itself is installed in
+# /usr/bin (bin_t), so it runs in the domain of whoever calls it.
+type aurora_secboot_key_t;
+files_security_file(aurora_secboot_key_t)

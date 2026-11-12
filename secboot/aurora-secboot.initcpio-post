@@ -1,0 +1,25 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# mkinitcpio post hook: build (and sign, when the owner's db key exists) the
+# secure-path UKI from the image mkinitcpio just made. It does nothing until
+# /etc/aurora/secboot.conf exists; see aurora-secboot(1).
+# mkinitcpio passes: $1 kernel image, $2 initramfs image, $3 UKI (unused here),
+# and exports KERNELVERSION.
+set -u
+kernel=${1:-} initramfs=${2:-}
+root=${AURORA_SECBOOT_ROOT:-}
+[[ -f $root/etc/aurora/secboot.conf ]] || exit 0
+# The fallback image and images written outside /boot (mkinitcpio -g) are not
+# boot images.
+[[ -n $kernel && -n $initramfs && $initramfs == "$root"/boot/* && $initramfs != *-fallback.img ]] || exit 0
+kver=${KERNELVERSION:-}
+if [[ -z $kver || $kver == none ]]; then
+  if [[ $kernel =~ /usr/lib/modules/([^/]+)/vmlinuz$ ]]; then
+    kver=${BASH_REMATCH[1]}
+  else
+    echo "aurora-secboot: no kernel version for $kernel, no UKI built" >&2
+    exit 0
+  fi
+fi
+cli=${AURORA_SECBOOT_CLI:-/usr/bin/aurora-secboot}
+exec "$cli" ${root:+--root "$root"} hook add "$kver" --image "$kernel" --initrd "$initramfs"

@@ -1,0 +1,1 @@
+/var/lib/aurora/secboot(/.*)?	gen_context(system_u:object_r:aurora_secboot_key_t,s0)
