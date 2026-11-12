@@ -600,6 +600,31 @@ class ImageBuilderTests(TempCase):
         args = fx.calls('ukify')[-1]
         self.assertEqual(args[args.index('--stub') + 1], str(fx.root / 'nix/store/s/opt.stub'))
 
+    def test_os_release_option_and_sandbox_fallback(self):
+        fx, conf, gen = self.nixos()
+        (fx.root / 'nix/store/s').mkdir(exist_ok=True)
+        (fx.root / 'nix/store/s/os-release').write_text('ID=nixos\nNAME=NixOS\n')
+        r = fx.run('--config', conf, 'uki', 'build', '7.2.10', '--image', f'{gen}/kernel', '--initrd', '/tmp/initrd',
+                   '--output', '/a.efi', '--os-release', '/nix/store/s/os-release')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = fx.calls('ukify')[-1]
+        self.assertEqual(args[args.index('--os-release') + 1], '@' + str(fx.root / 'nix/store/s/os-release'))
+        r = fx.run('--config', conf, 'uki', 'build', '7.2.10', '--image', f'{gen}/kernel', '--initrd', '/tmp/initrd',
+                   '--output', '/b.efi', '--os-release', '/nix/store/s/missing')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('missing', r.stderr)
+        # No os-release anywhere (a build sandbox): ukify still gets one.
+        for f in ('etc/os-release', 'usr/lib/os-release'):
+            if (fx.root / f).exists():
+                (fx.root / f).unlink()
+        r = fx.run('--config', conf, 'uki', 'build', '7.2.10', '--image', f'{gen}/kernel', '--initrd', '/tmp/initrd',
+                   '--output', '/c.efi')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = fx.calls('ukify')[-1]
+        text = args[args.index('--os-release') + 1]
+        self.assertFalse(text.startswith('@'))
+        self.assertIn('PRETTY_NAME="Linux 7.2.10"', text)
+
     def test_enable_given_uki_and_read_only_config(self):
         fx, conf, gen = self.nixos()
         fx.run('--config', conf, 'keys', 'create')
