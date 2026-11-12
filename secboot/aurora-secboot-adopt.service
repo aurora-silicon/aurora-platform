@@ -1,0 +1,17 @@
+[Unit]
+Description=Move the installer's Stage 2 key off the EFI system partition
+Documentation=file:/usr/share/doc/aurora-secboot/README.md
+ConditionPathExists=|/boot/efi/aurora/secboot/stage2.key
+ConditionPathExists=|/boot/aurora/secboot/stage2.key
+RequiresMountsFor=/var/lib/aurora
+After=local-fs.target
+Before=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/aurora-secboot keys adopt
+UMask=0077
+PrivateNetwork=yes
+
+[Install]
+WantedBy=multi-user.target

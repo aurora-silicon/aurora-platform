@@ -1,0 +1,1078 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: MIT
+"""Build, sign and install unified kernel images (UKIs) for the secure boot path.
+
+Python 3 standard library only. External tools: ukify (systemd-ukify),
+sbsign and sbverify (sbsigntools), openssl. Exit status: 0 on success, 1 when
+the request is refused (one sentence on stderr), 2 on usage errors.
+See secboot/README.md.
+"""
+import argparse
+import base64
+import errno
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+import zlib
+
+CONFIG = '/etc/aurora/secboot.conf'
+DEFAULTS = {
+    'KEY_OWNER': 'aurora',
+    'SECURE_PATH': 'no',
+    'LOCKDOWN': 'integrity',
+    'KEY_DIR': '/var/lib/aurora/secboot/keys',
+    'ESP': '',
+    'UKI_BUILD': 'auto',
+}
+CHOICES = {
+    'KEY_OWNER': ('aurora', 'owner', 'both'),
+    'SECURE_PATH': ('no', 'yes'),
+    'LOCKDOWN': ('integrity', 'confidentiality'),
+    'UKI_BUILD': ('auto', 'yes', 'no'),
+}
+STUB = '/usr/lib/systemd/boot/efi/linuxaa64.efi.stub'
+DT_ESP = ('/proc/device-tree/chosen/asahi,efi-system-partition',
+          '/sys/firmware/devicetree/base/chosen/asahi,efi-system-partition')
+BOOT_SECURITY = '/sys/firmware/aurora/boot_security'
+EFIVARS = '/sys/firmware/efi/efivars'
+EFI_GLOBAL = '8be4df61-93ca-11d2-aa0d-00e098032b8c'
+LOCKDOWN_FILE = '/sys/kernel/security/lockdown'
+BOOT_LOADER = 'EFI/BOOT/BOOTAA64.EFI'
+SAVED_LOADER = 'EFI/BOOT/BOOTAA64.EFI.aurora-shim'
+UKI_DIR = 'EFI/Linux'
+HANDOFF_DIR = 'aurora/secboot'
+UEFI_KEYS = ('PK', 'KEK', 'db')
+
+# Command line tokens that open a shell, change what init runs, or weaken the
+# lockdown and signature checks. The secure path drops them. Kernel and systemd
+# treat '-' and '_' in parameter names alike, so names are compared with '_'.
+REFUSED_PREFIX = ('systemd.debug_shell', 'rd.systemd.debug_shell', 'rd.break', 'rd.shell')
+REFUSED_KEY = ('init', 'rdinit', 'systemd.unit', 'rd.systemd.unit', 'lockdown',
+               'module.sig_enforce', 'efi', 'panic', 'systemd.watchdog_sec')
+# Bare words that systemd reads as rescue.target or emergency.target.
+REFUSED_WORD = ('single', 'emergency', 'rescue', 's', 'S', '1', '-s', '-b')
+LAB_KEYS = ('panic', 'systemd.watchdog_sec')
+DROPPED_FROM_PROC = ('BOOT_IMAGE', 'initrd')
+
+
+class Refusal(Exception):
+    """The request cannot be done; the message is one plain sentence."""
+
+
+def warn(msg):
+    print(f'aurora-secboot: {msg}', file=sys.stderr)
+
+
+# --- paths and configuration ----------------------------------------------------------------------
+
+class System:
+    def __init__(self, root=''):
+        self.root = root.rstrip('/') if root else ''
+
+    def path(self, p):
+        return self.root + p if self.root else p
+
+    def arg_path(self, p):
+        """A path given on the command line: absolute ones live under --root."""
+        if self.root and p.startswith('/') and not (p + '/').startswith(self.root + '/'):
+            return self.root + p
+        return p
+
+    def read(self, p, default=None, binary=False):
+        try:
+            with open(self.path(p), 'rb' if binary else 'r') as f:
+                return f.read()
+        except OSError:
+            return default
+
+    def config(self):
+        cfg = dict(DEFAULTS)
+        text = self.read(CONFIG)
+        cfg['_present'] = text is not None
+        for n, line in enumerate((text or '').splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)=(.*)$', line)
+            if not m:
+                raise Refusal(f'{CONFIG} line {n} is not KEY=value.')
+            value = re.sub(r'(^|\s+)#.*$', '', m.group(2)).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+                value = value[1:-1]
+            cfg[m.group(1)] = value
+        for key, allowed in CHOICES.items():
+            if cfg[key] not in allowed:
+                raise Refusal(f'{CONFIG}: {key}={cfg[key]} is not one of {", ".join(allowed)}.')
+        if not cfg['KEY_DIR'].startswith('/'):
+            raise Refusal(f'{CONFIG}: KEY_DIR must be an absolute path.')
+        if cfg['ESP'] and not cfg['ESP'].startswith('/'):
+            raise Refusal(f'{CONFIG}: ESP must be empty or an absolute path.')
+        return cfg
+
+    def set_config(self, key, value):
+        """Set KEY=value in the config, keeping every other line and comment."""
+        text = self.read(CONFIG, '')
+        lines = text.splitlines()
+        out, done = [], False
+        for line in lines:
+            m = re.match(rf'(\s*){key}=(\S*|"[^"]*"|\'[^\']*\')(.*)$', line)
+            if m and not done:
+                out.append(f'{m.group(1)}{key}={value}{m.group(3)}')
+                done = True
+            elif m:
+                continue
+            else:
+                out.append(line)
+        if not done:
+            out.append(f'{key}={value}')
+        os.makedirs(os.path.dirname(self.path(CONFIG)), exist_ok=True)
+        atomic_write(self.path(CONFIG), ('\n'.join(out) + '\n').encode(), 0o644)
+
+    def key_dir(self, cfg):
+        return self.path(cfg['KEY_DIR'])
+
+    def esp(self, cfg):
+        if cfg['ESP']:
+            return self.path(cfg['ESP'])
+        mount = self.dt_esp_mount()
+        return mount if mount else self.path('/boot/efi')
+
+    def dt_esp_mount(self):
+        """Mount point of the ESP that Stage 1/2 named in the device tree."""
+        for node in DT_ESP:
+            raw = self.read(node, binary=True)
+            if raw:
+                break
+        else:
+            return None
+        partuuid = raw.rstrip(b'\0').decode(errors='replace').strip().lower()
+        link = self.path('/dev/disk/by-partuuid/' + partuuid)
+        if not os.path.exists(link):
+            return None
+        dev = os.path.realpath(link)
+        for line in (self.read('/proc/self/mountinfo') or '').splitlines():
+            fields = line.split(' - ')
+            if len(fields) != 2:
+                continue
+            left, right = fields[0].split(), fields[1].split()
+            if len(right) >= 2 and os.path.realpath(self.path(right[1])) == dev:
+                return self.path(left[4].replace('\\040', ' '))
+        return None
+
+    def machine_id(self):
+        mid = (self.read('/etc/machine-id') or '').strip() or os.environ.get('KERNEL_INSTALL_MACHINE_ID', '')
+        if not re.fullmatch(r'[0-9a-f]{32}', mid):
+            raise Refusal('/etc/machine-id is missing or malformed, so the UKI cannot be named.')
+        return mid
+
+    def running_kernel(self):
+        if self.root:
+            return (self.read('/proc/sys/kernel/osrelease') or '').strip() or None
+        return os.uname().release
+
+
+def atomic_write(path, data, mode=0o644):
+    """Write a new file next to path, fsync it and rename it over path."""
+    d = os.path.dirname(path) or '.'
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.', suffix='.tmp', dir=d)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    fsync_dir(d)
+
+
+def atomic_copy(src, dst, mode=0o644):
+    with open(src, 'rb') as f:
+        atomic_write(dst, f.read(), mode)
+
+
+def fsync_dir(d):
+    try:
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def wipe(path):
+    """Overwrite a file with zeros, then unlink it (best effort on flash and FAT)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'r+b') as f:
+            f.write(b'\0' * size)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    os.unlink(path)
+    fsync_dir(os.path.dirname(path))
+
+
+def tool(name, package):
+    found = shutil.which(name)
+    if not found:
+        raise Refusal(f'{name} is not installed (package {package}).')
+    return found
+
+
+def run(argv, **kw):
+    r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kw)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout).strip().splitlines()
+        raise Refusal(f'{os.path.basename(argv[0])} failed: {detail[-1] if detail else "exit " + str(r.returncode)}.')
+    return r
+
+
+def restorecon(sysobj, path):
+    if sysobj.root or not os.path.exists('/sys/fs/selinux/enforce'):
+        return
+    rc = shutil.which('restorecon')
+    if rc:
+        subprocess.run([rc, '-R', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --- version order (rpm style: digit runs numerically, letter runs as text) ----------------------
+
+def vercmp(a, b):
+    ra, rb = re.findall(r'\d+|[A-Za-z]+|~', a), re.findall(r'\d+|[A-Za-z]+|~', b)
+    for x, y in zip(ra, rb):
+        if x == y:
+            continue
+        if x == '~' or y == '~':
+            return -1 if x == '~' else 1
+        if x.isdigit() and y.isdigit():
+            return (int(x) > int(y)) - (int(x) < int(y))
+        if x.isdigit() != y.isdigit():
+            return 1 if x.isdigit() else -1
+        return (x > y) - (x < y)
+    if len(ra) == len(rb):
+        return 0
+    longer = ra if len(ra) > len(rb) else rb
+    nxt = longer[min(len(ra), len(rb))]
+    sign = 1 if longer is ra else -1
+    return -sign if nxt == '~' else sign
+
+
+def newest(versions):
+    best = None
+    for v in versions:
+        if best is None or vercmp(v, best) > 0:
+            best = v
+    return best
+
+
+# --- PE inspection ----------------------------------------------------------------------------
+
+def pe_info(path):
+    """Return (sections, signed) for a PE file, or None if it is not one."""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(1 << 16)
+    except OSError:
+        return None
+    if len(data) < 0x40 or data[:2] != b'MZ':
+        return None
+    pe = struct.unpack_from('<I', data, 0x3c)[0]
+    if pe + 24 > len(data) or data[pe:pe + 4] != b'PE\0\0':
+        return None
+    nsec, = struct.unpack_from('<H', data, pe + 6)
+    optsize, = struct.unpack_from('<H', data, pe + 20)
+    opt = pe + 24
+    magic, = struct.unpack_from('<H', data, opt)
+    dd = opt + (112 if magic == 0x20b else 96)
+    signed = False
+    if dd + 5 * 8 <= opt + optsize and dd + 5 * 8 <= len(data):
+        _, size = struct.unpack_from('<II', data, dd + 4 * 8)
+        signed = size > 0
+    sections = []
+    s = opt + optsize
+    for i in range(nsec):
+        if s + 40 * (i + 1) > len(data):
+            break
+        sections.append(data[s + 40 * i:s + 40 * i + 8].rstrip(b'\0').decode(errors='replace'))
+    return sections, signed
+
+
+def is_uki(path):
+    info = pe_info(path)
+    return bool(info and '.linux' in info[0])
+
+
+def verdict(path, cert):
+    """verified | unsigned | other-key | not-pe."""
+    info = pe_info(path)
+    if info is None:
+        return 'not-pe'
+    if not info[1]:
+        return 'unsigned'
+    if not cert or not os.path.exists(cert):
+        return 'other-key'
+    r = subprocess.run([tool('sbverify', 'sbsigntools'), '--cert', cert, path],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return 'verified' if r.returncode == 0 else 'other-key'
+
+
+# --- command line ----------------------------------------------------------------------------
+
+def split_cmdline(text):
+    """Split a kernel command line like the kernel does (double quotes group)."""
+    tokens, cur, quoted, has = [], [], False, False
+    for ch in text:
+        if ch == '"':
+            quoted = not quoted
+            cur.append(ch)
+            has = True
+        elif ch.isspace() and not quoted:
+            if has:
+                tokens.append(''.join(cur))
+            cur, has = [], False
+        else:
+            cur.append(ch)
+            has = True
+    if has:
+        tokens.append(''.join(cur))
+    return tokens
+
+
+def refused(token, lab):
+    """Why a token is dropped from the secure-path command line, or None."""
+    if token in REFUSED_WORD:
+        return 'starts a rescue or emergency shell'
+    key = token.split('=', 1)[0].replace('-', '_')
+    if lab and key in LAB_KEYS:
+        return None
+    for p in REFUSED_PREFIX:
+        if key == p or key.startswith(p):
+            return 'opens a shell'
+    if key in REFUSED_KEY:
+        if key in ('lockdown', 'module.sig_enforce', 'efi'):
+            return 'is set by the secure path'
+        if key in LAB_KEYS:
+            return 'is a lab-only setting'
+        return 'changes what init runs'
+    return None
+
+
+def secure_cmdline(sysobj, cfg, lab=False, source=None):
+    if source is not None:
+        try:
+            with open(source) as f:
+                text = f.read()
+        except OSError as e:
+            raise Refusal(f'cannot read {source}: {e.strerror}.')
+        origin = source
+    else:
+        text = sysobj.read('/etc/kernel/cmdline')
+        origin = '/etc/kernel/cmdline'
+        if text is None:
+            text = sysobj.read('/proc/cmdline') or ''
+            origin = '/proc/cmdline'
+    tokens, warnings = [], []
+    for t in split_cmdline(text.replace('\n', ' ')):
+        if origin == '/proc/cmdline' and t.split('=', 1)[0] in DROPPED_FROM_PROC:
+            continue
+        why = refused(t, lab)
+        if why:
+            warnings.append(f"removed '{t}' from the secure-path command line: it {why}")
+            continue
+        tokens.append(t)
+    tokens.append('lockdown=' + cfg['LOCKDOWN'])
+    return ' '.join(tokens), warnings
+
+
+# --- keys ------------------------------------------------------------------------------------
+
+# Ed25519 public key from a 32-byte seed (RFC 8032, section 5.1.5).
+_P = 2 ** 255 - 19
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_BY = 4 * pow(5, _P - 2, _P) % _P
+
+
+def _bx(y):
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P:
+        x = x * pow(2, (_P - 1) // 4, _P) % _P
+    return _P - x if x & 1 else x
+
+
+_BASE = (_bx(_BY), _BY, 1, _bx(_BY) * _BY % _P)
+
+
+def _ed_add(a, b):
+    x1, y1, z1, t1 = a
+    x2, y2, z2, t2 = b
+    k = (y1 - x1) * (y2 - x2) % _P
+    l_ = (y1 + x1) * (y2 + x2) % _P
+    m = 2 * _D * t1 * t2 % _P
+    n = 2 * z1 * z2 % _P
+    e, f, g, h = l_ - k, n - m, n + m, l_ + k
+    return e * f % _P, g * h % _P, f * g % _P, e * h % _P
+
+
+def ed25519_public(seed):
+    if len(seed) != 32:
+        raise ValueError('seed must be 32 bytes')
+    h = hashlib.sha512(seed).digest()
+    s = int.from_bytes(h[:32], 'little')
+    s = (s & ((1 << 254) - 8)) | (1 << 254)
+    q, p = (0, 1, 1, 0), _BASE
+    while s:
+        if s & 1:
+            q = _ed_add(q, p)
+        p = _ed_add(p, p)
+        s >>= 1
+    zi = pow(q[2], _P - 2, _P)
+    x, y = q[0] * zi % _P, q[1] * zi % _P
+    return (y | ((x & 1) << 255)).to_bytes(32, 'little')
+
+
+def stage2_key_id(pub):
+    return hashlib.sha256(pub).hexdigest()[:16]
+
+
+def pem_certs(text):
+    return [base64.b64decode(''.join(b.split()))
+            for b in re.findall(r'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----', text, re.S)]
+
+
+def ensure_key_dir(sysobj, kd):
+    os.makedirs(kd, mode=0o700, exist_ok=True)
+    os.chmod(kd, 0o700)
+    restorecon(sysobj, os.path.dirname(kd))
+
+
+def cmd_keys_create(sysobj, cfg, args):
+    if cfg['KEY_OWNER'] == 'aurora':
+        raise Refusal('KEY_OWNER=aurora keeps no private key on this machine; '
+                      'set KEY_OWNER=owner or both in /etc/aurora/secboot.conf to make owner keys.')
+    kd = sysobj.key_dir(cfg)
+    present = [f for k in UEFI_KEYS for f in (k + '.key', k + '.crt') if os.path.exists(os.path.join(kd, f))]
+    if present and not args.force:
+        raise Refusal(f'{kd} already holds {", ".join(present)}; use --force to replace the UEFI keys.')
+    openssl = tool('openssl', 'openssl')
+    ensure_key_dir(sysobj, kd)
+    host = (sysobj.read('/etc/hostname') or '').strip() or 'aurora'
+    stamp = time.strftime('%Y%m%d')
+    work = tempfile.mkdtemp(prefix='.new-', dir=kd)
+    try:
+        for k in UEFI_KEYS:
+            run([openssl, 'req', '-new', '-x509', '-newkey', 'rsa:2048', '-nodes', '-sha256',
+                 '-days', '7300', '-subj', f'/CN={host} Aurora secure boot {k} {stamp}/',
+                 '-keyout', os.path.join(work, k + '.key'), '-out', os.path.join(work, k + '.crt')])
+        for k in UEFI_KEYS:
+            for ext, mode in (('.key', 0o600), ('.crt', 0o644)):
+                src = os.path.join(work, k + ext)
+                os.chmod(src, mode)
+                os.replace(src, os.path.join(kd, k + ext))
+            print(f'made {os.path.join(kd, k)}.key, {k}.crt')
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    guid = os.path.join(kd, 'owner.guid')
+    if args.force or not os.path.exists(guid):
+        atomic_write(guid, (str(uuid.uuid4()) + '\n').encode(), 0o644)
+    s2 = os.path.join(kd, 'stage2.key')
+    if os.path.exists(s2):
+        print(f'kept {s2}: the Stage 1 key block trusts its public half')
+    else:
+        seed = os.urandom(32)
+        atomic_write(s2, seed, 0o600)
+        atomic_write(os.path.join(kd, 'stage2.pub'), ed25519_public(seed), 0o644)
+        print(f'made {s2}, stage2.pub (key id {stage2_key_id(ed25519_public(seed))})')
+    fsync_dir(kd)
+    print('The private keys are on this machine: root can sign with them.')
+    return 0
+
+
+def cmd_keys_adopt(sysobj, cfg, args):
+    if args.source:
+        key = os.path.join(args.source, 'stage2.key') if os.path.isdir(args.source) else args.source
+    else:
+        key = os.path.join(sysobj.esp(cfg), HANDOFF_DIR, 'stage2.key')
+    pubf = key[:-4] + '.pub' if key.endswith('.key') else key + '.pub'
+    owner = os.path.join(os.path.dirname(key), 'owner')
+    kd = sysobj.key_dir(cfg)
+    dst, dstpub = os.path.join(kd, 'stage2.key'), os.path.join(kd, 'stage2.pub')
+    if not os.path.exists(key):
+        if os.path.exists(dst):
+            print(f'nothing to adopt: {dst} is already in place')
+        else:
+            print(f'nothing to adopt: no {key}')
+        return 0
+    with open(key, 'rb') as f:
+        seed = f.read()
+    try:
+        with open(pubf, 'rb') as f:
+            pub = f.read()
+    except OSError:
+        raise Refusal(f'{pubf} is missing, so the Stage 2 key cannot be checked; it was left in place.')
+    if len(seed) != 32 or len(pub) != 32 or ed25519_public(seed) != pub:
+        raise Refusal(f'{key} does not match {pubf}; nothing was adopted and both were left in place.')
+    if os.path.exists(dst):
+        with open(dst, 'rb') as f:
+            if f.read() != seed:
+                raise Refusal(f'{dst} already holds a different Stage 2 key; the ESP copy was left in place.')
+    else:
+        ensure_key_dir(sysobj, kd)
+        atomic_write(dst, seed, 0o600)
+        atomic_write(dstpub, pub, 0o644)
+        print(f'adopted the Stage 2 key into {dst} (key id {stage2_key_id(pub)})')
+    if os.path.exists(owner):
+        text = open(owner).read().strip()
+        value = text.split('=', 1)[1].strip() if '=' in text else text
+        if value in CHOICES['KEY_OWNER'] and value != cfg['KEY_OWNER']:
+            try:
+                sysobj.set_config('KEY_OWNER', value)
+                print(f'KEY_OWNER={value} (chosen at install)')
+            except OSError as e:
+                warn(f'could not record KEY_OWNER={value} in {CONFIG}: {e.strerror}')
+        os.unlink(owner)
+    for f in (key, pubf):
+        if os.path.exists(f):
+            wipe(f)
+    print(f'wiped the ESP copies under {os.path.dirname(key)}')
+    return 0
+
+
+# --- UKIs ------------------------------------------------------------------------------------
+
+def uki_path(sysobj, cfg, kver):
+    return os.path.join(sysobj.esp(cfg), UKI_DIR, f'aurora-{sysobj.machine_id()}-{kver}.efi')
+
+
+def ukis(sysobj, cfg):
+    """{kver: path} for this machine's UKIs."""
+    d = os.path.join(sysobj.esp(cfg), UKI_DIR)
+    out = {}
+    try:
+        mid = sysobj.machine_id()
+        names = os.listdir(d)
+    except (OSError, Refusal):
+        return out
+    pre = f'aurora-{mid}-'
+    for n in names:
+        if n.startswith(pre) and n.endswith('.efi') and not n.startswith('.'):
+            out[n[len(pre):-4]] = os.path.join(d, n)
+    return out
+
+
+def find_first(sysobj, candidates):
+    for c in candidates:
+        if c and os.path.exists(sysobj.path(c)):
+            return sysobj.path(c)
+    return None
+
+
+def cmd_uki_build(sysobj, cfg, args):
+    kver = args.kver
+    if '/' in kver or kver.startswith('.'):
+        raise Refusal(f'{kver} is not a kernel version.')
+    image = args.image or find_first(sysobj, (f'/usr/lib/modules/{kver}/vmlinuz', f'/boot/vmlinuz-{kver}'))
+    if not image or not os.path.exists(image):
+        raise Refusal(f'no kernel image for {kver} (looked in /usr/lib/modules/{kver}/vmlinuz and /boot).')
+    initrds = args.initrd or [find_first(sysobj, (f'/boot/initramfs-{kver}.img', f'/boot/initrd.img-{kver}',
+                                                  f'/usr/lib/modules/{kver}/initramfs.img'))]
+    if not initrds[0]:
+        raise Refusal(f'no initramfs for {kver}; pass --initrd.')
+    for i in initrds:
+        if not os.path.exists(i):
+            raise Refusal(f'{i} does not exist.')
+    stub = sysobj.path(STUB)
+    if not os.path.exists(stub):
+        raise Refusal(f'{STUB} is missing (systemd-boot stub).')
+    osrel = find_first(sysobj, ('/etc/os-release', '/usr/lib/os-release'))
+    cmdline, warnings = secure_cmdline(sysobj, cfg, args.lab, args.cmdline_file)
+    for w in warnings:
+        warn(w)
+    if args.lab:
+        warn('--lab keeps the lab dead-man settings: never ship this UKI')
+    out = args.output or uki_path(sysobj, cfg, kver)
+    outdir = os.path.dirname(os.path.abspath(out))
+    os.makedirs(outdir, exist_ok=True)
+    kd = sysobj.key_dir(cfg)
+    key, cert = os.path.join(kd, 'db.key'), os.path.join(kd, 'db.crt')
+    sign = not args.no_sign and os.path.exists(key) and os.path.exists(cert)
+    if not sign and not args.no_sign:
+        warn(f'no db.key in {kd}: the UKI is left unsigned' +
+             (' (KEY_OWNER=aurora: Aurora signs what it ships)' if cfg['KEY_OWNER'] == 'aurora' else ''))
+    ukify = tool('ukify', 'systemd-ukify')
+    sbsign = tool('sbsign', 'sbsigntools') if sign else None
+    base = '.' + os.path.basename(out)
+    fd, unsigned = tempfile.mkstemp(prefix=base + '.', suffix='.unsigned', dir=outdir)
+    os.close(fd)
+    fd, signed = tempfile.mkstemp(prefix=base + '.', suffix='.signed', dir=outdir)
+    os.close(fd)
+    try:
+        argv = [ukify, 'build', '--linux', image]
+        for i in initrds:
+            argv += ['--initrd', i]
+        argv += ['--cmdline', cmdline, '--uname', kver, '--stub', stub, '--output', unsigned]
+        if osrel:
+            argv[2:2] = ['--os-release', '@' + osrel]
+        run(argv)
+        final = unsigned
+        if sign:
+            os.unlink(signed)
+            run([sbsign, '--key', key, '--cert', cert, '--output', signed, unsigned])
+            final = signed
+        with open(final, 'rb') as f:
+            os.fsync(f.fileno())
+        os.chmod(final, 0o644)
+        os.replace(final, out)
+        fsync_dir(outdir)
+    finally:
+        for t in (unsigned, signed):
+            if os.path.exists(t):
+                os.unlink(t)
+    digest = hashlib.sha256(open(out, 'rb').read()).hexdigest()
+    print(f'{out}: {"signed with " + cert if sign else "unsigned"}, sha256 {digest}')
+    print(f'cmdline: {cmdline}')
+    return 0
+
+
+def cmd_uki_remove(sysobj, cfg, args):
+    p = uki_path(sysobj, cfg, args.kver)
+    if not os.path.exists(p):
+        print(f'nothing to remove: no {p}')
+        return 0
+    os.unlink(p)
+    fsync_dir(os.path.dirname(p))
+    print(f'removed {p}')
+    return 0
+
+
+def cmd_uki_verify(sysobj, cfg, args):
+    cert = os.path.join(sysobj.key_dir(cfg), 'db.crt')
+    if not os.path.exists(cert):
+        raise Refusal(f'there is no {cert} to verify against' +
+                      (' (KEY_OWNER=aurora keeps no owner keys).' if cfg['KEY_OWNER'] == 'aurora' else '.'))
+    paths = args.paths or [p for _, p in sorted(ukis(sysobj, cfg).items())]
+    if not paths:
+        raise Refusal(f'there are no UKIs under {os.path.join(sysobj.esp(cfg), UKI_DIR)}.')
+    bad = 0
+    for p in paths:
+        v = verdict(p, cert) if os.path.exists(p) else 'missing'
+        print(f'{p}: {v}')
+        bad += v != 'verified'
+    return 1 if bad else 0
+
+
+# --- secure path on/off ---------------------------------------------------------------------
+
+def install_loader(sysobj, cfg, quiet=False):
+    """Copy the newest verified UKI to BOOTAA64.EFI, keeping the old loader once."""
+    if cfg['KEY_OWNER'] == 'aurora':
+        raise Refusal('KEY_OWNER=aurora: the secure path waits for Aurora-signed UKIs, '
+                      'and this machine holds no key to sign its own.')
+    cert = os.path.join(sysobj.key_dir(cfg), 'db.crt')
+    if not os.path.exists(cert):
+        raise Refusal(f'there is no {cert}; run "aurora-secboot keys create" first.')
+    have = ukis(sysobj, cfg)
+    wanted = {k for k in (sysobj.running_kernel(), newest(have)) if k}
+    verified = {k: p for k, p in have.items() if verdict(p, cert) == 'verified'}
+    if not wanted & set(verified):
+        raise Refusal('there is no verified UKI for the running or the newest kernel; '
+                      'run "aurora-secboot uki build <version>" first.')
+    kver = newest(verified)
+    src = verified[kver]
+    esp = sysobj.esp(cfg)
+    loader, saved = os.path.join(esp, BOOT_LOADER), os.path.join(esp, SAVED_LOADER)
+    changes = []
+    if os.path.exists(loader) and not os.path.exists(saved) and not is_uki(loader):
+        atomic_copy(loader, saved)
+        changes.append(f'kept the previous loader as {saved}')
+    os.makedirs(os.path.dirname(loader), exist_ok=True)
+    same = os.path.exists(loader) and open(loader, 'rb').read() == open(src, 'rb').read()
+    if not same:
+        atomic_copy(src, loader)
+        changes.append(f'{loader} is now {os.path.basename(src)} ({kver})')
+    return changes
+
+
+def cmd_enable(sysobj, cfg, args):
+    changes = install_loader(sysobj, cfg)
+    if cfg['SECURE_PATH'] != 'yes':
+        sysobj.set_config('SECURE_PATH', 'yes')
+        changes.append(f'SECURE_PATH=yes in {CONFIG}')
+    for c in changes or ['nothing changed: the secure path is already on']:
+        print(c)
+    return 0
+
+
+def cmd_disable(sysobj, cfg, args):
+    esp = sysobj.esp(cfg)
+    loader, saved = os.path.join(esp, BOOT_LOADER), os.path.join(esp, SAVED_LOADER)
+    changes = []
+    if os.path.exists(saved):
+        os.replace(saved, loader)
+        fsync_dir(os.path.dirname(loader))
+        changes.append(f'put the previous loader back as {loader}')
+    elif os.path.exists(loader) and is_uki(loader):
+        raise Refusal(f'{loader} is a UKI and there is no saved loader to put back; reinstall the boot loader '
+                      '(shim or GRUB) first.')
+    if cfg['SECURE_PATH'] != 'no':
+        sysobj.set_config('SECURE_PATH', 'no')
+        changes.append(f'SECURE_PATH=no in {CONFIG}')
+    for c in changes or ['nothing changed: the secure path is already off']:
+        print(c)
+    return 0
+
+
+# --- U-Boot variable seed -------------------------------------------------------------------
+
+SEED_MAGIC = 0x0161566966456255
+EFI_GLOBAL_GUID = uuid.UUID(EFI_GLOBAL)
+EFI_IMAGE_DB_GUID = uuid.UUID('d719b2cb-3d3a-4596-a3bc-dad00e67656f')
+EFI_CERT_X509 = uuid.UUID('a5c059a1-94e4-4aa7-87b5-ab155c2bf072')
+EFI_CERT_SHA256 = uuid.UUID('c1c41626-504c-4092-aca9-41f936934328')
+# NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS | TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+SEED_ATTRS = 0x01 | 0x02 | 0x04 | 0x20
+MICROSOFT_CAS = (
+    b'Microsoft Corporation UEFI CA', b'Microsoft UEFI CA', b'Microsoft Windows Production PCA',
+    b'Windows UEFI CA', b'Microsoft Option ROM UEFI CA', b'Microsoft Corporation KEK CA',
+)
+
+
+def signature_list(certs, owner):
+    """One EFI_SIGNATURE_LIST per certificate (X.509, DER)."""
+    out = b''
+    for der in certs:
+        sig = owner.bytes_le + der
+        out += struct.pack('<16sIII', EFI_CERT_X509.bytes_le, 28 + len(sig), 0, len(sig)) + sig
+    return out
+
+
+def no_revocations():
+    # dbx holds one all-zero SHA-256 entry: it exists and matches no image.
+    sig = bytes(16) + bytes(32)
+    return struct.pack('<16sIII', EFI_CERT_SHA256.bytes_le, 28 + len(sig), 0, len(sig)) + sig
+
+
+def seed_variable(guid, name, data):
+    body = name.encode('utf-16-le') + b'\0\0' + data
+    body += b'\0' * (-len(body) % 8)
+    return struct.pack('<IIQ16s', len(data), SEED_ATTRS, 0, guid.bytes_le) + body
+
+
+def build_seed(lists):
+    """U-Boot's variable file (CONFIG_EFI_VAR_SEED_FILE) holding PK, KEK, db and dbx."""
+    body = (seed_variable(EFI_GLOBAL_GUID, 'PK', lists['PK']) +
+            seed_variable(EFI_GLOBAL_GUID, 'KEK', lists['KEK']) +
+            seed_variable(EFI_IMAGE_DB_GUID, 'db', lists['db']) +
+            seed_variable(EFI_IMAGE_DB_GUID, 'dbx', lists.get('dbx') or no_revocations()))
+    return struct.pack('<QQII', 0, SEED_MAGIC, 24 + len(body), zlib.crc32(body) & 0xffffffff) + body
+
+
+def parse_seed(data):
+    """{name: (guid, attrs, data)} from a seed file; raises ValueError if malformed."""
+    if len(data) < 24:
+        raise ValueError('short seed')
+    _, magic, length, crc = struct.unpack_from('<QQII', data)
+    if magic != SEED_MAGIC or length != len(data) or zlib.crc32(data[24:]) & 0xffffffff != crc:
+        raise ValueError('bad seed header')
+    out, off = {}, 24
+    while off < len(data):
+        size, attrs, _, guid = struct.unpack_from('<IIQ16s', data, off)
+        off += 32
+        end = data.index(b'\0\0', off)
+        while (end - off) % 2:
+            end = data.index(b'\0\0', end + 1)
+        name = data[off:end].decode('utf-16-le')
+        start = end + 2
+        out[name] = (uuid.UUID(bytes_le=guid), attrs, data[start:start + size])
+        off = start + size
+        off += -(off - 24) % 8
+    return out
+
+
+def cmd_seed(sysobj, cfg, args):
+    kd = sysobj.key_dir(cfg)
+    try:
+        owner = uuid.UUID(open(os.path.join(kd, 'owner.guid')).read().strip())
+    except (OSError, ValueError):
+        owner = None
+    lists = {}
+    for k in UEFI_KEYS:
+        crt = os.path.join(kd, k + '.crt')
+        try:
+            certs = pem_certs(open(crt).read())
+        except OSError:
+            raise Refusal(f'{crt} is missing; run "aurora-secboot keys create" first.')
+        if not certs:
+            raise Refusal(f'{crt} holds no PEM certificate.')
+        for der in certs:
+            for ca in MICROSOFT_CAS:
+                if ca in der:
+                    raise Refusal(f'{crt} holds {ca.decode()}; only the distribution\'s or the owner\'s own '
+                                  'keys go in the seed.')
+        if owner is None:
+            owner = uuid.uuid5(uuid.NAMESPACE_OID, 'aurora-secboot:' + hashlib.sha256(certs[0]).hexdigest()) \
+                if k == 'PK' else owner
+        lists[k] = signature_list(certs, owner)
+    out = args.output
+    atomic_write(out, build_seed(lists), 0o644)
+    print(f'{out}: PK, KEK, db from {kd}, empty dbx; sha256 {hashlib.sha256(open(out, "rb").read()).hexdigest()}')
+    print('Build U-Boot with CONFIG_EFI_VARIABLES_PRESEED and this file as CONFIG_EFI_VAR_SEED_FILE.')
+    return 0
+
+
+# --- status ---------------------------------------------------------------------------------
+
+def efivar(sysobj, name):
+    raw = sysobj.read(f'{EFIVARS}/{name}-{EFI_GLOBAL}', binary=True)
+    if raw is None or len(raw) < 5:
+        return None
+    return raw[4]
+
+
+def collect_status(sysobj, cfg):
+    kd = sysobj.key_dir(cfg)
+    keys = {f: os.path.exists(os.path.join(kd, f)) for f in
+            ('PK.key', 'PK.crt', 'KEK.key', 'KEK.crt', 'db.key', 'db.crt', 'stage2.key', 'stage2.pub')}
+    st = {'config': {k: cfg[k] for k in DEFAULTS}, 'config_present': cfg['_present'], 'key_dir': kd,
+          'keys': keys, 'private_keys_on_machine': any(v for k, v in keys.items() if k.endswith('.key'))}
+    pub = sysobj.read(cfg['KEY_DIR'] + '/stage2.pub', binary=True)
+    st['stage2_key_id'] = stage2_key_id(pub) if pub and len(pub) == 32 else None
+    record = None
+    bsdir = sysobj.path(BOOT_SECURITY)
+    if os.path.isdir(bsdir):
+        record = {}
+        for n in sorted(os.listdir(bsdir)):
+            v = sysobj.read(f'{BOOT_SECURITY}/{n}')
+            if v is not None:
+                record[n] = v.strip()
+    st['boot_security'] = record
+    st['efi'] = {n: efivar(sysobj, n) for n in ('SecureBoot', 'SetupMode', 'AuditMode', 'DeployedMode')}
+    lock = sysobj.read(LOCKDOWN_FILE)
+    m = re.search(r'\[(\w+)\]', lock or '')
+    st['lockdown'] = m.group(1) if m else None
+    esp = sysobj.esp(cfg)
+    st['esp'] = esp
+    cert = os.path.join(kd, 'db.crt')
+    images = []
+    for kver, p in sorted(ukis(sysobj, cfg).items(), key=lambda kv: [int(x) if x.isdigit() else x for x in
+                                                                    re.findall(r'\d+|\D+', kv[0])]):
+        images.append({'path': p, 'kernel': kver, 'verdict': verdict(p, cert)})
+    others = os.path.join(esp, UKI_DIR)
+    try:
+        for n in sorted(os.listdir(others)):
+            p = os.path.join(others, n)
+            if n.endswith('.efi') and not n.startswith('.') and p not in {i['path'] for i in images}:
+                images.append({'path': p, 'kernel': None, 'verdict': verdict(p, cert)})
+    except OSError:
+        pass
+    st['ukis'] = images
+    loader = os.path.join(esp, BOOT_LOADER)
+    st['boot_loader'] = None
+    if os.path.exists(loader):
+        st['boot_loader'] = {'path': loader, 'kind': 'uki' if is_uki(loader) else 'loader',
+                             'verdict': verdict(loader, cert),
+                             'saved_loader': os.path.exists(os.path.join(esp, SAVED_LOADER))}
+    st['first_gap'] = first_gap(st)
+    return st
+
+
+def first_gap(st):
+    rec = st['boot_security']
+    if rec is None:
+        return 'no boot security record (/sys/firmware/aurora/boot_security): the Stage 2 predates it'
+    if rec.get('advisory', '1') != '0':
+        return 'Stage 1 does not enforce Stage 2 signatures, so the record is advisory'
+    if rec.get('state') != 'verified':
+        return f'the boot chain is not verified (state {rec.get("state", "unknown")})'
+    if st['efi'].get('SecureBoot') != 1:
+        return 'UEFI Secure Boot is not enforcing'
+    bl = st['boot_loader']
+    if not bl or bl['kind'] != 'uki' or bl['verdict'] != 'verified':
+        return 'EFI/BOOT/BOOTAA64.EFI is not a UKI signed with this machine\'s db key'
+    if st['lockdown'] in (None, 'none'):
+        return 'kernel lockdown is off'
+    return 'none'
+
+
+def cmd_status(sysobj, cfg, args):
+    st = collect_status(sysobj, cfg)
+    if args.json:
+        print(json.dumps(st, indent=2, sort_keys=True))
+        return 0
+    c = st['config']
+    print(f'config: {CONFIG}{"" if st["config_present"] else " (absent, defaults)"}: ' +
+          ' '.join(f'{k}={c[k]}' for k in DEFAULTS))
+    print(f'key owner: {c["KEY_OWNER"]}')
+    have = [k for k, v in st['keys'].items() if v]
+    print(f'keys in {st["key_dir"]}: {", ".join(have) if have else "none"}' +
+          (f' (Stage 2 key id {st["stage2_key_id"]})' if st['stage2_key_id'] else ''))
+    if st['private_keys_on_machine']:
+        print('warning: private signing keys are on this machine; root can sign with them')
+    rec = st['boot_security']
+    print('boot record: ' + ('absent' if rec is None else ', '.join(
+        f'{k}={v}' for k, v in rec.items() if k != 'measurements' and '\n' not in v)))
+    efi = st['efi']
+    print('UEFI: ' + ', '.join(f'{k}={"absent" if v is None else v}' for k, v in efi.items()))
+    print(f'lockdown: {st["lockdown"] or "unknown"}')
+    print(f'ESP: {st["esp"]}')
+    bl = st['boot_loader']
+    print('BOOTAA64.EFI: ' + ('absent' if not bl else f'{bl["kind"]}, {bl["verdict"]}' +
+                               (', previous loader saved' if bl['saved_loader'] else '')))
+    for u in st['ukis']:
+        print(f'UKI {u["path"]}: {u["verdict"]}')
+    if not st['ukis']:
+        print('UKIs: none')
+    print(f'first gap: {st["first_gap"]}')
+    return 0
+
+
+# --- distribution hooks ----------------------------------------------------------------------
+
+def cmd_hook(sysobj, cfg, args):
+    """kernel-install and mkinitcpio entry point; quiet unless the secure path is set up."""
+    if not cfg['_present']:
+        return 0
+    if args.event == 'remove':
+        cmd_uki_remove(sysobj, cfg, argparse.Namespace(kver=args.kver))
+        return refresh_loader(sysobj, cfg)
+    kd = sysobj.key_dir(cfg)
+    want = cfg['UKI_BUILD'] == 'yes' or (cfg['UKI_BUILD'] == 'auto' and (
+        os.path.exists(os.path.join(kd, 'db.key')) or cfg['SECURE_PATH'] == 'yes'))
+    if not want:
+        return 0
+    initrds = [i for i in args.initrd if i and os.path.exists(i)]
+    if not initrds:
+        staging = os.environ.get('KERNEL_INSTALL_STAGING_AREA')
+        staged = os.path.join(staging, 'initrd') if staging else None
+        entry = os.path.join(args.entry_dir, 'initrd') if args.entry_dir else None
+        found = next((p for p in (staged, entry) if p and os.path.exists(p)), None) or \
+            find_first(sysobj, (f'/boot/initramfs-{args.kver}.img',))
+        initrds = [found] if found else None
+    build = argparse.Namespace(kver=args.kver, image=args.image if args.image and os.path.exists(args.image)
+                               else None, initrd=initrds, cmdline_file=None, lab=False, output=None,
+                               no_sign=False)
+    try:
+        cmd_uki_build(sysobj, cfg, build)
+    except Refusal as e:
+        warn(f'no UKI for {args.kver}: {e}')
+        return 1 if cfg['SECURE_PATH'] == 'yes' else 0
+    return refresh_loader(sysobj, cfg)
+
+
+def refresh_loader(sysobj, cfg):
+    if cfg['SECURE_PATH'] != 'yes':
+        return 0
+    try:
+        for c in install_loader(sysobj, cfg):
+            print(c)
+    except Refusal as e:
+        warn(f'EFI/BOOT/BOOTAA64.EFI not refreshed: {e}')
+        return 1
+    return 0
+
+
+# --- main ------------------------------------------------------------------------------------
+
+def parser():
+    ap = argparse.ArgumentParser(prog='aurora-secboot', description='Signed UKIs for the secure boot path.')
+    ap.add_argument('--root', default='', help='prefix every path with DIR (tests, image builds)')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('status', help='show the secure boot state and the first gap')
+    s.add_argument('--json', action='store_true')
+    s.set_defaults(func=cmd_status)
+    k = sub.add_parser('keys', help='owner keys').add_subparsers(dest='keys_cmd', required=True)
+    s = k.add_parser('create', help='make the owner PK, KEK, db and Stage 2 keys')
+    s.add_argument('--force', action='store_true', help='replace existing UEFI keys')
+    s.set_defaults(func=cmd_keys_create)
+    s = k.add_parser('adopt', help="move the installer's Stage 2 key off the ESP")
+    s.add_argument('--from', dest='source', metavar='PATH')
+    s.set_defaults(func=cmd_keys_adopt)
+    s = sub.add_parser('cmdline', help='print the secure-path kernel command line')
+    s.add_argument('--lab', action='store_true', help='keep panic= and systemd.watchdog_sec= (never ship)')
+    s.set_defaults(func=lambda sysobj, cfg, a: print_cmdline(sysobj, cfg, a))
+    u = sub.add_parser('uki', help='build, remove and verify UKIs').add_subparsers(dest='uki_cmd', required=True)
+    s = u.add_parser('build')
+    s.add_argument('kver')
+    s.add_argument('--image')
+    s.add_argument('--initrd', action='append')
+    s.add_argument('--cmdline-file')
+    s.add_argument('--lab', action='store_true')
+    s.add_argument('--output')
+    s.add_argument('--no-sign', action='store_true')
+    s.set_defaults(func=cmd_uki_build)
+    s = u.add_parser('remove')
+    s.add_argument('kver')
+    s.set_defaults(func=cmd_uki_remove)
+    s = u.add_parser('verify')
+    s.add_argument('paths', nargs='*')
+    s.set_defaults(func=cmd_uki_verify)
+    sub.add_parser('enable', help='boot the newest verified UKI').set_defaults(func=cmd_enable)
+    sub.add_parser('disable', help='put the previous loader back').set_defaults(func=cmd_disable)
+    s = sub.add_parser('seed', help='build the U-Boot PK/KEK/db/dbx variable seed')
+    s.add_argument('-o', '--output', required=True)
+    s.set_defaults(func=cmd_seed)
+    s = sub.add_parser('hook', help='used by the kernel-install and mkinitcpio hooks')
+    s.add_argument('event', choices=('add', 'remove'))
+    s.add_argument('kver')
+    s.add_argument('--entry-dir')
+    s.add_argument('--image')
+    s.add_argument('--initrd', action='append', default=[])
+    s.set_defaults(func=cmd_hook)
+    return ap
+
+
+def print_cmdline(sysobj, cfg, args):
+    line, warnings = secure_cmdline(sysobj, cfg, args.lab)
+    for w in warnings:
+        warn(w)
+    if args.lab:
+        warn('--lab keeps the lab dead-man settings: never ship this command line')
+    print(line)
+    return 0
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    sysobj = System(args.root)
+    try:
+        cfg = sysobj.config()
+        # --root prefixes the paths given on the command line too.
+        for attr in ('image', 'cmdline_file', 'output', 'source', 'entry_dir'):
+            if getattr(args, attr, None):
+                setattr(args, attr, sysobj.arg_path(getattr(args, attr)))
+        for attr in ('initrd', 'paths'):
+            if getattr(args, attr, None):
+                setattr(args, attr, [sysobj.arg_path(p) for p in getattr(args, attr)])
+        return args.func(sysobj, cfg, args)
+    except Refusal as e:
+        print(f'aurora-secboot: {e}', file=sys.stderr)
+        return 1
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EPERM):
+            print(f'aurora-secboot: {e.filename or "a file"} is not writable; run as root.', file=sys.stderr)
+        else:
+            print(f'aurora-secboot: {e.filename or ""}: {e.strerror}.', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

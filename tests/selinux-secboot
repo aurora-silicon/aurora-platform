@@ -1,0 +1,39 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Load the secure boot key module into real Fedora targeted policy (offline,
+# in a disposable container) and check who can reach the owner's keys.
+set -euo pipefail
+source_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp -a "$source_root/selinux/." "$work/"
+make -s -C "$work" -f /usr/share/selinux/devel/Makefile aurora_secboot.pp
+semodule -n -i "$work/aurora_secboot.pp"
+semodule -l | grep -qx aurora_secboot
+fail() { echo "SELinux secboot check failed: $*" >&2; exit 1; }
+for path in /var/lib/aurora/secboot /var/lib/aurora/secboot/keys /var/lib/aurora/secboot/keys/db.key; do
+  [[ $(matchpathcon -n "$path") == system_u:object_r:aurora_secboot_key_t:s0 ]] || fail "$path label"
+  echo "$path: $(matchpathcon -n "$path")"
+done
+[[ $(matchpathcon -n /usr/bin/aurora-secboot) == system_u:object_r:bin_t:s0 ]] || fail 'the CLI is not bin_t'
+[[ $(matchpathcon -n /var/lib/aurora/firstboot) != *aurora_secboot_key_t* ]] || fail 'label leaks to firstboot'
+policy=$(ls /etc/selinux/targeted/policy/policy.* | sort -V | tail -n 1)
+# Administrators, package scriptlets (kernel-install) and systemd services
+# (aurora-secboot-adopt.service) write the keys, the ESP and /boot.
+for domain in unconfined_t rpm_script_t unconfined_service_t; do
+  for target in aurora_secboot_key_t dosfs_t boot_t; do
+    sesearch -A -s "$domain" -t "$target" -c file -p write "$policy" | grep -q allow ||
+      fail "$domain cannot write $target files"
+  done
+  sesearch -A -s "$domain" -t aurora_secboot_key_t -c dir -p add_name "$policy" | grep -q allow ||
+    fail "$domain cannot create keys"
+done
+# systemd starts bin_t programs as unconfined services; rpm scriptlets keep their domain.
+sesearch -T -s init_t -t bin_t -c process "$policy" | grep -q 'unconfined_service_t;' ||
+  fail 'init_t does not run bin_t programs as unconfined services'
+# Confined services that may read every ordinary file cannot read the keys.
+for domain in httpd_t sshd_t; do
+  ! sesearch -A -s "$domain" -t aurora_secboot_key_t -c file -p read "$policy" | grep -q allow ||
+    fail "$domain can read the keys"
+done
+echo 'Secure boot keys are reachable by administrators, rpm scriptlets and unconfined services only.'

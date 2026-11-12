@@ -1,0 +1,86 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Real aurora-secboot round trip with ukify, sbsign, sbverify and openssl:
+# owner keys, a signed UKI of a real arm64 kernel, verification, a UKI signed
+# with another key that must fail, and the U-Boot variable seed.
+#   tests/secboot-roundtrip KERNEL_IMAGE INITRD KERNEL_VERSION WORKDIR
+# Everything is written under WORKDIR (a --root tree); nothing on the host
+# changes. Needs systemd-ukify, systemd-boot-unsigned (the stub), sbsigntools,
+# openssl and python3.
+set -euo pipefail
+source_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+image=$1 initrd=$2 kver=$3 work=$4
+cli=("$source_root/secboot/aurora-secboot")
+stub=/usr/lib/systemd/boot/efi/linuxaa64.efi.stub
+fail() { echo "secboot round trip failed: $*" >&2; exit 1; }
+[[ ! -e $work/root ]] || fail "$work/root exists; use a new directory"
+root=$work/root
+mkdir -p "$root/etc/aurora" "$root/etc/kernel" "$root/usr/lib/modules/$kver" "$root/boot/efi/EFI/BOOT" \
+  "$root/usr/lib/systemd/boot/efi"
+cp "$source_root/secboot/secboot.conf" "$root/etc/aurora/secboot.conf"
+sed -i 's/^KEY_OWNER=aurora/KEY_OWNER=owner/' "$root/etc/aurora/secboot.conf"
+echo 0123456789abcdef0123456789abcdef > "$root/etc/machine-id"
+cp /etc/os-release "$root/etc/os-release"
+echo 'root=UUID=x ro rhgb quiet systemd.debug_shell=1 panic=10' > "$root/etc/kernel/cmdline"
+cp "$stub" "$root$stub"
+cp "$image" "$root/usr/lib/modules/$kver/vmlinuz"
+cp "$initrd" "$root/boot/initramfs-$kver.img"
+run() { "${cli[@]}" --root "$root" "$@"; }
+
+run keys create
+run uki build "$kver" 2> "$work/build.err"
+cat "$work/build.err"
+uki=$root/boot/efi/EFI/Linux/aurora-0123456789abcdef0123456789abcdef-$kver.efi
+[[ -f $uki ]] || fail 'no UKI'
+grep -q "removed 'systemd.debug_shell=1'" "$work/build.err" || fail 'debug_shell not reported'
+ukify inspect "$uki" --json=short > "$work/inspect.json"
+python3 - "$work/inspect.json" "$kver" <<'EOF'
+import json, sys
+info = json.load(open(sys.argv[1]))
+sections = {k.lstrip('.'): v for k, v in info.items()}
+cmdline = sections['cmdline']['text'].strip()
+assert cmdline == 'root=UUID=x ro rhgb quiet lockdown=integrity', cmdline
+assert sections['uname']['text'].strip() == sys.argv[2]
+assert 'dtb' not in sections, 'a devicetree was embedded'
+assert {'linux', 'initrd', 'osrel'} <= set(sections), sorted(sections)
+print('UKI sections:', ' '.join(sorted(sections)))
+print('UKI cmdline:', cmdline)
+EOF
+sbverify --cert "$root/var/lib/aurora/secboot/keys/db.crt" "$uki"
+run uki verify | tee "$work/verify.out"
+grep -q ': verified$' "$work/verify.out" || fail 'uki verify'
+
+# The same UKI signed with a stranger's key must not verify against db.
+openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 1 -subj '/CN=stranger/' \
+  -keyout "$work/stranger.key" -out "$work/stranger.crt" 2>/dev/null
+run uki build "$kver" --no-sign --output /stranger-unsigned.efi 2>/dev/null
+sbsign --key "$work/stranger.key" --cert "$work/stranger.crt" --output "$root/stranger.efi" \
+  "$root/stranger-unsigned.efi"
+if run uki verify /stranger.efi > "$work/stranger.out"; then
+  fail 'a UKI signed with another key verified'
+fi
+grep -q ': other-key$' "$work/stranger.out" || fail 'stranger verdict'
+grep -q ': unsigned$' <(run uki verify /stranger-unsigned.efi || :) || fail 'unsigned verdict'
+! sbverify --cert "$root/var/lib/aurora/secboot/keys/db.crt" "$root/stranger.efi" 2>/dev/null ||
+  fail 'sbverify accepted the stranger'
+echo 'stranger UKI: other-key (refused by sbverify)'
+
+run seed -o /ubootefi.var
+python3 - "$source_root/secboot/aurora-secboot" "$root" <<'EOF'
+import importlib.machinery, importlib.util, subprocess, sys
+loader = importlib.machinery.SourceFileLoader('sb', sys.argv[1])
+spec = importlib.util.spec_from_loader('sb', loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+root = sys.argv[2]
+v = sb.parse_seed(open(root + '/ubootefi.var', 'rb').read())
+assert sorted(v) == ['KEK', 'PK', 'db', 'dbx'], sorted(v)
+for k in ('PK', 'KEK', 'db'):
+    der = subprocess.run(['openssl', 'x509', '-in', f'{root}/var/lib/aurora/secboot/keys/{k}.crt',
+                          '-outform', 'DER'], check=True, stdout=subprocess.PIPE).stdout
+    assert v[k][2][44:] == der, k
+print('seed: PK, KEK, db carry the owner certificates; dbx is the empty list')
+EOF
+run status
+sha256sum "$uki" "$root/stranger.efi" "$root/ubootefi.var"
+echo 'secboot round trip passed'
