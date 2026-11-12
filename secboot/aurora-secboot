@@ -637,7 +637,12 @@ def cmd_uki_build(sysobj, cfg, args):
         stub = sysobj.path(STUB)
     if not os.path.exists(stub):
         raise Refusal(f'{stub} is missing (systemd-boot stub).')
-    osrel = find_first(sysobj, ('/etc/os-release', '/usr/lib/os-release'))
+    if getattr(args, 'os_release', None):
+        osrel = args.os_release
+        if not os.path.exists(osrel):
+            raise Refusal(f'{osrel} does not exist.')
+    else:
+        osrel = find_first(sysobj, ('/etc/os-release', '/usr/lib/os-release'))
     cmdline, warnings = secure_cmdline(sysobj, cfg, args.lab, args.cmdline_file, args.init)
     for w in warnings:
         warn(w)
@@ -664,8 +669,9 @@ def cmd_uki_build(sysobj, cfg, args):
         for i in initrds:
             argv += ['--initrd', i]
         argv += ['--cmdline', cmdline, '--uname', kver, '--stub', stub, '--output', unsigned]
-        if osrel:
-            argv[2:2] = ['--os-release', '@' + osrel]
+        # Without any os-release (a build sandbox), ukify would look for
+        # /usr/lib/os-release itself and fail; give it a minimal one.
+        argv[2:2] = ['--os-release', '@' + osrel if osrel else f'ID=linux\nNAME=Linux\nPRETTY_NAME="Linux {kver}"\n']
         run(argv)
         final = unsigned
         if sign:
@@ -1077,6 +1083,7 @@ def parser():
     s.add_argument('--output')
     s.add_argument('--no-sign', action='store_true')
     s.add_argument('--init', metavar='PATH', help='add init=PATH after the command line filter')
+    s.add_argument('--os-release', metavar='PATH', help='os-release file for the UKI (default /etc/os-release, else /usr/lib/os-release)')
     s.add_argument('--stub', metavar='PATH', help=f'systemd-boot stub (default $AURORA_SECBOOT_STUB, else {STUB})')
     s.set_defaults(func=cmd_uki_build)
     s = u.add_parser('remove')
@@ -1118,7 +1125,7 @@ def main(argv=None):
     try:
         cfg = sysobj.config()
         # --root prefixes the paths given on the command line too.
-        for attr in ('image', 'cmdline_file', 'output', 'source', 'entry_dir', 'stub', 'uki'):
+        for attr in ('image', 'cmdline_file', 'output', 'source', 'entry_dir', 'stub', 'uki', 'os_release'):
             if getattr(args, attr, None):
                 setattr(args, attr, sysobj.arg_path(getattr(args, attr)))
         for attr in ('initrd', 'paths'):

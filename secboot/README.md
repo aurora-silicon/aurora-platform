@@ -66,9 +66,9 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
   from the one already in `KEY_DIR`, is refused and left where it is.
 - `cmdline [--lab]`: the secure-path command line. It starts from `/etc/kernel/cmdline` (else `/proc/cmdline` without
   `BOOT_IMAGE=` and `initrd=`), removes the tokens below with one warning each, and adds `lockdown=<LOCKDOWN>`.
-- `uki build KVER [--image P] [--initrd P]... [--cmdline-file P] [--init P] [--stub P] [--lab] [--output P] [--no-sign]`:
+- `uki build KVER [--image P] [--initrd P]... [--cmdline-file P] [--init P] [--stub P] [--os-release P] [--lab] [--output P] [--no-sign]`:
   `ukify build` with the stub (`--stub`, else `$AURORA_SECBOOT_STUB`, else
-  `/usr/lib/systemd/boot/efi/linuxaa64.efi.stub`), `--uname KVER` and `/etc/os-release`. `--init P` adds `init=P` after
+  `/usr/lib/systemd/boot/efi/linuxaa64.efi.stub`), `--uname KVER` and the os-release file (`--os-release P`, else `/etc/os-release`, else `/usr/lib/os-release`; with none, a minimal one naming KVER, so a build sandbox works). `--init P` adds `init=P` after
   the command line filter (NixOS names its generation's init this way); `P` must be absolute, without spaces or quotes. No devicetree goes in the UKI: U-Boot
   passes the one it booted with. It signs with `db.key` when it exists, else leaves the UKI unsigned with a warning. The
   default output is `ESP/EFI/Linux/aurora-<machine-id>-<KVER>.efi`; it is written to a temporary file in the same directory,
