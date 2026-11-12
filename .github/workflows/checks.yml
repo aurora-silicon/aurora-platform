@@ -8,8 +8,16 @@ defaults:
 jobs:
   source:
     runs-on: ubuntu-24.04
+    env:
+      AURORA_TEST_AURA: ${{ github.workspace }}/.aura
     steps:
       - uses: actions/checkout@v5
+      # aura's Stage 1 and signing tools, for the stage1/stage2 tests.
+      - uses: actions/checkout@v5
+        with:
+          repository: aurora-silicon/aura
+          ref: f3f38a5a87f2ab25ea3fbfeac6164537b2d10b28  # aura main with #195
+          path: .aura
       - run: |
           python3 -m unittest discover -s tests
           bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion tests/loop-rekey tests/selinux-labels tests/selinux-policy images/finalize-image images/label-fedora-rootfs
@@ -21,10 +29,15 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: aurora-silicon/aura
+          ref: f3f38a5a87f2ab25ea3fbfeac6164537b2d10b28  # aura main with #195
+          path: .aura
       - name: Build, sign and verify a real UKI with the Fedora tools
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD:/src:ro" -w /src registry.fedoraproject.org/fedora:44 \
+          docker run --rm -v "$PWD:/src:ro" -w /src -e AURORA_TEST_AURA=/src/.aura registry.fedoraproject.org/fedora:44 \
             bash -euo pipefail -c '
               dnf install -y systemd-ukify systemd-boot-unsigned sbsigntools openssl python3 cpio
               cd /tmp && dnf download kernel-core

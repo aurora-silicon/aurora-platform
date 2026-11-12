@@ -25,6 +25,8 @@ built with Secure Boot variables (`aurora-secboot seed`) and from Stage 1.
 | `KEY_DIR` | `/var/lib/aurora/secboot/keys` | Owner keys. |
 | `ESP` | empty | Empty: the ESP named by the device tree's `/chosen/asahi,efi-system-partition`, else `/boot/efi`. |
 | `UKI_BUILD` | `auto` (default), `yes`, `no` | When the distribution hooks build a UKI: `auto` when `db.key` exists or the secure path is on. |
+| `STAGE2_SIGN` | `auto` (default), `yes`, `no` | Whether `stage2 hook` signs the Stage 2 the updater wrote: `auto` when `stage2.key` exists and `KEY_OWNER` is `owner` or `both`. `yes` fails the update when it cannot sign. |
+| `STAGE2_SECVER` | `1` | Security version in Stage 2 signatures. Stage 1 refuses one below its floor. |
 
 ## Keys
 
@@ -87,6 +89,34 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
   and db from `KEY_DIR` and an empty dbx, for an owner-built U-Boot. Certificates from Microsoft's UEFI and Windows CAs are
   refused: they would admit every boot loader Microsoft has signed.
 
+- `stage1 build --audit|--enforce [--stage1-image P] [--stock-image P] [--rollback P]... [--aura-dir D] [--output-dir D] [--min-secver N] [--esp-partuuid U] [--volume NAME] [--allow-dev-flavour] [--sign-stage2-by-hand]`:
+  a Stage 1 Mach-O object for this install that trusts `stage2.pub`, ready to enrol from 1TR. User steps:
+  [stage1-existing-install.md](stage1-existing-install.md). It reads the chip from the device tree root
+  `compatible` (T8132, T6040 and later get the object padded for the execute window and load
+  `m1n1/boot-ctxr.bin`, the others load `m1n1/boot.bin`), and the ESP from `/chosen/asahi,efi-system-partition`.
+  It fills the image's configuration and key blocks (floor `--min-secver`, default 1; `--enforce` sets the
+  enforce flag) and wraps it with aura's tools from `D/tools` (`--aura-dir`, else `$AURORA_SECBOOT_AURA_DIR`,
+  else `/usr/share/aura`). The default image is `D/stage1/aura-secure-raw.bin`; a `dev`-flavour image is
+  refused unless `--allow-dev-flavour`. Next to it go a rollback object (`--rollback`, copied next to it;
+  else for enforce the earlier audit object; else a stock Stage 1 for the same install made from
+  `D/stage1/aura-raw.bin`), `enroll-stage1.sh` and `ENROLL-<mode>.txt` with the MD5s and the 1TR commands.
+  Default output `ESP/aurora/stage1/`; a JSON record goes to `/var/lib/aurora/secboot/stage1/`. Refused:
+  `KEY_OWNER=aurora`, no `stage2.pub`, no Apple chip in the device tree, the Stage 2 file missing on the ESP,
+  a signature security version below the floor, too little space. `--enforce` is also refused unless this
+  boot's record shows the Stage 1 next-stage entry `audit` (or `enforce`) and `verified` with this key, the
+  ESP Stage 2 (and a staged `.next`) verifies with this key at or above the floor, no `aura-try` trial is
+  armed, Stage 2 signing is on, and the updater signs (`/usr/share/aurora/stage2-sign-hook` or
+  `/etc/aurora/stage2-sign-hook`) or `--sign-stage2-by-hand` is given.
+- `stage2 sign [--path P]`: sign the Stage 2 Stage 1 loads (and a staged `.next`) with `stage2.key`, through
+  aura's `secboot_sign.py sign-image`; an existing trailer is replaced. Refused when Stage 2 signing is off.
+- `stage2 verify [--path P]`: each file's verdict against `stage2.pub`; exit 1 unless all verify.
+- `stage2 hook IN OUT`: for updaters (update-m1n1's `bootchain.py`): write `IN` to `OUT`, signed when Stage 2
+  signing is on, unchanged otherwise (also when the configuration is absent, or when the Stage 2's aura is
+  older than 1.0.0b11 and cannot skip a trailer, unless `STAGE2_SIGN=yes`). Signing is deterministic, so the
+  same input gives the same output. Exit 1 fails the update and the updater keeps the last Stage 2.
+
+`status` also prints what this boot's Stage 1 recorded about Stage 2 and the verdict of the Stage 2 on the ESP.
+
 Command line tokens the secure path removes (names compare with `-` and `_` alike):
 `systemd.debug_shell*`, `rd.systemd.debug_shell*`, `init=`, `rdinit=`, `rd.break*`, `rd.shell*`, `systemd.unit=`,
 `rd.systemd.unit=`, `lockdown=`, `module.sig_enforce=`, `efi=`, `panic=`, `systemd.watchdog_sec=`, and the bare words
@@ -109,5 +139,6 @@ failed build only fails the hook while the secure path is on, so the default pat
 ## Tests
 
 `python3 -m unittest discover -s tests` runs `tests/test_secboot.py` with fake `ukify`, `sbsign`, `sbverify` and `openssl` on
-`PATH`. Where the real tools exist (a Fedora container or VM), `tests/secboot-roundtrip` makes keys, builds and signs a real
+`PATH`. The Stage 1 and Stage 2 tests use aura's real tools from an aura checkout (`../aura`, or `AURORA_TEST_AURA`) and are
+skipped without one. Where the real tools exist (a Fedora container or VM), `tests/secboot-roundtrip` makes keys, builds and signs a real
 UKI from the installed kernel, verifies it with `sbverify` and checks that a UKI signed with another key fails.

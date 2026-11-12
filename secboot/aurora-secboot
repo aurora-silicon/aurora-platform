@@ -31,12 +31,15 @@ DEFAULTS = {
     'KEY_DIR': '/var/lib/aurora/secboot/keys',
     'ESP': '',
     'UKI_BUILD': 'auto',
+    'STAGE2_SIGN': 'auto',
+    'STAGE2_SECVER': '1',
 }
 CHOICES = {
     'KEY_OWNER': ('aurora', 'owner', 'both'),
     'SECURE_PATH': ('no', 'yes'),
     'LOCKDOWN': ('integrity', 'confidentiality'),
     'UKI_BUILD': ('auto', 'yes', 'no'),
+    'STAGE2_SIGN': ('auto', 'yes', 'no'),
 }
 STUB = '/usr/lib/systemd/boot/efi/linuxaa64.efi.stub'
 DT_ESP = ('/proc/device-tree/chosen/asahi,efi-system-partition',
@@ -902,6 +905,565 @@ def cmd_seed(sysobj, cfg, args):
     return 0
 
 
+# --- Stage 1 and Stage 2 (aura) ---------------------------------------------------------------
+#
+# The formats belong to aura; this calls aura's own tools from the aura package (tools/ next to
+# stage1/ in AURA_DIR) rather than carrying a second copy of them.
+
+AURA_DIR = '/usr/share/aura'
+DT_ROOTS = ('/proc/device-tree', '/sys/firmware/devicetree/base')
+S1_CFG_MAGIC = b'AURORA-S1-CFG01\0'
+S1_KEY_MAGIC = b'AURORA-S1-KEY01\0'
+S1_FLAVOUR = b'chosen.aurora,stage1-flavour='
+AURA_LOAD = (0x808, b'AURALOAD')
+TRAILER = b'AURSIGT1'
+SIG_TAG = b'aura_sig'
+STAGE2_STANDARD = 'm1n1/boot.bin'
+STAGE2_CONFINED = 'm1n1/boot-ctxr.bin'
+STAGE1_DIR = 'aurora/stage1'
+STAGE1_STATE = '/var/lib/aurora/secboot/stage1'
+SECVER_MAX = 0xffffffff
+# An updater that hands each Stage 2 it writes to "aurora-secboot stage2 hook" installs one of these.
+STAGE2_HOOK_MARKERS = ('/usr/share/aurora/stage2-sign-hook', '/etc/aurora/stage2-sign-hook')
+
+
+def aura_dir(sysobj, args):
+    """--aura-dir (already under --root), else $AURORA_SECBOOT_AURA_DIR, else /usr/share/aura."""
+    given = getattr(args, 'aura_dir', None)
+    return given if given else sysobj.path(os.environ.get('AURORA_SECBOOT_AURA_DIR') or AURA_DIR)
+
+
+def aura_tool(sysobj, args, name):
+    tools = os.path.join(aura_dir(sysobj, args), 'tools')
+    p = os.path.join(tools, name)
+    if not os.path.exists(p) and os.path.exists(os.path.join(tools, 'recovery', name)):
+        p = os.path.join(tools, 'recovery', name)  # an aura checkout
+    if not os.path.exists(p):
+        raise Refusal(f'{p} is missing: install the aura package that ships its tools, or pass --aura-dir '
+                      'with an aura checkout (its tools/ directory).')
+    return p
+
+
+def aura_py(sysobj, args, name, *argv):
+    return run([sys.executable, aura_tool(sysobj, args, name), *argv])
+
+
+def dt_read(sysobj, rel):
+    for root in DT_ROOTS:
+        raw = sysobj.read(root + rel, binary=True)
+        if raw is not None:
+            return raw
+    return None
+
+
+def dt_str(sysobj, rel):
+    raw = dt_read(sysobj, rel)
+    return raw.rstrip(b'\0').decode(errors='replace') if raw is not None else None
+
+
+def soc(sysobj):
+    """(chip id, board) from the device tree root compatible, e.g. (0x8132, 'j713')."""
+    raw = dt_read(sysobj, '/compatible') or b''
+    chip, board = None, None
+    for c in raw.split(b'\0'):
+        m = re.fullmatch(rb'apple,t([0-9a-f]{4})', c)
+        if m and chip is None:
+            chip = int(m.group(1), 16)
+        m = re.fullmatch(rb'apple,(j[0-9a-z]+)', c)
+        if m and board is None:
+            board = m.group(1).decode()
+    return chip, board
+
+
+def uses_execute_window(chip):
+    """M4-generation and later (T8132, T6040 and up): a padded Stage 1 that loads the confined Stage 2.
+    The same bounds as aurora-installer's AuraStage1Format.usesExecuteWindow."""
+    return 0x8130 <= chip <= 0x8FFF or 0x6040 <= chip <= 0x6FFF
+
+
+def boot_record(sysobj):
+    """The aura boot security record from the device tree: (properties, [measurements])."""
+    for root in DT_ROOTS:
+        node = sysobj.path(root + '/chosen/aurora,boot-security')
+        if os.path.isdir(node):
+            break
+    else:
+        return None, []
+
+    def props(d):
+        out = {}
+        for n in os.listdir(d):
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                with open(p, 'rb') as f:
+                    out[n] = f.read()
+        return out
+
+    def s(v):
+        return v.rstrip(b'\0').decode(errors='replace') if v is not None else None
+
+    top = {k: s(v) for k, v in props(node).items() if k in ('state', 'policy', 'stage', 'stage1-flavour', 'flavour')}
+    entries = []
+    for n in sorted(os.listdir(node)):
+        d = os.path.join(node, n)
+        if not (n.startswith('measurement') and os.path.isdir(d)):
+            continue
+        p = props(d)
+        e = {k: s(p.get(k)) for k in ('stage', 'policy', 'component', 'verdict')}
+        e['key_id'] = p['key-id'].hex() if len(p.get('key-id', b'')) == 8 else None
+        sv = p.get('security-version')
+        e['security_version'] = struct.unpack('>I', sv)[0] if sv and len(sv) == 4 else None
+        e['sha256'] = p['sha256'].hex() if len(p.get('sha256', b'')) == 32 else None
+        entries.append(e)
+    return top, entries
+
+
+def stage1_check(entries):
+    """What this boot's Stage 1 recorded about the Stage 2 it loaded, or None."""
+    for e in entries:
+        if e.get('stage') == 'stage1' and e.get('component') == 'next-stage':
+            return e
+    return None
+
+
+def read_trailer(data):
+    """(covered length, record) of an aura image trailer, or None when the image has none."""
+    if len(data) < 16 or data[-8:] != TRAILER:
+        return None
+    off = struct.unpack('<Q', data[-16:-8])[0]
+    if off >= len(data) - 16 or data[off:off + 8] != SIG_TAG:
+        return None
+    return off, data[off:-16]
+
+
+def trailer_key_id(data):
+    t = read_trailer(data)
+    return t[1][44:52].hex() if t and len(t[1]) >= 52 else None
+
+
+def stage2_key(sysobj, cfg):
+    kd = sysobj.key_dir(cfg)
+    key, pub = os.path.join(kd, 'stage2.key'), os.path.join(kd, 'stage2.pub')
+    seed = open(key, 'rb').read() if os.path.exists(key) else None
+    pubb = open(pub, 'rb').read() if os.path.exists(pub) else None
+    if pubb is not None and len(pubb) != 32:
+        raise Refusal(f'{pub} is not a raw 32-byte Ed25519 public key.')
+    if seed is not None and (len(seed) != 32 or (pubb is not None and ed25519_public(seed) != pubb)):
+        raise Refusal(f'{key} does not match {pub}.')
+    return (key if seed is not None else None), (pub if pubb is not None else None)
+
+
+def stage2_secver(cfg):
+    try:
+        v = int(cfg.get('STAGE2_SECVER', '1'), 0)
+    except ValueError:
+        v = -1
+    if not 0 <= v <= SECVER_MAX:
+        raise Refusal(f'STAGE2_SECVER={cfg.get("STAGE2_SECVER")} is not a number from 0 to {SECVER_MAX}.')
+    return v
+
+
+def stage2_verdict(sysobj, args, path, pub):
+    """(verdict, key id, security version) of an image trailer: verified | unsigned | other-key |
+    bad-signature | bad-format | missing."""
+    if not os.path.exists(path):
+        return 'missing', None, None
+    with open(path, 'rb') as f:
+        data = f.read()
+    t = read_trailer(data)
+    if t is None:
+        return ('bad-format' if data[-8:] == TRAILER else 'unsigned'), None, None
+    rec = t[1]
+    kid = rec[44:52].hex() if len(rec) >= 52 else None
+    secver = struct.unpack_from('<I', rec, 28)[0] if len(rec) >= 32 else None
+    if pub is None or kid != stage2_key_id(open(pub, 'rb').read()):
+        return 'other-key', kid, secver
+    r = subprocess.run([sys.executable, aura_tool(sysobj, args, 'secboot_sign.py'), 'verify', '--pub', pub, path],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    words = (r.stdout or '').split()
+    v = words[2] if len(words) > 2 and words[0] == 'image' else ('verified' if r.returncode == 0 else 'bad-signature')
+    return v, kid, secver
+
+
+def payload_region(data):
+    """What follows an aura image: its payloads and appended config lines. The image runs to the end
+    of its stack (the STACKBOT quad); the load header's footprint is its size (aura's _payload_start).
+    The image itself holds the chosen.aurora,measure- format string, so only this part is searched.
+    Data that is not an aura image is returned whole."""
+    off = AURA_LOAD[0]
+    if data[off:off + 8] == AURA_LOAD[1] and len(data) >= off + 24:
+        footprint = struct.unpack_from('<Q', data, off + 16)[0]
+        if off + 24 <= footprint <= len(data) and data[footprint - 8:footprint] == b'STACKBOT':
+            return data[footprint:]
+    return data
+
+
+def aura_signer(sysobj, args):
+    """aura's tools/secboot_sign.py as a module: the record format and Ed25519 signing stay aura's."""
+    import importlib.util
+    path = aura_tool(sysobj, args, 'secboot_sign.py')
+    spec = importlib.util.spec_from_file_location('aura_secboot_sign', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not all(hasattr(mod, n) for n in ('make_record', 'FOOTER', 'pubkey')):
+        raise Refusal(f'{path} has no make_record: it is not aura\'s secboot_sign.py.')
+    return mod
+
+
+def sign_stage2_bytes(sysobj, cfg, args, data, key, secver):
+    """data with its aura image trailer replaced by one from key (aura's sign-image format)."""
+    t = read_trailer(data)
+    if t is not None:
+        data = data[:t[0]]
+    # Checked here rather than by sign-image, whose check before aura#197 also matched the format
+    # string in aura's own code and refused every Stage 2.
+    if b'chosen.aurora,measure-' in payload_region(data):
+        raise Refusal('this Stage 2 carries chosen.aurora,measure- lines, which only a loading stage may add.')
+    mod = aura_signer(sysobj, args)
+    with open(key, 'rb') as f:
+        seed = f.read()
+    if len(seed) != 32:
+        raise Refusal(f'{key} is not a raw 32-byte Ed25519 seed.')
+    rec, _ = mod.make_record(seed, data, secver)
+    out = data + rec + struct.pack('<Q', len(data)) + mod.FOOTER
+    t = read_trailer(out)
+    if t is None or t[0] != len(data):
+        raise Refusal('aura\'s secboot_sign.py did not make one image trailer.')
+    return out
+
+
+def stage2_signing(sysobj, cfg):
+    """(key path, why) when Stage 2 updates should be signed, else (None, why)."""
+    mode = cfg.get('STAGE2_SIGN', 'auto')
+    key, _ = stage2_key(sysobj, cfg)
+    if mode == 'no':
+        return None, 'STAGE2_SIGN=no'
+    if key is None:
+        if mode == 'yes':
+            raise Refusal(f'STAGE2_SIGN=yes but there is no {os.path.join(sysobj.key_dir(cfg), "stage2.key")}.')
+        return None, 'no Stage 2 key on this machine'
+    if cfg['KEY_OWNER'] == 'aurora':
+        if mode == 'yes':
+            raise Refusal('STAGE2_SIGN=yes needs KEY_OWNER=owner or both.')
+        return None, 'KEY_OWNER=aurora'
+    return key, f'STAGE2_SIGN={mode}'
+
+
+def stage2_target(sysobj, cfg, args):
+    path = getattr(args, 'path', None)
+    if path:
+        return path
+    chip, _ = soc(sysobj)
+    if chip is None:
+        raise Refusal('the device tree names no Apple chip; pass --path.')
+    return os.path.join(sysobj.esp(cfg), STAGE2_CONFINED if uses_execute_window(chip) else STAGE2_STANDARD)
+
+
+def cmd_stage2_sign(sysobj, cfg, args):
+    key, why = stage2_signing(sysobj, cfg)
+    if key is None:
+        raise Refusal(f'Stage 2 signing is off ({why}).')
+    secver = stage2_secver(cfg)
+    target = stage2_target(sysobj, cfg, args)
+    paths = [target] + [p for p in (target + '.next',) if os.path.exists(p) and not args.path]
+    for p in paths:
+        if not os.path.exists(p):
+            raise Refusal(f'{p} does not exist.')
+        with open(p, 'rb') as f:
+            data = f.read()
+        if TRAILER not in data[:-16] and b'aurora,boot-security-v1' not in data:
+            warn(f'{p} looks older than aura 1.0.0b11: it neither skips a trailer nor writes the boot record')
+        out = sign_stage2_bytes(sysobj, cfg, args, data, key, secver)
+        if out == data:
+            print(f'{p}: already signed with this key (key id {trailer_key_id(out)}, secver {secver})')
+            continue
+        atomic_write(p, out, 0o644)
+        print(f'{p}: signed, key id {trailer_key_id(out)}, secver {secver}, sha256 {hashlib.sha256(out).hexdigest()}')
+    return 0
+
+
+def cmd_stage2_verify(sysobj, cfg, args):
+    _, pub = stage2_key(sysobj, cfg)
+    target = stage2_target(sysobj, cfg, args)
+    bad = 0
+    for p in [target] + [x for x in (target + '.next',) if os.path.exists(x) and not args.path]:
+        v, kid, secver = stage2_verdict(sysobj, args, p, pub)
+        print(f'{p}: {v}' + (f', key id {kid}, secver {secver}' if kid else ''))
+        bad |= v != 'verified'
+    return 1 if bad else 0
+
+
+def cmd_stage2_hook(sysobj, cfg, args):
+    """update-m1n1 (bootchain.py) hands over each Stage 2 it composed: write it signed when Stage 2
+    signing is on, unchanged otherwise. A refusal fails the update, so the last Stage 2 stays."""
+    with open(args.input, 'rb') as f:
+        data = f.read()
+    key, why = (None, 'no configuration') if not cfg['_present'] else stage2_signing(sysobj, cfg)
+    if key is not None and TRAILER not in data:
+        # A Stage 2 older than aura#133 reads a trailer as an unknown payload when no
+        # verifying Stage 1 cut it off first.
+        if cfg.get('STAGE2_SIGN') == 'yes':
+            raise Refusal('this Stage 2\'s aura does not know image trailers (older than aura 1.0.0b11).')
+        key, why = None, 'this Stage 2\'s aura is older than aura 1.0.0b11'
+    out = data if key is None else sign_stage2_bytes(sysobj, cfg, args, data, key, stage2_secver(cfg))
+    atomic_write(args.output, out, 0o644)
+    if key is None:
+        print(f'aurora-secboot: Stage 2 left unsigned ({why})')
+    else:
+        print(f'aurora-secboot: Stage 2 signed, key id {trailer_key_id(out)}, secver {stage2_secver(cfg)}')
+    return 0
+
+
+def image_flavour(raw):
+    for f in (b'secure', b'dev'):
+        if S1_FLAVOUR + f + b'\0' in raw:
+            return f.decode()
+    return None
+
+
+def check_stage1_image(path, need_keys=True):
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except OSError:
+        raise Refusal(f'{path} is missing; pass --stage1-image with an aura Stage 1 built with SECBOOT=audit '
+                      'SECBOOT_FLAVOUR=secure (build/aura.bin).')
+    off, magic = AURA_LOAD
+    if raw[:4] == struct.pack('<I', 0xFEEDFACF):
+        raise Refusal(f'{path} is a Mach-O object; pass the raw image (build/aura.bin).')
+    if raw[off:off + 8] != magic:
+        raise Refusal(f'{path} is not a raw aura image.')
+    if raw.count(S1_CFG_MAGIC) != 1:
+        raise Refusal(f'{path} has no Stage 1 configuration block: it is a Stage 2 build (ESP_STAGE2=1).')
+    if need_keys and raw.count(S1_KEY_MAGIC) != 1:
+        raise Refusal(f'{path} has no AURORA-S1-KEY01 block: build it with SECBOOT=audit.')
+    return raw
+
+
+def free_bytes(path):
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def md5_file(path):
+    h = hashlib.md5(usedforsecurity=False)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def make_object(sysobj, args, raw_path, out, esp_uuid, stage2_path, padded, keys=None, floor=1, enforce=False):
+    """fill_stage1_config.py, then (for a SECBOOT image) fill-keys, macho_boot_object.py and the
+    execute-window padding, all aura's own tools."""
+    work = tempfile.mkdtemp(prefix='.stage1-', dir=os.path.dirname(out))
+    try:
+        cfgd = os.path.join(work, 'cfg.bin')
+        aura_py(sysobj, args, 'fill_stage1_config.py', '--input', raw_path, '--output', cfgd,
+                '--esp-partuuid', esp_uuid, '--stage2-path', stage2_path)
+        filled = cfgd
+        if keys:
+            filled = os.path.join(work, 'keys.bin')
+            argv = ['fill-keys']
+            for k in keys:
+                argv += ['--pub', k]
+            argv += ['--min-secver', str(floor)] + (['--enforce'] if enforce else []) + [cfgd, filled]
+            aura_py(sysobj, args, 'secboot_sign.py', *argv)
+        tmp = os.path.join(work, 'object.macho')
+        aura_py(sysobj, args, 'macho_boot_object.py', *(['--execute-window'] if padded else []), filled, tmp)
+        os.replace(tmp, out)
+        fsync_dir(os.path.dirname(out))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def cmd_stage1_build(sysobj, cfg, args):
+    mode = 'enforce' if args.enforce else 'audit'
+    if cfg['KEY_OWNER'] == 'aurora':
+        raise Refusal('KEY_OWNER=aurora: there is no Aurora release key yet, so a Stage 1 can only trust an owner '
+                      'key; set KEY_OWNER=owner and run "aurora-secboot keys create" first.')
+    key, pub = stage2_key(sysobj, cfg)
+    if pub is None:
+        raise Refusal(f'there is no {os.path.join(sysobj.key_dir(cfg), "stage2.pub")}; run '
+                      '"aurora-secboot keys create" first.')
+    kid = stage2_key_id(open(pub, 'rb').read())
+    floor = args.min_secver
+    if not 0 <= floor <= SECVER_MAX:
+        raise Refusal(f'--min-secver must be from 0 to {SECVER_MAX}.')
+
+    chip, board = soc(sysobj)
+    if chip is None:
+        raise Refusal('the device tree names no Apple chip (apple,tNNNN), so the Stage 1 form is unknown.')
+    padded = uses_execute_window(chip)
+    stage2_rel = STAGE2_CONFINED if padded else STAGE2_STANDARD
+    esp_uuid = (dt_str(sysobj, '/chosen/asahi,efi-system-partition') or '').strip().lower()
+    if args.esp_partuuid:
+        if esp_uuid and args.esp_partuuid.lower() != esp_uuid:
+            raise Refusal(f'--esp-partuuid {args.esp_partuuid} is not the ESP this boot came from ({esp_uuid}).')
+        esp_uuid = args.esp_partuuid.lower()
+    if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', esp_uuid):
+        raise Refusal('this boot\'s Stage 1 named no ESP (/chosen/asahi,efi-system-partition); pass --esp-partuuid.')
+    esp = sysobj.esp(cfg)
+    if not cfg['ESP'] and sysobj.dt_esp_mount() is None:
+        raise Refusal(f'the ESP {esp_uuid} is not mounted; mount it (e.g. at /boot/efi) and run this again.')
+    stage2 = os.path.join(esp, stage2_rel)
+    if not os.path.exists(stage2):
+        if padded:
+            raise Refusal(f'{stage2} does not exist: this M4-or-later Mac needs the confined Stage 2 that update-m1n1 '
+                          'writes with a monitor-free aura, and a padded Stage 1 would load nothing.')
+        raise Refusal(f'{stage2} does not exist, so the new Stage 1 would load nothing.')
+
+    if padded:
+        with open(aura_tool(sysobj, args, 'macho_boot_object.py'), 'rb') as f:
+            if b'--execute-window' not in f.read():
+                raise Refusal('this aura\'s macho_boot_object.py cannot pad for the execute window (it predates '
+                              'aura#195); pass --aura-dir with a newer aura checkout.')
+    image = args.stage1_image or os.path.join(aura_dir(sysobj, args), 'stage1', 'aura-secure-raw.bin')
+    raw = check_stage1_image(image)
+    flavour = image_flavour(raw)
+    if flavour != 'secure' and not args.allow_dev_flavour:
+        raise Refusal(f'{image} is a {flavour or "unknown"}-flavour Stage 1: it gives a USB host the aura proxy after '
+                      'a failed boot. Build it with SECBOOT_FLAVOUR=secure, or pass --allow-dev-flavour on a lab Mac.')
+
+    secver = stage2_secver(cfg)
+    signing, why = stage2_signing(sysobj, cfg)
+    notes = []
+    if signing is not None and secver < floor:
+        raise Refusal(f'STAGE2_SECVER={secver} is below the Stage 1 floor {floor}: every signed Stage 2 would be '
+                      'refused as a rollback.')
+    if mode == 'enforce':
+        if signing is None:
+            raise Refusal(f'Stage 2 signing is off ({why}), so the next Stage 2 update would be unsigned and an '
+                          'enforcing Stage 1 would refuse it.')
+        if not any(os.path.exists(sysobj.path(m)) for m in STAGE2_HOOK_MARKERS) and not args.sign_stage2_by_hand:
+            raise Refusal('this system\'s Stage 2 updater does not sign what it writes (no '
+                          f'{STAGE2_HOOK_MARKERS[0]}), so the next aura or kernel update would leave a Stage 2 the '
+                          'enforcing Stage 1 refuses. Update the updater package, or pass --sign-stage2-by-hand and run '
+                          '"aurora-secboot stage2 sign" after every update, before rebooting.')
+        v, skid, ssv = stage2_verdict(sysobj, args, stage2, pub)
+        if v != 'verified':
+            raise Refusal(f'{stage2} is {v}, not signed with key {kid}: run "aurora-secboot stage2 sign", reboot '
+                          'with the audit Stage 1 and check its record first.')
+        if ssv is None or ssv < floor:
+            raise Refusal(f'{stage2} carries security version {ssv}, below the floor {floor}.')
+        marker = os.path.join(esp, 'aura-try')
+        if os.path.exists(marker) and open(marker, 'rb').read().startswith(b'armed'):
+            raise Refusal('an aura-try Stage 2 trial is armed; let it finish (reboot) before enforcing.')
+        nxt = stage2 + '.next'
+        if os.path.exists(nxt) and stage2_verdict(sysobj, args, nxt, pub)[0] != 'verified':
+            raise Refusal(f'{nxt} is not signed with key {kid}; run "aurora-secboot stage2 sign".')
+        top, entries = boot_record(sysobj)
+        s1 = stage1_check(entries)
+        if not s1 or s1.get('policy') not in ('audit', 'enforce'):
+            raise Refusal('this boot did not come from a Stage 1 that checks Stage 2 (no stage1 next-stage entry with '
+                          'policy audit in the boot record): enrol the audit Stage 1 and boot it first.')
+        if s1.get('verdict') != 'verified' or s1.get('key_id') != kid:
+            raise Refusal(f'this boot\'s Stage 1 recorded Stage 2 as {s1.get("verdict")} (key id {s1.get("key_id")}), '
+                          f'not verified with key {kid}: sign Stage 2, reboot and check again before enforcing.')
+    elif signing is None:
+        notes.append(f'Stage 2 signing is off ({why}); the audit Stage 1 will record Stage 2 as unsigned.')
+
+    out_dir = args.output_dir or os.path.join(esp, STAGE1_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+    new = os.path.join(out_dir, f'stage1-{mode}.macho')
+    # Rollback: what the owner names, else (enforce) the audit object built before, else a stock
+    # Stage 1 for this install made from the aura package's own Stage 1 image.
+    rollback, stock_raw = [], None
+    audit = os.path.join(out_dir, 'stage1-audit.macho')
+    if args.rollback:
+        # Recovery reads them from the same folder as the new object.
+        for r in args.rollback:
+            if not os.path.isfile(r):
+                raise Refusal(f'{r} does not exist.')
+            dst = os.path.join(out_dir, os.path.basename(r))
+            if dst == new:
+                raise Refusal(f'{r} has the new object\'s name; rename it.')
+            if os.path.abspath(r) != os.path.abspath(dst):
+                shutil.copyfile(r, dst)
+            rollback.append(dst)
+    elif mode == 'enforce' and os.path.exists(audit):
+        rollback.append(audit)
+    else:
+        stock_raw = args.stock_image or os.path.join(aura_dir(sysobj, args), 'stage1', 'aura-raw.bin')
+        if not os.path.exists(stock_raw):
+            raise Refusal(f'{stock_raw} is missing, so there is no stock Stage 1 to go back to; pass --rollback with '
+                          'the Stage 1 object enrolled now, or --stock-image with a stock aura Stage 1 raw image.')
+        check_stage1_image(stock_raw, need_keys=False)
+        rollback.append(os.path.join(out_dir, 'stage1-stock.macho'))
+
+    size = (16 << 20) + (2 << 20) + (128 << 20) + (4 << 20) if padded else 4 << 20
+    need = size * (2 if stock_raw else 1)
+    free = free_bytes(out_dir)
+    for p in [new] + ([rollback[0]] if stock_raw else []):
+        if os.path.exists(p):
+            free = None if free is None else free + os.path.getsize(p)
+    if free is not None and free < need:
+        raise Refusal(f'{out_dir} has {free >> 20} MiB free and the objects need about {need >> 20} MiB (a FAT volume '
+                      'holds the padding in full); pass --output-dir on a larger FAT volume, such as a USB stick.')
+
+    make_object(sysobj, args, image, new, esp_uuid, stage2_rel, padded, keys=[pub], floor=floor,
+                enforce=mode == 'enforce')
+    if stock_raw:
+        make_object(sysobj, args, stock_raw, rollback[0], esp_uuid, stage2_rel, padded)
+    script = os.path.join(out_dir, 'enroll-stage1.sh')
+    shutil.copyfile(aura_tool(sysobj, args, 'enroll-stage1.sh'), script)
+
+    sums = {os.path.basename(p): md5_file(p) for p in [new] + rollback}
+    volume = args.volume or '<VOLUME>'
+    keep = ' '.join(f'--keep {os.path.basename(r)} {sums[os.path.basename(r)]}' for r in rollback)
+    flags = '--compress ' if padded else ''
+    cmd = f'bash enroll-stage1.sh {flags}{keep} {volume} {os.path.basename(new)} {sums[os.path.basename(new)]}'
+    manifest = {
+        'mode': mode, 'flavour': flavour, 'chip': f't{chip:04x}', 'board': board, 'padded': padded,
+        'esp_partuuid': esp_uuid, 'stage2_path': stage2_rel, 'key_id': kid, 'min_secver': floor,
+        'stage1_image': image, 'stage1_image_sha256': hashlib.sha256(raw).hexdigest(),
+        'object': new, 'object_md5': sums[os.path.basename(new)], 'object_sha256': sha256_file(new),
+        'rollback': [{'path': r, 'md5': sums[os.path.basename(r)]} for r in rollback],
+        'enroll': cmd, 'made': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+    }
+    state = sysobj.path(STAGE1_STATE)
+    os.makedirs(state, mode=0o700, exist_ok=True)
+    atomic_write(os.path.join(state, f'{time.strftime("%Y%m%d-%H%M%S")}-{mode}.json'),
+                 (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode(), 0o600)
+    lines = [
+        f'Aurora Stage 1 ({mode}, {flavour} flavour) for this install: ESP {esp_uuid}, Stage 2 {stage2_rel}, '
+        f'chip t{chip:04x}{", padded for the execute window" if padded else ""}.',
+        f'It trusts Stage 2 key {kid}, floor {floor}' +
+        ('; it REFUSES any Stage 2 that is not signed with that key.' if mode == 'enforce'
+         else '; it records whether Stage 2 is signed and boots it either way.'),
+        '',
+        'MD5 (write these down from the Linux terminal, not from this file):',
+        *[f'  {v}  {k}' for k, v in sums.items()],
+        '',
+        'In 1TR (hold the power button, Options, Utilities > Terminal):',
+        '  diskutil list                 # find this ESP (or the USB stick) and the Linux system volume',
+        '  diskutil mount diskXsY',
+        f'  cd /Volumes/<ESP>/{STAGE1_DIR}' if not args.output_dir else f'  cd <the volume>/{os.path.basename(out_dir)}',
+        f'  {cmd.replace("enroll-stage1.sh", "enroll-stage1.sh --check", 1)}',
+        f'  {cmd}',
+        '',
+        'To go back: the same command with the rollback object and its MD5 in place of the new one.',
+    ]
+    atomic_write(os.path.join(out_dir, f'ENROLL-{mode}.txt'), ('\n'.join(lines) + '\n').encode(), 0o644)
+    for n in notes:
+        warn(n)
+    print('\n'.join(lines))
+    print(f'\nObjects in {out_dir}; manifest in {state}.')
+    if volume == '<VOLUME>':
+        print('Replace <VOLUME> with the Linux system volume\'s name as diskutil list shows it (or pass --volume).')
+    return 0
+
+
 # --- status ---------------------------------------------------------------------------------
 
 def efivar(sysobj, name):
@@ -954,6 +1516,23 @@ def collect_status(sysobj, cfg):
         st['boot_loader'] = {'path': loader, 'kind': 'uki' if is_uki(loader) else 'loader',
                              'verdict': verdict(loader, cert),
                              'saved_loader': os.path.exists(os.path.join(esp, SAVED_LOADER))}
+    top, entries = boot_record(sysobj)
+    s1 = stage1_check(entries)
+    st['stage1'] = None if s1 is None else {k: s1.get(k) for k in ('policy', 'verdict', 'key_id', 'security_version')}
+    if st['stage1'] is not None:
+        st['stage1']['flavour'] = (top or {}).get('stage1-flavour')
+    st['stage2'] = None
+    try:
+        target = stage2_target(sysobj, cfg, argparse.Namespace(path=None))
+        _, pub = stage2_key(sysobj, cfg)
+        v, kid, secver = stage2_verdict(sysobj, argparse.Namespace(aura_dir=None), target, pub)
+        st['stage2'] = {'path': target, 'verdict': v, 'key_id': kid, 'security_version': secver}
+    except Refusal:
+        pass
+    try:
+        st['stage2_signing'] = stage2_signing(sysobj, cfg)[1]
+    except Refusal as e:
+        st['stage2_signing'] = str(e)
     st['first_gap'] = first_gap(st)
     return st
 
@@ -997,6 +1576,15 @@ def cmd_status(sysobj, cfg, args):
     print('UEFI: ' + ', '.join(f'{k}={"absent" if v is None else v}' for k, v in efi.items()))
     print(f'lockdown: {st["lockdown"] or "unknown"}')
     print(f'ESP: {st["esp"]}')
+    s1 = st.get('stage1')
+    print('Stage 1: ' + ('records no Stage 2 check (it predates key checks)' if not s1 else
+                         f'policy {s1["policy"]}, {s1["flavour"] or "unknown"} flavour, Stage 2 {s1["verdict"]}' +
+                         (f' (key id {s1["key_id"]}, secver {s1["security_version"]})' if s1['key_id'] else '')))
+    s2 = st.get('stage2')
+    if s2:
+        print(f'Stage 2 {s2["path"]}: {s2["verdict"]}' +
+              (f' (key id {s2["key_id"]}, secver {s2["security_version"]})' if s2['key_id'] else '') +
+              f'; updates: {st["stage2_signing"]}')
     bl = st['boot_loader']
     print('BOOTAA64.EFI: ' + ('absent' if not bl else f'{bl["kind"]}, {bl["verdict"]}' +
                                (', previous loader saved' if bl['saved_loader'] else '')))
@@ -1099,6 +1687,40 @@ def parser():
     s = sub.add_parser('seed', help='build the U-Boot PK/KEK/db/dbx variable seed')
     s.add_argument('-o', '--output', required=True)
     s.set_defaults(func=cmd_seed)
+    s1 = sub.add_parser('stage1', help='an owner-key Stage 1 for this install').add_subparsers(dest='stage1_cmd',
+                                                                                              required=True)
+    s = s1.add_parser('build', help='build a ready-to-enrol Stage 1 object, its rollback and the 1TR command')
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument('--audit', action='store_true', help='check and record Stage 2 signatures, boot either way')
+    g.add_argument('--enforce', action='store_true', help='refuse a Stage 2 not signed with the owner key')
+    s.add_argument('--stage1-image', metavar='PATH', help='raw aura Stage 1 built with SECBOOT=audit '
+                   'SECBOOT_FLAVOUR=secure (default AURA_DIR/stage1/aura-secure-raw.bin)')
+    s.add_argument('--stock-image', metavar='PATH', help='raw stock aura Stage 1 for the rollback object '
+                   '(default AURA_DIR/stage1/aura-raw.bin)')
+    s.add_argument('--rollback', metavar='PATH', action='append', help='a Stage 1 object to go back to (repeatable)')
+    s.add_argument('--aura-dir', metavar='DIR', help=f'aura package directory with tools/ and stage1/ '
+                   f'(default $AURORA_SECBOOT_AURA_DIR, else {AURA_DIR}); an aura checkout works')
+    s.add_argument('--output-dir', metavar='DIR', help=f'where the objects go (default ESP/{STAGE1_DIR})')
+    s.add_argument('--min-secver', type=int, default=1, help='rollback floor in the key block (default 1)')
+    s.add_argument('--esp-partuuid', metavar='UUID', help='the ESP, when this boot\'s Stage 1 named none')
+    s.add_argument('--volume', metavar='NAME', help='the Linux system volume name, for the printed 1TR command')
+    s.add_argument('--allow-dev-flavour', action='store_true', help='accept a dev-flavour Stage 1 (lab Macs)')
+    s.add_argument('--sign-stage2-by-hand', action='store_true',
+                   help='enforce although the Stage 2 updater does not sign (run "stage2 sign" after every update)')
+    s.set_defaults(func=cmd_stage1_build)
+    s2 = sub.add_parser('stage2', help='sign and check Stage 2 for an owner-key Stage 1').add_subparsers(
+        dest='stage2_cmd', required=True)
+    for name, func, text in (('sign', cmd_stage2_sign, 'sign the ESP Stage 2 (and an armed trial) with stage2.key'),
+                             ('verify', cmd_stage2_verify, 'check the ESP Stage 2 against stage2.pub')):
+        s = s2.add_parser(name, help=text)
+        s.add_argument('--path', metavar='PATH', help='this Stage 2 file instead of the one Stage 1 loads')
+        s.add_argument('--aura-dir', metavar='DIR')
+        s.set_defaults(func=func)
+    s = s2.add_parser('hook', help='used by update-m1n1: write INPUT to OUTPUT, signed when Stage 2 signing is on')
+    s.add_argument('input')
+    s.add_argument('output')
+    s.add_argument('--aura-dir', metavar='DIR')
+    s.set_defaults(func=cmd_stage2_hook)
     s = sub.add_parser('hook', help='used by the kernel-install and mkinitcpio hooks')
     s.add_argument('event', choices=('add', 'remove'))
     s.add_argument('kver')
@@ -1125,10 +1747,11 @@ def main(argv=None):
     try:
         cfg = sysobj.config()
         # --root prefixes the paths given on the command line too.
-        for attr in ('image', 'cmdline_file', 'output', 'source', 'entry_dir', 'stub', 'uki', 'os_release'):
+        for attr in ('image', 'cmdline_file', 'output', 'source', 'entry_dir', 'stub', 'uki', 'os_release',
+                     'stage1_image', 'stock_image', 'aura_dir', 'output_dir', 'path', 'input'):
             if getattr(args, attr, None):
                 setattr(args, attr, sysobj.arg_path(getattr(args, attr)))
-        for attr in ('initrd', 'paths'):
+        for attr in ('initrd', 'paths', 'rollback'):
             if getattr(args, attr, None):
                 setattr(args, attr, [sysobj.arg_path(p) for p in getattr(args, attr)])
         return args.func(sysobj, cfg, args)
