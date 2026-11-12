@@ -522,6 +522,159 @@ class SecurePathTests(TempCase):
         self.assertIn('first gap: UEFI Secure Boot', fx.run('status').stdout)
 
 
+class ImageBuilderTests(TempCase):
+    """The options an image builder (the NixOS module) passes."""
+
+    def nixos(self):
+        fx = self.fixture(conf=False)
+        conf = fx.root / 'nix/store/x-secboot.conf'
+        conf.parent.mkdir(parents=True)
+        conf.write_text('KEY_OWNER=owner\nSECURE_PATH=yes\nKEY_DIR=/var/lib/aurora/secboot/keys\nESP=/boot\n')
+        (fx.root / 'etc/aurora').mkdir(parents=True)
+        os.symlink(conf, fx.root / 'etc/aurora/secboot.conf')
+        gen = fx.root / 'nix/var/system-42'
+        gen.mkdir(parents=True)
+        (gen / 'kernel').write_bytes(b'kernel')
+        (gen / 'kernel-params').write_text('init=/old root=fstab systemd.debug_shell loglevel=4\n')
+        (fx.root / 'boot/EFI/BOOT').mkdir(parents=True)
+        (fx.root / 'boot/EFI/BOOT/BOOTAA64.EFI').write_bytes(fake_pe(['.text']) + b'systemd-boot')
+        (fx.root / 'tmp').mkdir()
+        (fx.root / 'tmp/initrd').write_bytes(b'initrd')
+        return fx, '/etc/aurora/secboot.conf', '/nix/var/system-42'
+
+    def build(self, fx, conf, gen, *extra):
+        return fx.run('--config', conf, 'uki', 'build', '7.2.10', '--image', f'{gen}/kernel', '--initrd', '/tmp/initrd',
+                      '--cmdline-file', f'{gen}/kernel-params', '--init', f'{gen}/init',
+                      '--output', '/boot/EFI/Linux/aurora-nixos-abc.efi', *extra)
+
+    def test_config_option_replaces_the_default_file(self):
+        fx = self.fixture(conf=False)
+        (fx.root / 'srv').mkdir()
+        (fx.root / 'srv/sb.conf').write_text('LOCKDOWN=confidentiality\n')
+        self.assertTrue(fx.run('cmdline').stdout.strip().endswith('lockdown=integrity'))
+        r = fx.run('--config', '/srv/sb.conf', 'cmdline')
+        self.assertTrue(r.stdout.strip().endswith('lockdown=confidentiality'), r.stdout)
+        (fx.root / 'srv/sb.conf').write_text('LOCKDOWN=none\n')
+        r = fx.run('--config', '/srv/sb.conf', 'cmdline')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('/srv/sb.conf', r.stderr)
+
+    def test_init_is_added_after_the_filter(self):
+        fx, conf, gen = self.nixos()
+        fx.run('--config', conf, 'keys', 'create')
+        r = self.build(fx, conf, gen)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = fx.calls('ukify')[0]
+        self.assertEqual(args[args.index('--cmdline') + 1],
+                         f'root=fstab loglevel=4 init={gen}/init lockdown=integrity')
+        self.assertIn("removed 'init=/old'", r.stderr)
+        self.assertTrue((fx.root / 'boot/EFI/Linux/aurora-nixos-abc.efi').exists())
+
+    def test_init_must_be_one_absolute_path(self):
+        fx, conf, gen = self.nixos()
+        for bad in ('relative/init', '/nix/a b', '/nix/"x'):
+            r = fx.run('--config', conf, 'uki', 'build', '7.2.10', '--image', f'{gen}/kernel', '--initrd',
+                       '/tmp/initrd', '--init', bad, '--output', '/out.efi')
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn('--init', r.stderr)
+        self.assertEqual(fx.calls('ukify'), [])
+
+    def test_stub_option_and_environment(self):
+        fx, conf, gen = self.nixos()
+        (fx.root / 'usr/lib/systemd/boot/efi/linuxaa64.efi.stub').unlink()
+        r = self.build(fx, conf, gen)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('stub', r.stderr)
+        (fx.root / 'nix/store/s').mkdir()
+        (fx.root / 'nix/store/s/env.stub').write_bytes(fake_pe(['.text']))
+        (fx.root / 'nix/store/s/opt.stub').write_bytes(fake_pe(['.text']))
+        env = {**fx.env, 'AURORA_SECBOOT_STUB': '/nix/store/s/env.stub'}
+        r = fx.run('--config', conf, 'uki', 'build', '7.2.10', '--image', f'{gen}/kernel', '--initrd', '/tmp/initrd',
+                   '--output', '/a.efi', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = fx.calls('ukify')[-1]
+        self.assertEqual(args[args.index('--stub') + 1], str(fx.root / 'nix/store/s/env.stub'))
+        r = fx.run('--config', conf, 'uki', 'build', '7.2.10', '--image', f'{gen}/kernel', '--initrd', '/tmp/initrd',
+                   '--output', '/b.efi', '--stub', '/nix/store/s/opt.stub', env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = fx.calls('ukify')[-1]
+        self.assertEqual(args[args.index('--stub') + 1], str(fx.root / 'nix/store/s/opt.stub'))
+
+    def test_enable_given_uki_and_read_only_config(self):
+        fx, conf, gen = self.nixos()
+        fx.run('--config', conf, 'keys', 'create')
+        self.build(fx, conf, gen)
+        uki = '/boot/EFI/Linux/aurora-nixos-abc.efi'
+        self.assertEqual(fx.run('--config', conf, 'uki', 'verify', uki).returncode, 0)
+        loader = fx.root / 'boot/EFI/BOOT/BOOTAA64.EFI'
+        saved = fx.root / 'boot' / sb.SAVED_LOADER
+        before = (fx.root / 'nix/store/x-secboot.conf').read_text()
+        cfg = fx.root / 'nix/store/x-secboot.conf'
+        cfg.write_text(before.replace('SECURE_PATH=yes', 'SECURE_PATH=no'))
+        r = fx.run('--config', conf, 'enable', '--uki', uki)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(loader.read_bytes(), (fx.root / uki.lstrip('/')).read_bytes())
+        self.assertTrue(saved.read_bytes().endswith(b'systemd-boot'))
+        self.assertIn('system configuration', r.stdout)
+        self.assertIn('SECURE_PATH=no', cfg.read_text())
+        # A UKI that does not verify is refused.
+        fx.run('--config', conf, 'uki', 'build', '7.2.10', '--image', f'{gen}/kernel', '--initrd', '/tmp/initrd',
+               '--output', '/boot/EFI/Linux/unsigned.efi', '--no-sign')
+        r = fx.run('--config', conf, 'enable', '--uki', '/boot/EFI/Linux/unsigned.efi')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('not a UKI signed', r.stderr)
+        r = fx.run('--config', conf, 'disable')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(loader.read_bytes().endswith(b'systemd-boot'))
+        self.assertFalse(saved.exists())
+
+    def test_adopt_with_read_only_config(self):
+        fx, conf, gen = self.nixos()
+        seed = os.urandom(32)
+        d = fx.root / 'boot/aurora/secboot'
+        d.mkdir(parents=True)
+        (d / 'stage2.key').write_bytes(seed)
+        (d / 'stage2.pub').write_bytes(sb.ed25519_public(seed))
+        (d / 'owner').write_text('KEY_OWNER=both\n')
+        r = fx.run('--config', conf, 'keys', 'adopt')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((fx.keys / 'stage2.key').read_bytes(), seed)
+        self.assertFalse((d / 'stage2.key').exists())
+        self.assertIn('KEY_OWNER=owner', (fx.root / 'nix/store/x-secboot.conf').read_text())
+        self.assertIn('system configuration', r.stderr)
+
+
+class LoaderRefreshTests(TempCase):
+    def ready(self):
+        fx = self.fixture()
+        fx.run('keys', 'create')
+        fx.run('uki', 'build', KVER)
+        return fx, fx.esp / sb.BOOT_LOADER, fx.esp / sb.SAVED_LOADER
+
+    def test_enable_refreshes_the_saved_loader_after_a_loader_update(self):
+        fx, loader, saved = self.ready()
+        fx.run('enable')
+        new_shim = fake_pe(['.text', '.sbat']) + b'shim 16.2'
+        loader.write_bytes(new_shim)
+        r = fx.run('enable')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(saved.read_bytes(), new_shim)
+        self.assertEqual(loader.read_bytes(), fx.uki().read_bytes())
+        self.assertEqual(fx.run('disable').returncode, 0)
+        self.assertEqual(loader.read_bytes(), new_shim)
+
+    def test_disable_keeps_a_fresh_loader_and_drops_the_stale_copy(self):
+        fx, loader, saved = self.ready()
+        fx.run('enable')
+        new_shim = fake_pe(['.text', '.sbat']) + b'shim 16.2'
+        loader.write_bytes(new_shim)
+        r = fx.run('disable')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(loader.read_bytes(), new_shim)
+        self.assertFalse(saved.exists())
+        self.assertIn('stale', r.stdout)
+
+
 class SeedTests(TempCase):
     def test_seed_parses_back(self):
         fx = self.fixture()

@@ -74,8 +74,10 @@ def warn(msg):
 # --- paths and configuration ----------------------------------------------------------------------
 
 class System:
-    def __init__(self, root=''):
+    def __init__(self, root='', config=None):
         self.root = root.rstrip('/') if root else ''
+        self.config_name = config or CONFIG
+        self.config_file = self.arg_path(config) if config else self.path(CONFIG)
 
     def path(self, p):
         return self.root + p if self.root else p
@@ -95,7 +97,11 @@ class System:
 
     def config(self):
         cfg = dict(DEFAULTS)
-        text = self.read(CONFIG)
+        try:
+            with open(self.config_file) as f:
+                text = f.read()
+        except OSError:
+            text = None
         cfg['_present'] = text is not None
         for n, line in enumerate((text or '').splitlines(), 1):
             line = line.strip()
@@ -103,23 +109,39 @@ class System:
                 continue
             m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)=(.*)$', line)
             if not m:
-                raise Refusal(f'{CONFIG} line {n} is not KEY=value.')
+                raise Refusal(f'{self.config_name} line {n} is not KEY=value.')
             value = re.sub(r'(^|\s+)#.*$', '', m.group(2)).strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
                 value = value[1:-1]
             cfg[m.group(1)] = value
         for key, allowed in CHOICES.items():
             if cfg[key] not in allowed:
-                raise Refusal(f'{CONFIG}: {key}={cfg[key]} is not one of {", ".join(allowed)}.')
+                raise Refusal(f'{self.config_name}: {key}={cfg[key]} is not one of {", ".join(allowed)}.')
         if not cfg['KEY_DIR'].startswith('/'):
-            raise Refusal(f'{CONFIG}: KEY_DIR must be an absolute path.')
+            raise Refusal(f'{self.config_name}: KEY_DIR must be an absolute path.')
         if cfg['ESP'] and not cfg['ESP'].startswith('/'):
-            raise Refusal(f'{CONFIG}: ESP must be empty or an absolute path.')
+            raise Refusal(f'{self.config_name}: ESP must be empty or an absolute path.')
         return cfg
+
+    def config_writable(self):
+        """False when the system configuration owns the file (a symlink, or read-only)."""
+        f = self.config_file
+        if os.path.islink(f):
+            return False
+        if os.path.exists(f):
+            return os.access(f, os.W_OK)
+        d = os.path.dirname(f)
+        while d and not os.path.exists(d):
+            d = os.path.dirname(d)
+        return os.access(d or '.', os.W_OK)
 
     def set_config(self, key, value):
         """Set KEY=value in the config, keeping every other line and comment."""
-        text = self.read(CONFIG, '')
+        try:
+            with open(self.config_file) as f:
+                text = f.read()
+        except OSError:
+            text = ''
         lines = text.splitlines()
         out, done = [], False
         for line in lines:
@@ -133,8 +155,8 @@ class System:
                 out.append(line)
         if not done:
             out.append(f'{key}={value}')
-        os.makedirs(os.path.dirname(self.path(CONFIG)), exist_ok=True)
-        atomic_write(self.path(CONFIG), ('\n'.join(out) + '\n').encode(), 0o644)
+        os.makedirs(os.path.dirname(os.path.abspath(self.config_file)), exist_ok=True)
+        atomic_write(self.config_file, ('\n'.join(out) + '\n').encode(), 0o644)
 
     def key_dir(self, cfg):
         return self.path(cfg['KEY_DIR'])
@@ -376,7 +398,7 @@ def refused(token, lab):
     return None
 
 
-def secure_cmdline(sysobj, cfg, lab=False, source=None):
+def secure_cmdline(sysobj, cfg, lab=False, source=None, init=None):
     if source is not None:
         try:
             with open(source) as f:
@@ -399,6 +421,11 @@ def secure_cmdline(sysobj, cfg, lab=False, source=None):
             warnings.append(f"removed '{t}' from the secure-path command line: it {why}")
             continue
         tokens.append(t)
+    if init is not None:
+        # An init the image builder names (NixOS: the generation's stage 2); it is signed with the rest.
+        if not init.startswith('/') or re.search(r'[\s"]', init):
+            raise Refusal(f'--init {init!r} must be an absolute path without spaces or quotes.')
+        tokens.append('init=' + init)
     tokens.append('lockdown=' + cfg['LOCKDOWN'])
     return ' '.join(tokens), warnings
 
@@ -545,10 +572,12 @@ def cmd_keys_adopt(sysobj, cfg, args):
         value = text.split('=', 1)[1].strip() if '=' in text else text
         if value in CHOICES['KEY_OWNER'] and value != cfg['KEY_OWNER']:
             try:
+                if not sysobj.config_writable():
+                    raise OSError(errno.EROFS, 'it comes from the system configuration')
                 sysobj.set_config('KEY_OWNER', value)
                 print(f'KEY_OWNER={value} (chosen at install)')
             except OSError as e:
-                warn(f'could not record KEY_OWNER={value} in {CONFIG}: {e.strerror}')
+                warn(f'could not record KEY_OWNER={value} in {sysobj.config_name}: {e.strerror}')
         os.unlink(owner)
     for f in (key, pubf):
         if os.path.exists(f):
@@ -600,11 +629,16 @@ def cmd_uki_build(sysobj, cfg, args):
     for i in initrds:
         if not os.path.exists(i):
             raise Refusal(f'{i} does not exist.')
-    stub = sysobj.path(STUB)
+    if args.stub:
+        stub = args.stub
+    elif os.environ.get('AURORA_SECBOOT_STUB'):
+        stub = sysobj.arg_path(os.environ['AURORA_SECBOOT_STUB'])
+    else:
+        stub = sysobj.path(STUB)
     if not os.path.exists(stub):
-        raise Refusal(f'{STUB} is missing (systemd-boot stub).')
+        raise Refusal(f'{stub} is missing (systemd-boot stub).')
     osrel = find_first(sysobj, ('/etc/os-release', '/usr/lib/os-release'))
-    cmdline, warnings = secure_cmdline(sysobj, cfg, args.lab, args.cmdline_file)
+    cmdline, warnings = secure_cmdline(sysobj, cfg, args.lab, args.cmdline_file, args.init)
     for w in warnings:
         warn(w)
     if args.lab:
@@ -682,28 +716,38 @@ def cmd_uki_verify(sysobj, cfg, args):
 
 # --- secure path on/off ---------------------------------------------------------------------
 
-def install_loader(sysobj, cfg, quiet=False):
-    """Copy the newest verified UKI to BOOTAA64.EFI, keeping the old loader once."""
+def install_loader(sysobj, cfg, uki=None):
+    """Copy a verified UKI (default: the newest) to BOOTAA64.EFI, keeping the loader it replaces."""
     if cfg['KEY_OWNER'] == 'aurora':
         raise Refusal('KEY_OWNER=aurora: the secure path waits for Aurora-signed UKIs, '
                       'and this machine holds no key to sign its own.')
     cert = os.path.join(sysobj.key_dir(cfg), 'db.crt')
     if not os.path.exists(cert):
         raise Refusal(f'there is no {cert}; run "aurora-secboot keys create" first.')
-    have = ukis(sysobj, cfg)
-    wanted = {k for k in (sysobj.running_kernel(), newest(have)) if k}
-    verified = {k: p for k, p in have.items() if verdict(p, cert) == 'verified'}
-    if not wanted & set(verified):
-        raise Refusal('there is no verified UKI for the running or the newest kernel; '
-                      'run "aurora-secboot uki build <version>" first.')
-    kver = newest(verified)
-    src = verified[kver]
+    if uki:
+        if not os.path.exists(uki):
+            raise Refusal(f'{uki} does not exist.')
+        if not is_uki(uki) or verdict(uki, cert) != 'verified':
+            raise Refusal(f'{uki} is not a UKI signed with {cert}.')
+        src, kver = uki, os.path.basename(uki)
+    else:
+        have = ukis(sysobj, cfg)
+        wanted = {k for k in (sysobj.running_kernel(), newest(have)) if k}
+        verified = {k: p for k, p in have.items() if verdict(p, cert) == 'verified'}
+        if not wanted & set(verified):
+            raise Refusal('there is no verified UKI for the running or the newest kernel; '
+                          'run "aurora-secboot uki build <version>" first.')
+        kver = newest(verified)
+        src = verified[kver]
     esp = sysobj.esp(cfg)
     loader, saved = os.path.join(esp, BOOT_LOADER), os.path.join(esp, SAVED_LOADER)
     changes = []
-    if os.path.exists(loader) and not os.path.exists(saved) and not is_uki(loader):
-        atomic_copy(loader, saved)
-        changes.append(f'kept the previous loader as {saved}')
+    # A loader that is not a UKI (shim, GRUB, or one a package update just wrote) is the one
+    # disable puts back, so the saved copy follows it.
+    if os.path.exists(loader) and not is_uki(loader):
+        if not os.path.exists(saved) or open(saved, 'rb').read() != open(loader, 'rb').read():
+            atomic_copy(loader, saved)
+            changes.append(f'kept the previous loader as {saved}')
     os.makedirs(os.path.dirname(loader), exist_ok=True)
     same = os.path.exists(loader) and open(loader, 'rb').read() == open(src, 'rb').read()
     if not same:
@@ -712,11 +756,20 @@ def install_loader(sysobj, cfg, quiet=False):
     return changes
 
 
+def record_secure_path(sysobj, cfg, value, changes):
+    if cfg['SECURE_PATH'] == value:
+        return
+    if not sysobj.config_writable():
+        changes.append(f'SECURE_PATH comes from the system configuration ({sysobj.config_name} is not '
+                       'writable); it was left as it is')
+        return
+    sysobj.set_config('SECURE_PATH', value)
+    changes.append(f'SECURE_PATH={value} in {sysobj.config_name}')
+
+
 def cmd_enable(sysobj, cfg, args):
-    changes = install_loader(sysobj, cfg)
-    if cfg['SECURE_PATH'] != 'yes':
-        sysobj.set_config('SECURE_PATH', 'yes')
-        changes.append(f'SECURE_PATH=yes in {CONFIG}')
+    changes = install_loader(sysobj, cfg, args.uki)
+    record_secure_path(sysobj, cfg, 'yes', changes)
     for c in changes or ['nothing changed: the secure path is already on']:
         print(c)
     return 0
@@ -726,16 +779,20 @@ def cmd_disable(sysobj, cfg, args):
     esp = sysobj.esp(cfg)
     loader, saved = os.path.join(esp, BOOT_LOADER), os.path.join(esp, SAVED_LOADER)
     changes = []
-    if os.path.exists(saved):
+    if os.path.exists(loader) and not is_uki(loader):
+        # A boot loader is already in place (put back, or newer than the saved copy).
+        if os.path.exists(saved):
+            os.unlink(saved)
+            fsync_dir(os.path.dirname(saved))
+            changes.append(f'{loader} is already a boot loader; removed the stale {saved}')
+    elif os.path.exists(saved):
         os.replace(saved, loader)
         fsync_dir(os.path.dirname(loader))
         changes.append(f'put the previous loader back as {loader}')
-    elif os.path.exists(loader) and is_uki(loader):
+    elif os.path.exists(loader):
         raise Refusal(f'{loader} is a UKI and there is no saved loader to put back; reinstall the boot loader '
                       '(shim or GRUB) first.')
-    if cfg['SECURE_PATH'] != 'no':
-        sysobj.set_config('SECURE_PATH', 'no')
-        changes.append(f'SECURE_PATH=no in {CONFIG}')
+    record_secure_path(sysobj, cfg, 'no', changes)
     for c in changes or ['nothing changed: the secure path is already off']:
         print(c)
     return 0
@@ -919,7 +976,7 @@ def cmd_status(sysobj, cfg, args):
         print(json.dumps(st, indent=2, sort_keys=True))
         return 0
     c = st['config']
-    print(f'config: {CONFIG}{"" if st["config_present"] else " (absent, defaults)"}: ' +
+    print(f'config: {sysobj.config_name}{"" if st["config_present"] else " (absent, defaults)"}: ' +
           ' '.join(f'{k}={c[k]}' for k in DEFAULTS))
     print(f'key owner: {c["KEY_OWNER"]}')
     have = [k for k, v in st['keys'].items() if v]
@@ -969,7 +1026,7 @@ def cmd_hook(sysobj, cfg, args):
         initrds = [found] if found else None
     build = argparse.Namespace(kver=args.kver, image=args.image if args.image and os.path.exists(args.image)
                                else None, initrd=initrds, cmdline_file=None, lab=False, output=None,
-                               no_sign=False)
+                               no_sign=False, init=None, stub=None)
     try:
         cmd_uki_build(sysobj, cfg, build)
     except Refusal as e:
@@ -995,6 +1052,7 @@ def refresh_loader(sysobj, cfg):
 def parser():
     ap = argparse.ArgumentParser(prog='aurora-secboot', description='Signed UKIs for the secure boot path.')
     ap.add_argument('--root', default='', help='prefix every path with DIR (tests, image builds)')
+    ap.add_argument('--config', metavar='PATH', help=f'read PATH instead of {CONFIG}')
     sub = ap.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('status', help='show the secure boot state and the first gap')
     s.add_argument('--json', action='store_true')
@@ -1018,6 +1076,8 @@ def parser():
     s.add_argument('--lab', action='store_true')
     s.add_argument('--output')
     s.add_argument('--no-sign', action='store_true')
+    s.add_argument('--init', metavar='PATH', help='add init=PATH after the command line filter')
+    s.add_argument('--stub', metavar='PATH', help=f'systemd-boot stub (default $AURORA_SECBOOT_STUB, else {STUB})')
     s.set_defaults(func=cmd_uki_build)
     s = u.add_parser('remove')
     s.add_argument('kver')
@@ -1025,7 +1085,9 @@ def parser():
     s = u.add_parser('verify')
     s.add_argument('paths', nargs='*')
     s.set_defaults(func=cmd_uki_verify)
-    sub.add_parser('enable', help='boot the newest verified UKI').set_defaults(func=cmd_enable)
+    s = sub.add_parser('enable', help='boot the newest (or the given) verified UKI')
+    s.add_argument('--uki', metavar='PATH')
+    s.set_defaults(func=cmd_enable)
     sub.add_parser('disable', help='put the previous loader back').set_defaults(func=cmd_disable)
     s = sub.add_parser('seed', help='build the U-Boot PK/KEK/db/dbx variable seed')
     s.add_argument('-o', '--output', required=True)
@@ -1052,11 +1114,11 @@ def print_cmdline(sysobj, cfg, args):
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    sysobj = System(args.root)
+    sysobj = System(args.root, args.config)
     try:
         cfg = sysobj.config()
         # --root prefixes the paths given on the command line too.
-        for attr in ('image', 'cmdline_file', 'output', 'source', 'entry_dir'):
+        for attr in ('image', 'cmdline_file', 'output', 'source', 'entry_dir', 'stub', 'uki'):
             if getattr(args, attr, None):
                 setattr(args, attr, sysobj.arg_path(getattr(args, attr)))
         for attr in ('initrd', 'paths'):

@@ -50,7 +50,9 @@ read the Stage 2 key. Overwriting is best effort on flash storage.
 ## Commands
 
 Exit status 0 on success, 1 when a request is refused (one sentence on stderr), 2 on usage errors. `--root DIR` puts every
-path, including the ones given on the command line, under `DIR`.
+path, including the ones given on the command line, under `DIR`. `--config PATH` (before the command) reads `PATH` instead
+of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not writable (NixOS generates it), `enable`,
+`disable` and `keys adopt` leave it alone and say that the setting comes from the system configuration.
 
 - `status [--json]`: configuration, keys, the boot security record (`/sys/firmware/aurora/boot_security`), the EFI
   `SecureBoot`, `SetupMode`, `AuditMode` and `DeployedMode` variables, kernel lockdown, each UKI under `ESP/EFI/Linux/` and
@@ -64,18 +66,23 @@ path, including the ones given on the command line, under `DIR`.
   from the one already in `KEY_DIR`, is refused and left where it is.
 - `cmdline [--lab]`: the secure-path command line. It starts from `/etc/kernel/cmdline` (else `/proc/cmdline` without
   `BOOT_IMAGE=` and `initrd=`), removes the tokens below with one warning each, and adds `lockdown=<LOCKDOWN>`.
-- `uki build KVER [--image P] [--initrd P]... [--cmdline-file P] [--lab] [--output P] [--no-sign]`: `ukify build` with
-  `/usr/lib/systemd/boot/efi/linuxaa64.efi.stub`, `--uname KVER` and `/etc/os-release`. No devicetree goes in the UKI: U-Boot
+- `uki build KVER [--image P] [--initrd P]... [--cmdline-file P] [--init P] [--stub P] [--lab] [--output P] [--no-sign]`:
+  `ukify build` with the stub (`--stub`, else `$AURORA_SECBOOT_STUB`, else
+  `/usr/lib/systemd/boot/efi/linuxaa64.efi.stub`), `--uname KVER` and `/etc/os-release`. `--init P` adds `init=P` after
+  the command line filter (NixOS names its generation's init this way); `P` must be absolute, without spaces or quotes. No devicetree goes in the UKI: U-Boot
   passes the one it booted with. It signs with `db.key` when it exists, else leaves the UKI unsigned with a warning. The
   default output is `ESP/EFI/Linux/aurora-<machine-id>-<KVER>.efi`; it is written to a temporary file in the same directory,
   synced and renamed. The defaults for the image are `/usr/lib/modules/KVER/vmlinuz` and `/boot/vmlinuz-KVER`, and for the
   initramfs `/boot/initramfs-KVER.img`.
 - `uki remove KVER`: remove that kernel's UKI.
 - `uki verify [PATH...]`: `sbverify --cert db.crt` on each UKI (default: all of this machine's). Exit 1 if any fails.
-- `enable`: refused under `KEY_OWNER=aurora` and when neither the running nor the newest kernel has a verified UKI. It keeps the
-  current loader as `EFI/BOOT/BOOTAA64.EFI.aurora-shim` (once), copies the newest verified UKI to `EFI/BOOT/BOOTAA64.EFI` and
-  sets `SECURE_PATH=yes`. Running it again refreshes `BOOTAA64.EFI` to the newest verified UKI.
-- `disable`: puts the saved loader back and sets `SECURE_PATH=no`.
+- `enable [--uki P]`: refused under `KEY_OWNER=aurora` and when neither the running nor the newest kernel has a verified UKI
+  (with `--uki`: when `P` is not a UKI that verifies). When `EFI/BOOT/BOOTAA64.EFI` is a boot loader rather than a UKI, it
+  is copied to `EFI/BOOT/BOOTAA64.EFI.aurora-shim`, replacing an older copy, so a loader a package update just wrote is the
+  one `disable` puts back. Then the UKI (`P`, else the newest verified one) is copied to `BOOTAA64.EFI` and
+  `SECURE_PATH=yes` is set. Running it again refreshes `BOOTAA64.EFI`.
+- `disable`: puts the saved loader back and sets `SECURE_PATH=no`. When `BOOTAA64.EFI` is already a boot loader, it is kept
+  and the stale saved copy is removed.
 - `seed -o FILE`: the U-Boot variable seed (`CONFIG_EFI_VAR_SEED_FILE` with `CONFIG_EFI_VARIABLES_PRESEED`) holding PK, KEK
   and db from `KEY_DIR` and an empty dbx, for an owner-built U-Boot. Certificates from Microsoft's UEFI and Windows CAs are
   refused: they would admit every boot loader Microsoft has signed.
