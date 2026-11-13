@@ -131,6 +131,10 @@ if [[ ${AURORA_TEST_INTERRUPT:-0} == 1 ]]; then
   umount "$scratch/mnt"
 fi
 cryptsetup isLuks "$root"
+# 256 KiB of LUKS2 metadata leaves room for several Secure Enclave password
+# tokens and the recovery key; the data still starts 16 MiB in.
+cryptsetup luksDump "$root" | grep -Eq '^Metadata area:[[:space:]]+262144 \[bytes\]$'
+cryptsetup luksDump --dump-json-metadata "$root" | grep -q '"offset":"16777216"'
 [[ -b /dev/mapper/root ]]
 mount -o subvol=root /dev/mapper/root "$scratch/mnt"
 grep -qx 'Aurora conversion preserves filesystem content' "$scratch/mnt/proof"

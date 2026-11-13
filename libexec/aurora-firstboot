@@ -196,6 +196,10 @@ boot_key=$boot_dir/omarchy/luks-key
 # the disk even after the keyslot itself is gone.
 header_backup=$boot_dir/omarchy/luks-header-before-recovery.bin
 phase='' partition='' uuid='' device=''
+# The recovery key, as FileVault makes one: shown once (aurora-recovery-key),
+# kept here root-only inside the encrypted root until the owner has seen it.
+recovery_key=$state/recovery-key
+recovery_shown=$state/recovery-key-shown
 read_journal() {
   local key value format=''
   [[ -f $journal && ! -L $journal ]] || fail 'Root preparation journal is missing'
@@ -252,6 +256,40 @@ key_file_slot() {
     sed -n 's/^Key slot \([0-9][0-9]*\) unlocked\.$/\1/p' | head -n 1
 }
 
+# A recovery key in the same form as aurora-sep-fde's (six groups of four
+# from an alphabet without 0/O, 1/I), in a keyslot of its own. It is written
+# to disk before its keyslot exists, so a stop in between is resumed with the
+# same key; it never replaces a key the owner may already have seen.
+recovery_alphabet=ABCDEFGHJKLMNPQRSTUVWXYZ23456789
+new_recovery_key() {
+  local bytes i out=''
+  bytes=$(od -An -tu1 -N24 /dev/urandom)
+  i=0
+  for b in $bytes; do
+    (( i == 0 || i % 4 )) || out+=-
+    out+=${recovery_alphabet:b % 32:1}
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+add_recovery_key() {
+  local password=$1
+  [[ ! -e $recovery_shown && ! -f $recovery_key ]] || return 0
+  if [[ ! -f $recovery_key.new ]]; then
+    new_recovery_key > "$recovery_key.new"
+    sync "$recovery_key.new"
+  fi
+  if ! cryptsetup open --test-passphrase --key-file "$recovery_key.new" "$device" 2>/dev/null; then
+    printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-file=- "$device" "$recovery_key.new" ||
+      fail 'Adding the recovery key failed'
+    cryptsetup open --test-passphrase --key-file "$recovery_key.new" "$device" || fail 'The recovery key did not open the disk'
+  fi
+  mv -f "$recovery_key.new" "$recovery_key"
+  label "$recovery_key"
+  sync "$state"
+}
+
 # Enroll the password in key slot 1, prove it unlocks, then destroy the
 # temporary keyslot and every copy of the temporary key. The disk never
 # loses its last working slot: the temporary slot is removed only after the
@@ -269,6 +307,7 @@ protect_disk() {
     printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-slot 1 --key-file "$keyfile" "$device" -
   fi
   printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$device" || fail 'The new password did not unlock the disk'
+  add_recovery_key "$password"
   for keyfile in "$state/luks-key" "$boot_key"; do
     [[ -f $keyfile && ! -L $keyfile ]] || continue
     slot=$(key_file_slot "$keyfile")
@@ -291,6 +330,185 @@ protect_disk() {
   printf 'rekeyed\n' > "$state/disk-rekeyed"
   label "$state/disk-rekeyed"
   sync "$state/disk-rekeyed"
+}
+
+# ---- Secure Enclave disk password (FileVault model) ----
+# On a Mac whose Secure Enclave can open the root from the initrd, the
+# owner's password is not stored as a LUKS passphrase. aurora-sep-fde seals
+# a keyslot secret to the owner's SEP key bag, which only that password
+# unlocks; the enclave checks every attempt and counts the wrong ones. A
+# recovery key (24 characters, shown once) gets its own token and an offline
+# keyslot, so the Mac can always be opened if the enclave cannot answer.
+# Elsewhere (no aurora-sep-luks, or an enclave that cannot unlock a user's key
+# bag before the root is mounted) the password becomes a LUKS passphrase as
+# before. Nothing here names a Mac model: the running enclave decides.
+sep_fde=${AURORA_SEP_FDE:-/usr/bin/aurora-sep-fde}
+sep_devices=${AURORA_SEP_DEVICES:-/sys/bus/platform/devices}
+sep_wait=${AURORA_SEP_KEYSTORE_WAIT:-120}
+sealed_marker=$state/disk-sealed
+dracut_conf_dir=${AURORA_DRACUT_CONF_DIR:-/etc/dracut.conf.d}
+mkinitcpio_conf=${AURORA_MKINITCPIO_CONF:-/etc/mkinitcpio.conf}
+
+sep_modinfo() { modinfo -F parm apple_sep 2>/dev/null; }
+
+# The enclave's own report, read from its driver's sysfs attributes:
+# - the key store is open this boot (waited for: on some Macs the enclave
+#   starts its applications most of a minute after boot);
+# - trusted keys are on, and the enclave may write its own records (xART
+#   writable): a user's key bag cannot be loaded without those writes;
+# - no xART guard runs: the guard's record list lives on the real root, so
+#   with a guard the initrd cannot unlock a user's bag (the driver refuses);
+# - the driver has the initrd phase that unlocks per-user key bags.
+sep_root_capable() {
+  local diag='' candidate keystore='' policy waited=0
+  [[ -x $sep_fde ]] || { log 'disk password: aurora-sep-fde is not installed'; return 1; }
+  for candidate in "$sep_devices"/*.sep/diag; do
+    [[ -r $candidate/keystore ]] && { diag=$candidate; break; }
+  done
+  [[ -n $diag ]] || { log 'disk password: no Secure Enclave driver'; return 1; }
+  while :; do
+    keystore=$(<"$diag/keystore")
+    [[ $keystore == unknown ]] && (( waited < sep_wait )) || break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [[ $keystore == open ]] || { log "disk password: Secure Enclave key store is $keystore"; return 1; }
+  policy=" $(<"$diag/policy") "
+  [[ $policy == *' trusted_keys=1 '* && $policy == *' xart_writes=1 '* && $policy == *' xart_guard=0 '* ]] ||
+    { log "disk password: Secure Enclave policy${policy% } cannot unlock a user key bag in the initrd"; return 1; }
+  sep_modinfo | grep -q '^keystore_only:.*per-user key bags' ||
+    { log 'disk password: apple_sep cannot unlock a user key bag in the initrd'; return 1; }
+}
+
+# Count the disk's aurora-sep tokens of one role ("user" or "recovery"),
+# optionally for one Linux user.
+sep_tokens() {
+  cryptsetup luksDump --dump-json-metadata "$device" | python3 -c '
+import json, sys
+role, user = sys.argv[1], sys.argv[2]
+tokens = json.load(sys.stdin)["tokens"].values()
+print(sum(1 for t in tokens if t.get("type") == "aurora-sep" and t.get("aurora_sep_role") == role
+          and (not user or t.get("aurora_sep_user") == user)))' "$1" "${2:-}"
+}
+
+disk_sealed() { [[ -e $sealed_marker ]]; }
+
+# The initramfs must load the enclave driver in the phase that unlocks a
+# user's key bag, and carry the token plugin. The root is opened by Aurora's
+# own initrd service, not from crypttab, so the builders are told.
+sep_initrd_config() {
+  if [[ -d $dracut_conf_dir ]] || command -v dracut >/dev/null 2>&1; then
+    install -d -m 0755 "$dracut_conf_dir"
+    printf '%s\n' '# aurora-firstboot: the root is sealed by the Secure Enclave (aurora-sep-fde).' \
+      'add_dracutmodules+=" aurora-sep "' 'aurora_sep_password_unlock="yes"' \
+      > "$dracut_conf_dir/90-aurora-sep-root.conf.new"
+    chmod 0644 "$dracut_conf_dir/90-aurora-sep-root.conf.new"
+    mv -f "$dracut_conf_dir/90-aurora-sep-root.conf.new" "$dracut_conf_dir/90-aurora-sep-root.conf"
+    label "$dracut_conf_dir/90-aurora-sep-root.conf"
+  fi
+  if [[ -f $mkinitcpio_conf ]]; then
+    install -d -m 0755 "$mkinitcpio_conf.d"
+    printf '%s\n' '# aurora-firstboot: the root is sealed by the Secure Enclave (aurora-sep-fde).' \
+      'HOOKS+=(aurora-sep)' 'AURORA_SEP_PASSWORD_UNLOCK=yes' \
+      > "$mkinitcpio_conf.d/90-aurora-sep-root.conf.new"
+    chmod 0644 "$mkinitcpio_conf.d/90-aurora-sep-root.conf.new"
+    mv -f "$mkinitcpio_conf.d/90-aurora-sep-root.conf.new" "$mkinitcpio_conf.d/90-aurora-sep-root.conf"
+  fi
+}
+
+sep_rebuild_initrd() {
+  if [[ -e /etc/NIXOS ]]; then
+    log 'disk password: set aurora.sepLuks.initrd.enable and rebuild so the initrd opens the sealed root'
+  elif command -v dracut >/dev/null 2>&1; then
+    dracut --regenerate-all --force || return 1
+  elif command -v mkinitcpio >/dev/null 2>&1; then
+    mkinitcpio -P || return 1
+  fi
+}
+
+# Seal the disk to the owner's password and make the recovery key, then
+# retire the temporary key. Returns 1, with nothing removed, when the enclave
+# refuses the enrolment, so the caller can fall back to a passphrase. Every
+# step can be resumed: tokens already on the disk are kept.
+seal_disk() {
+  local user=$1 password=$2 keyfile=$state/luks-key secret
+  [[ -f $keyfile && ! -L $keyfile ]] || fail 'The temporary encryption key is unavailable; use the original setup password to resume'
+  secret=$(mktemp "${rekey_dir:-/run}/seal.XXXXXX" 2>/dev/null || mktemp /run/aurora-seal.XXXXXX)
+  printf '%s' "$password" > "$secret"
+  if (( $(sep_tokens user "$user") == 0 )); then
+    say 'Protecting the encrypted disk with your password and the Secure Enclave...'
+    if ! "$sep_fde" enroll --user "$user" --owner --quiet --unlock-key-file "$keyfile" --password-file "$secret" "$device"; then
+      rm -f -- "$secret"
+      warn 'The Secure Enclave did not accept the disk password; using a LUKS passphrase instead'
+      return 1
+    fi
+  fi
+  if ! "$sep_fde" test --password-file "$secret" "$device" >/dev/null; then
+    rm -f -- "$secret"
+    fail 'The Secure Enclave did not open the disk with the new password'
+  fi
+  rm -f -- "$secret"
+  # One recovery key. A token whose key was never written down (a stop
+  # between the enrolment and the file) is replaced.
+  if (( $(sep_tokens recovery) == 0 )) || [[ ! -f $recovery_key && ! -e $recovery_shown ]]; then
+    local replace=()
+    (( $(sep_tokens recovery) == 0 )) || replace=(--replace)
+    rm -f -- "$recovery_key.new"
+    "$sep_fde" recovery "${replace[@]}" --quiet --unlock-key-file "$keyfile" --recovery-key-file "$recovery_key.new" "$device" ||
+      fail 'Creating the recovery key failed'
+    sync "$recovery_key.new"
+    mv -f "$recovery_key.new" "$recovery_key"
+    label "$recovery_key"
+    # Whose session shows it.
+    printf '%s\n' "$user" > "$recovery_key-user"
+    label "$recovery_key-user"
+    sync "$state"
+  fi
+  "$sep_fde" test --recovery-key-file "$recovery_key" "$device" >/dev/null ||
+    [[ -e $recovery_shown ]] || fail 'The recovery key did not open the disk'
+  # The temporary key's slot goes last; aurora-sep-fde refuses unless a
+  # password token and a recovery token exist, and never removes a token's
+  # or the recovery key's own slot.
+  local keycopy
+  for keycopy in "$state/luks-key" "$boot_key"; do
+    [[ -f $keycopy && ! -L $keycopy ]] || continue
+    [[ -n $(key_file_slot "$keycopy") ]] || continue
+    "$sep_fde" remove-passphrase --quiet --unlock-key-file "$keycopy" "$device" ||
+      fail 'Removing the temporary encryption key failed'
+    [[ -z $(key_file_slot "$keycopy") ]] || fail 'The temporary encryption key is still usable'
+  done
+  sep_initrd_config
+  retire_key_files
+  printf 'format=1\nphase=finished\npartition=%s\nluks_uuid=%s\n' "$partition" "$uuid" > "$journal.new"
+  sync "$journal.new"
+  mv "$journal.new" "$journal"
+  label "$journal"
+  sync "$boot_dir/omarchy"
+  printf 'sealed\n' > "$sealed_marker"
+  label "$sealed_marker"
+  printf 'rekeyed\n' > "$state/disk-rekeyed"
+  label "$state/disk-rekeyed"
+  sync "$state"
+  sep_rebuild_initrd || warn 'Rebuilding the initramfs failed; the next start asks for the recovery key until it is rebuilt'
+  # Until the owner has seen the recovery key, every start hands it to their
+  # session again; both units stop by themselves once it was shown.
+  [[ -e /etc/NIXOS ]] || systemctl enable aurora-recovery-key.service aurora-recovery-key-done.path 2>/dev/null || true
+  systemctl start --no-block aurora-recovery-key-done.path 2>/dev/null || true
+}
+
+# The owner's password protects the disk: sealed by the Secure Enclave where
+# it can open the root at boot, else as a LUKS passphrase.
+protect_disk_for() {
+  local user=$1 password=$2
+  if [[ -n $user ]] && ! disk_sealed && sep_root_capable && seal_disk "$user" "$password"; then
+    log "the Secure Enclave now unlocks the disk with the password of $user; a recovery key was made"
+    return 0
+  fi
+  disk_sealed || protect_disk "$password"
+  if [[ -n $user && -f $recovery_key && ! -f $recovery_key-user ]]; then
+    printf '%s\n' "$user" > "$recovery_key-user"
+    label "$recovery_key-user"
+  fi
 }
 
 # Arch's sudoers does not enable the wheel group; the owner is created in it.
@@ -611,6 +829,7 @@ password_hook() {
   install -d -m 0700 "$rekey_dir"
   printf '%s' "$password" > "$rekey_dir/password.new"
   unset password
+  printf '%s\n' "$user" > "$rekey_dir/user"
   mv -f "$rekey_dir/password.new" "$rekey_dir/password"
   log "rekeying the disk with the password of $user ($type)"
   systemctl start --no-block aurora-disk-rekey.service
@@ -648,12 +867,20 @@ rekey_from_owner_password() {
   [[ -f $rekey_dir/password && ! -L $rekey_dir/password ]] || return 0
   password=$(<"$rekey_dir/password")
   rm -f -- "$rekey_dir/password"
+  local user=''
+  if [[ -f $rekey_dir/user && ! -L $rekey_dir/user ]]; then
+    user=$(<"$rekey_dir/user")
+    rm -f -- "$rekey_dir/user"
+    is_owner "$user" || user=''
+  fi
   read_journal
   if disk_needs_password; then
     follow_desktop_keyboard
-    protect_disk "$password"
+    protect_disk_for "$user" "$password"
     log 'the owner password now unlocks the disk; the temporary key is gone'
   fi
+  # The owner sees the recovery key once, in their session.
+  [[ ! -f $recovery_key ]] || systemctl start --no-block aurora-recovery-key.service 2>/dev/null || true
   unset password
   disarm_password_hooks
   retire_declared_hooks
@@ -698,6 +925,8 @@ setup_desktop() {
       ask_disk_password
       protect_disk "$password"
       unset password
+      # No account exists yet to show it to later: show it now, here.
+      [[ ! -f $recovery_key ]] || "$(dirname -- "${BASH_SOURCE[0]}")/aurora-recovery-key" --console
     fi
   fi
   allow_wheel
@@ -763,8 +992,15 @@ setup_text() {
   # setup can never leave the account and the disk with different passwords.
   # After a desktop setup protected the disk, the account password is free.
   read_journal
+  local seal=0
   if [[ ! -e $state/desktop && $phase != declined ]]; then
-    protect_disk "$password"
+    if disk_needs_password && ! disk_sealed && sep_root_capable; then
+      # The enclave seals to a user's key bag, so the account comes first;
+      # its password is set only after the disk takes it.
+      seal=1
+    else
+      protect_disk "$password"
+    fi
   fi
 
   # A resumed setup reuses an account an interrupted run already created.
@@ -777,6 +1013,9 @@ setup_text() {
   uid=$(id -u "$username")
   (( uid >= 1000 && uid < 60000 )) || fail 'Owner account has an unexpected user ID'
   usermod --append --groups wheel "$username"
+  if (( seal )); then
+    seal_disk "$username" "$password" || protect_disk "$password"
+  fi
   printf '%s:%s\n' "$username" "$password" | chpasswd
   unset password
   label -R "/home/$username" /etc/passwd /etc/shadow /etc/group
@@ -818,6 +1057,8 @@ EOF
   sync "$state/complete" "${account_files[@]}"
   rm -- "$state/pending"
   sync "$state"
+  # The recovery key is shown once, here, before anyone signs in.
+  [[ ! -f $recovery_key ]] || "$(dirname -- "${BASH_SOURCE[0]}")/aurora-recovery-key" --console
   printf '\nAurora setup is complete. Sign in as %s.\n' "$username"
 }
 

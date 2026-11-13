@@ -7,6 +7,9 @@ After=aurora-vendor-firmware.service aurora-vendorfw-initrd.service omarchy-vend
 After=plymouth-start.service
 # The unlock prompt reads the disk password with the console keymap.
 After=systemd-vconsole-setup.service
+# A root sealed by the Secure Enclave needs its driver in key-store-only mode
+# (aurora-sep-luks initrd integration, where installed).
+After=aurora-sep-initrd.service
 Before=cryptsetup-pre.target sysroot.mount initrd-root-device.target
 Before=shutdown.target
 Conflicts=shutdown.target

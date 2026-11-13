@@ -1,0 +1,92 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Show the disk's recovery key once, as Setup Assistant does for FileVault.
+#
+# aurora-firstboot leaves the key in a root-only file inside the encrypted
+# root ($state/recovery-key) when it seals the disk to the owner's password.
+#   --publish       (root, aurora-recovery-key.service) hands a copy to the
+#                   owner's session in /run, readable by the owner only.
+#   --show          (the owner's session, XDG autostart) shows it and asks the
+#                   owner to confirm they wrote it down.
+#   --acknowledged  (root, aurora-recovery-key-done.path) deletes every copy
+#                   once the owner confirmed.
+#   --console       (root: the text wizard, or `sudo` from a terminal) prints
+#                   it on the terminal, asks for confirmation and deletes it.
+# The key itself stays valid; only the stored copies go. A lost key is
+# replaced with: sudo aurora-sep-fde recovery --replace <disk>
+set -euo pipefail
+umask 077
+state=${AURORA_FIRSTBOOT_STATE:-/var/lib/aurora/firstboot}
+handoff=${AURORA_RECOVERY_HANDOFF:-/run/aurora-recovery-key}
+key=$state/recovery-key
+shown=$state/recovery-key-shown
+
+log() { logger -t aurora-recovery-key -- "$*" 2>/dev/null || true; }
+label() { command -v restorecon >/dev/null 2>&1 && restorecon -F "$@" 2>/dev/null || true; }
+
+title='Your recovery key'
+explain='If you forget your password, or this Mac cannot check it, the recovery key unlocks the disk and lets you reset your password.'
+keep='Write it down and keep it somewhere safe, away from this Mac. It is shown only once.'
+
+retire() {
+  if [[ -f $key && ! -L $key ]] && command -v shred >/dev/null 2>&1; then
+    shred --iterations=1 --zero --remove=wipesync -- "$key" 2>/dev/null || rm -f -- "$key"
+  else
+    rm -f -- "$key"
+  fi
+  rm -f -- "$key-user"
+  rm -rf -- "$handoff"
+  printf 'shown\n' > "$shown"
+  label "$shown"
+  sync "$state"
+  log 'the recovery key was shown and its stored copies are gone'
+}
+
+case ${1:-} in
+--publish)
+  [[ -f $key && ! -L $key && ! -e $shown ]] || exit 0
+  user=$(<"$key-user")
+  uid=$(id -u "$user")
+  gid=$(id -g "$user")
+  install -d -m 0700 -o "$uid" -g "$gid" "$handoff"
+  install -m 0400 -o "$uid" -g "$gid" "$key" "$handoff/key"
+  label -R "$handoff"
+  ;;
+--acknowledged)
+  [[ -e $handoff/acknowledged ]] || exit 0
+  retire
+  ;;
+--console)
+  [[ -f $key && ! -L $key ]] || { echo 'No recovery key is waiting to be shown.' >&2; exit 1; }
+  printf '\n%s\n\n    %s\n\n%s\n%s\n\n' "$title" "$(<"$key")" "$explain" "$keep"
+  read -r -p 'Press Enter once you have written it down. ' _
+  retire
+  printf '\033[2J\033[H'
+  ;;
+--show)
+  # The rekey runs in the background during the first sign-in; wait for it
+  # while first-boot work is in flight.
+  for _ in $(seq 1 300); do
+    [[ ! -r $handoff/key && -e /run/aurora-firstboot ]] || break
+    sleep 2
+  done
+  [[ -r $handoff/key ]] || exit 0
+  rk=$(<"$handoff/key")
+  text="$explain"$'\n\n'"$rk"$'\n\n'"$keep"
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --info --title="$title" --no-wrap --ok-label='I wrote it down' --text="$text" || exit 0
+  elif command -v kdialog >/dev/null 2>&1; then
+    kdialog --title "$title" --msgbox "$text" || exit 0
+  else
+    command -v notify-send >/dev/null 2>&1 &&
+      notify-send --urgency=critical "$title" 'Run "sudo /usr/lib/aurora/aurora-recovery-key --console" in a terminal to see it.'
+    exit 0
+  fi
+  unset rk text
+  touch "$handoff/acknowledged"
+  ;;
+*)
+  echo 'usage: aurora-recovery-key --publish | --show | --acknowledged | --console' >&2
+  exit 2
+  ;;
+esac
