@@ -8,6 +8,9 @@ build() {
     mkdir chmod dd date cat mv sync install grep sed kill sleep tr systemd-ask-password; do
     add_binary "$(command -v "$binary")"
   done
+  # A root sealed by the Secure Enclave opens through systemd-cryptsetup, which
+  # runs the aurora-sep token plugin (added by aurora-sep-luks's hook).
+  [[ ! -x /usr/lib/systemd/systemd-cryptsetup ]] || add_binary /usr/lib/systemd/systemd-cryptsetup
   add_module dm-crypt
   add_module apple_wdt
   add_module btrfs

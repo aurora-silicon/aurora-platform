@@ -1,0 +1,13 @@
+[Unit]
+Description=Hand the disk recovery key to its owner's session once
+# aurora-firstboot starts it after sealing the disk to the owner's password;
+# at later starts it runs until the owner has confirmed the key.
+ConditionPathExists=/var/lib/aurora/firstboot/recovery-key
+ConditionPathExists=!/var/lib/aurora/firstboot/recovery-key-shown
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/aurora/aurora-recovery-key --publish
+
+[Install]
+WantedBy=multi-user.target

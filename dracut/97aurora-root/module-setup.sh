@@ -9,6 +9,12 @@ install() {
     inst_binary "$(command -v "$binary")" || return 1
   done
   inst_binary /usr/bin/systemd-ask-password
+  # A root sealed by the Secure Enclave opens through systemd-cryptsetup, which
+  # runs the aurora-sep token plugin (installed by aurora-sep-luks's module).
+  local tool
+  for tool in /usr/lib/systemd/systemd-cryptsetup /lib/systemd/systemd-cryptsetup; do
+    [[ -x $dracutsysrootdir$tool ]] && { inst_binary "$tool"; break; }
+  done
   # The unlock prompt uses the keymap the i18n module copies from vconsole.conf.
   dracut_module_included i18n || dwarn 'aurora-root: without the i18n module the disk password prompt uses the US keymap'
   inst_simple "$layout" /etc/aurora/image-layout

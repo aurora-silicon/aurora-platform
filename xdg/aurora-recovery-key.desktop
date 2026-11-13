@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Disk recovery key
+Comment=Shows the disk recovery key once after setup
+Exec=/usr/lib/aurora/aurora-recovery-key --show
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-phase=2

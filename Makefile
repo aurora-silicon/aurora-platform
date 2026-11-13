@@ -12,6 +12,7 @@ install-common:
 	install -Dm755 libexec/aurora-firstboot $(DESTDIR)$(LIBDIR)/aurora/aurora-firstboot
 	install -Dm755 libexec/aurora-firstboot-handoff $(DESTDIR)$(LIBDIR)/aurora/aurora-firstboot-handoff
 	install -Dm755 libexec/aurora-password-hook $(DESTDIR)$(LIBDIR)/aurora/aurora-password-hook
+	install -Dm755 libexec/aurora-recovery-key $(DESTDIR)$(LIBDIR)/aurora/aurora-recovery-key
 	install -Dm755 libexec/aurora-growfs-needed $(DESTDIR)$(LIBDIR)/aurora/aurora-growfs-needed
 	install -Dm755 images/harden-grub.py $(DESTDIR)$(LIBDIR)/aurora/aurora-harden-grub
 	install -Dm644 vendor/omarchy-mac-encrypt $(DESTDIR)$(LIBDIR)/aurora/vendor/omarchy-mac-encrypt
@@ -21,6 +22,10 @@ install-common:
 	install -Dm644 systemd/aurora-root-mapper.conf $(DESTDIR)$(LIBDIR)/aurora/initrd/aurora-root-mapper.conf
 	install -Dm644 systemd/aurora-firstboot.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-firstboot.service
 	install -Dm644 systemd/aurora-disk-rekey.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-disk-rekey.service
+	install -Dm644 systemd/aurora-recovery-key.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-recovery-key.service
+	install -Dm644 systemd/aurora-recovery-key-done.path $(DESTDIR)$(LIBDIR)/systemd/system/aurora-recovery-key-done.path
+	install -Dm644 systemd/aurora-recovery-key-done.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-recovery-key-done.service
+	install -Dm644 xdg/aurora-recovery-key.desktop $(DESTDIR)$(SYSCONFDIR)/xdg/autostart/aurora-recovery-key.desktop
 	install -Dm644 systemd/aurora-initrd-keymap.path $(DESTDIR)$(LIBDIR)/systemd/system/aurora-initrd-keymap.path
 	install -Dm644 systemd/aurora-initrd-keymap.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-initrd-keymap.service
 	install -Dm644 systemd/aurora-display-manager.conf $(DESTDIR)$(LIBDIR)/systemd/system/display-manager.service.d/aurora-firstboot.conf
