@@ -346,6 +346,8 @@ sep_fde=${AURORA_SEP_FDE:-/usr/bin/aurora-sep-fde}
 sep_devices=${AURORA_SEP_DEVICES:-/sys/bus/platform/devices}
 sep_wait=${AURORA_SEP_KEYSTORE_WAIT:-120}
 sealed_marker=$state/disk-sealed
+dracut_conf_dir=${AURORA_DRACUT_CONF_DIR:-/etc/dracut.conf.d}
+mkinitcpio_conf=${AURORA_MKINITCPIO_CONF:-/etc/mkinitcpio.conf}
 
 sep_modinfo() { modinfo -F parm apple_sep 2>/dev/null; }
 
@@ -395,22 +397,22 @@ disk_sealed() { [[ -e $sealed_marker ]]; }
 # user's key bag, and carry the token plugin. The root is opened by Aurora's
 # own initrd service, not from crypttab, so the builders are told.
 sep_initrd_config() {
-  if [[ -d /etc/dracut.conf.d || -x /usr/bin/dracut ]]; then
-    install -d -m 0755 /etc/dracut.conf.d
+  if [[ -d $dracut_conf_dir ]] || command -v dracut >/dev/null 2>&1; then
+    install -d -m 0755 "$dracut_conf_dir"
     printf '%s\n' '# aurora-firstboot: the root is sealed by the Secure Enclave (aurora-sep-fde).' \
       'add_dracutmodules+=" aurora-sep "' 'aurora_sep_password_unlock="yes"' \
-      > /etc/dracut.conf.d/90-aurora-sep-root.conf.new
-    chmod 0644 /etc/dracut.conf.d/90-aurora-sep-root.conf.new
-    mv -f /etc/dracut.conf.d/90-aurora-sep-root.conf.new /etc/dracut.conf.d/90-aurora-sep-root.conf
-    label /etc/dracut.conf.d/90-aurora-sep-root.conf
+      > "$dracut_conf_dir/90-aurora-sep-root.conf.new"
+    chmod 0644 "$dracut_conf_dir/90-aurora-sep-root.conf.new"
+    mv -f "$dracut_conf_dir/90-aurora-sep-root.conf.new" "$dracut_conf_dir/90-aurora-sep-root.conf"
+    label "$dracut_conf_dir/90-aurora-sep-root.conf"
   fi
-  if [[ -f /etc/mkinitcpio.conf ]]; then
-    install -d -m 0755 /etc/mkinitcpio.conf.d
+  if [[ -f $mkinitcpio_conf ]]; then
+    install -d -m 0755 "$mkinitcpio_conf.d"
     printf '%s\n' '# aurora-firstboot: the root is sealed by the Secure Enclave (aurora-sep-fde).' \
       'HOOKS+=(aurora-sep)' 'AURORA_SEP_PASSWORD_UNLOCK=yes' \
-      > /etc/mkinitcpio.conf.d/90-aurora-sep-root.conf.new
-    chmod 0644 /etc/mkinitcpio.conf.d/90-aurora-sep-root.conf.new
-    mv -f /etc/mkinitcpio.conf.d/90-aurora-sep-root.conf.new /etc/mkinitcpio.conf.d/90-aurora-sep-root.conf
+      > "$mkinitcpio_conf.d/90-aurora-sep-root.conf.new"
+    chmod 0644 "$mkinitcpio_conf.d/90-aurora-sep-root.conf.new"
+    mv -f "$mkinitcpio_conf.d/90-aurora-sep-root.conf.new" "$mkinitcpio_conf.d/90-aurora-sep-root.conf"
   fi
 }
 
