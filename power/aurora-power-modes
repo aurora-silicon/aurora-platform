@@ -1,0 +1,343 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+"""Power profile legs beyond the CPU budget, and Low Power Mode scheduling.
+
+macOS Low Power Mode is more than a CPU limit.  This daemon gives the desktop's
+power profiles (tuned-ppd or power-profiles-daemon) the system legs that Linux
+can drive from userspace, next to aurora-power-budget, which owns the CPU
+clocks:
+
+  rt_floor  kernel.sched_util_clamp_min_rt_default.  The kernel default (1024)
+            runs a CPU at its top clock whenever a realtime thread (threaded
+            IRQs, PipeWire's data loop) runs on it.  Power Saver sets 0.
+  aspm      the PCIe ASPM policy.  Power Saver uses powersupersave, so links
+            that support L1.1/L1.2 (Wi-Fi, Bluetooth, the SD reader) enter
+            them.
+  platform  every kernel platform-profile handler (/sys/class/platform-profile)
+            follows the profile: low-power, balanced, performance.  On Macs
+            with High Power mode the kernel's performance profile is what
+            tells the SMC to give the fans their full range.  The profile
+            daemons that already drive the class write the same value.
+
+Each leg records the value it found at start and puts that value back outside
+the profiles that change it, and when the daemon stops.  Nothing is written
+for a profile with no entry.
+
+It also implements macOS's "Low Power Mode" battery setting
+(low_power_mode = never | always | battery | adapter): when the power source
+starts to match, the profile is switched to power-saver; when it stops
+matching, the previous profile comes back, unless the user picked another
+profile in between.  The default is never, as on macOS.
+
+Configuration: /etc/aurora/power-modes.conf (see the README).
+"""
+
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG = '/etc/aurora/power-modes.conf'
+STATUS = '/run/aurora-power-modes/status.json'
+POWER_SUPPLY = '/sys/class/power_supply'
+PPD = (
+    ('org.freedesktop.UPower.PowerProfiles', '/org/freedesktop/UPower/PowerProfiles'),
+    ('net.hadess.PowerProfiles', '/net/hadess/PowerProfiles'),
+)
+PROFILES = ('power-saver', 'balanced', 'performance')
+SOURCE_PERIOD = 5.0     # seconds between power source checks
+LOW_POWER_MODES = ('never', 'always', 'battery', 'adapter')
+
+# Policy: the value of each leg per profile.  A profile without an entry gets
+# the value found at start.
+LEGS = {
+    'rt_floor': ('/proc/sys/kernel/sched_util_clamp_min_rt_default', {'power-saver': '0'}),
+    'aspm': ('/sys/module/pcie_aspm/parameters/policy', {'power-saver': 'powersupersave'}),
+}
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def load_config(path=CONFIG):
+    conf = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.split('#', 1)[0].strip()
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    conf[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return conf
+
+
+def current_value(path):
+    """The file's value; for a choice list ("a [b] c") the bracketed one."""
+    with open(path) as f:
+        raw = f.read().strip()
+    if '[' in raw and ']' in raw:
+        return raw[raw.index('[') + 1:raw.index(']')]
+    return raw
+
+
+class Leg:
+    def __init__(self, name, path, values):
+        self.name, self.path, self.values = name, path, dict(values)
+        self.baseline = None
+        self.applied = None
+
+    def start(self):
+        try:
+            self.baseline = current_value(self.path)
+        except OSError:
+            self.baseline = None
+        # Nothing has been written: outside the profiles that change it the leg stays as found.
+        self.applied = self.baseline
+        return self.baseline is not None
+
+    def want(self, profile):
+        return self.values.get(profile, self.baseline)
+
+    def apply(self, profile):
+        value = self.want(profile)
+        if value is None or value == self.applied:
+            return False
+        try:
+            with open(self.path, 'w') as f:
+                f.write(value)
+        except OSError as e:
+            log('%s: cannot write %s to %s: %s' % (self.name, value, self.path, e))
+            return False
+        self.applied = value
+        return True
+
+    def end(self):
+        if self.baseline is not None and self.applied not in (None, self.baseline):
+            try:
+                with open(self.path, 'w') as f:
+                    f.write(self.baseline)
+            except OSError:
+                pass
+        self.applied = None
+
+
+PLATFORM_PROFILE = '/sys/class/platform-profile'
+PLATFORM_NAMES = {'power-saver': 'low-power', 'balanced': 'balanced', 'performance': 'performance'}
+
+
+def platform_legs(root=PLATFORM_PROFILE):
+    """One leg per kernel platform-profile handler, with the choices it offers."""
+    out = []
+    try:
+        handlers = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for dev in handlers:
+        base = os.path.join(root, dev)
+        try:
+            with open(os.path.join(base, 'choices')) as f:
+                choices = f.read().split()
+            with open(os.path.join(base, 'name')) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        values = {p: v for p, v in PLATFORM_NAMES.items() if v in choices}
+        out.append(Leg('platform:%s' % name, os.path.join(base, 'profile'), values))
+    return out
+
+
+def legs_from_config(conf, legs=LEGS):
+    """The legs, with config overrides: <leg>.<profile> = value, <leg> = off."""
+    out = []
+    for name, (path, values) in legs.items():
+        if conf.get(name, '').lower() in ('off', 'no', '0', 'false'):
+            continue
+        values = dict(values)
+        for profile in PROFILES:
+            key = '%s.%s' % (name, profile)
+            if key in conf:
+                values[profile] = conf[key]
+        out.append(Leg(name, path, values))
+    if conf.get('platform', '').lower() not in ('off', 'no', '0', 'false'):
+        out.extend(platform_legs(conf.get('_platform_root', PLATFORM_PROFILE)))
+    return out
+
+
+def power_source(root=POWER_SUPPLY):
+    """'battery', 'adapter' or None (no battery: a desktop)."""
+    battery = mains = False
+    try:
+        supplies = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for name in supplies:
+        base = os.path.join(root, name)
+        try:
+            with open(os.path.join(base, 'type')) as f:
+                kind = f.read().strip()
+        except OSError:
+            continue
+        if kind == 'Battery':
+            try:
+                with open(os.path.join(base, 'scope')) as f:
+                    if f.read().strip() == 'Device':     # a mouse or keyboard
+                        continue
+            except OSError:
+                pass
+            battery = True
+        elif kind in ('Mains', 'USB', 'USB_PD', 'USB_C'):
+            try:
+                with open(os.path.join(base, 'online')) as f:
+                    mains = mains or f.read().strip() == '1'
+            except OSError:
+                pass
+    if not battery:
+        return None
+    return 'adapter' if mains else 'battery'
+
+
+def low_power_wanted(mode, source):
+    if mode == 'always':
+        return True
+    if mode in ('battery', 'adapter'):
+        return source == mode
+    return False
+
+
+class Scheduler:
+    """macOS's Low Power Mode setting on top of the profile daemon.
+
+    Acts only on changes of the wanted state, so a profile the user picks
+    while the condition holds is kept.
+    """
+
+    def __init__(self, mode):
+        self.mode = mode
+        self.wanted = None
+        self.previous = None    # profile to restore; None when we did not switch
+
+    def update(self, source, profile):
+        """Returns the profile to set, or None."""
+        if profile is None:     # the profile daemon is not up yet: decide later
+            return None
+        wanted = low_power_wanted(self.mode, source)
+        if wanted == self.wanted:
+            # The user moved off power-saver while we held it: let go.
+            if self.previous and profile != 'power-saver':
+                self.previous = None
+            return None
+        self.wanted = wanted
+        if wanted:
+            if profile and profile != 'power-saver':
+                self.previous = profile
+                return 'power-saver'
+            return None
+        restore, self.previous = self.previous, None
+        if restore and profile == 'power-saver':
+            return restore
+        return None
+
+
+def active_profile():
+    for name, path in PPD:
+        try:
+            out = subprocess.run(['busctl', '--system', 'get-property', name, path, name, 'ActiveProfile'],
+                                 capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.returncode == 0 and out.stdout.startswith('s '):
+            return out.stdout[2:].strip().strip('"')
+    return None
+
+
+def set_profile(profile):
+    for name, path in PPD:
+        try:
+            out = subprocess.run(['busctl', '--system', 'set-property', name, path, name,
+                                  'ActiveProfile', 's', profile],
+                                 capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.returncode == 0:
+            return True
+    return False
+
+
+def monitor():
+    args = ['busctl', '--system', 'monitor', '--json=short']
+    for _, path in PPD:
+        args.append("--match=type='signal',interface='org.freedesktop.DBus.Properties',"
+                    "member='PropertiesChanged',path='%s'" % path)
+    try:
+        return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
+def write_status(state):
+    try:
+        os.makedirs(os.path.dirname(STATUS), exist_ok=True)
+        tmp = STATUS + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(state, f)
+        os.replace(tmp, STATUS)
+    except OSError:
+        pass
+
+
+def main():
+    conf = load_config()
+    legs = [leg for leg in legs_from_config(conf) if leg.start()]
+    mode = conf.get('low_power_mode', 'never').lower()
+    if mode not in LOW_POWER_MODES:
+        log('low_power_mode %r unknown; using never' % mode)
+        mode = 'never'
+    sched = Scheduler(mode)
+    log('legs: %s; low_power_mode=%s' % (
+        ', '.join('%s (found %s)' % (leg.name, leg.baseline) for leg in legs) or 'none', mode))
+
+    def stop(*_):
+        for leg in legs:
+            leg.end()
+        write_status({'profile': None, 'legs': {}})
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    mon = monitor()
+    profile = active_profile()
+    source = power_source()
+    while True:
+        target = sched.update(source, profile)
+        if target and set_profile(target):
+            log('low_power_mode=%s, power source %s: profile %s -> %s' % (mode, source, profile, target))
+            profile = active_profile()
+        changed = [leg.name for leg in legs if profile in PROFILES and leg.apply(profile)]
+        if changed:
+            log('profile %s: %s' % (profile, ', '.join('%s=%s' % (leg.name, leg.applied) for leg in legs)))
+        write_status({'profile': profile, 'source': source, 'low_power_mode': mode,
+                      'legs': {leg.name: leg.applied for leg in legs},
+                      'restore': sched.previous})
+        ready = []
+        if mon and mon.stdout:
+            ready, _, _ = select.select([mon.stdout], [], [], SOURCE_PERIOD)
+        else:
+            time.sleep(SOURCE_PERIOD)
+        if ready:
+            line = mon.stdout.readline()
+            if not line:
+                mon.wait()
+                time.sleep(1)
+                mon = monitor()
+        profile = active_profile()
+        source = power_source()
+
+
+if __name__ == '__main__':
+    main()

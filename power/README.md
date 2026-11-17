@@ -103,14 +103,79 @@ twice, so the daemon writes nothing, logs
 Games that ask for Feral GameMode run on the P cores with the governor left
 at `schedutil`; see [GAMEMODE.md](GAMEMODE.md).
 
+## The other legs: `aurora-power-modes`
+
+`aurora-power-modes` runs next to the budget and gives each profile the parts
+of a power mode that are not CPU clocks. It follows the same D-Bus profile and
+writes only what a profile changes; every value it touches is read at start
+and put back outside those profiles and when the service stops.
+
+| Leg | Power Saver | Balanced | Performance |
+| --- | --- | --- | --- |
+| `rt_floor` (`kernel.sched_util_clamp_min_rt_default`) | 0: realtime threads (threaded IRQs, PipeWire) no longer run their CPU at its top clock | as found | as found |
+| `aspm` (PCIe ASPM policy) | `powersupersave`: Wi-Fi, Bluetooth and SD reader links use L1.1/L1.2 | as found | as found |
+| `platform` (every `/sys/class/platform-profile` handler) | `low-power` | `balanced` | `performance`: on Macs whose kernel knows High Power mode, this tells the SMC to give the fans their full range |
+
+The `platform` leg is there because tuned-ppd drives only the ACPI
+`platform_profile` file, which Apple device tree boots do not have.
+power-profiles-daemon writes the class itself; the daemon then writes the same
+value.
+
+### Low Power Mode on battery
+
+macOS lets the user run Low Power Mode never, always, only on battery or only
+on the power adapter. `/etc/aurora/power-modes.conf` has the same setting:
+
+```
+# never (default, as on macOS) | always | battery | adapter
+low_power_mode = battery
+# turn a leg off, or change its value for one profile
+# aspm = off
+# rt_floor.balanced = 0
+```
+
+When the power source starts to match, the profile switches to Power Saver;
+when it stops matching, the previous profile comes back, unless the user
+picked a profile in between. GNOME's own "Automatic Power Saver" (Power
+Saver at low battery, `power-saver-profile-on-low-battery`) is separate and
+stays on.
+
+### Measured (MacBook Pro 16-inch M4 Pro, Fedora 45, kernel 7.3.0-aurora-fleet75, AC)
+
+Same boot, SELinux enforcing, panel off. SMC `Total System Power`, 60 s idle
+rows; loads as in the budget results (perl counting threads) plus a GPU ALU
+row. "Stock" is tuned-ppd plus `aurora-power-budget`; "with modes" adds
+`aurora-power-modes`.
+
+| Row | Balanced | Power Saver, stock | Power Saver, with modes |
+| --- | ---: | ---: | ---: |
+| idle | 5.43 to 5.60 W | 5.10 W | 4.55 W |
+| 1 thread | 15.4 to 16.9 W | 9.47 W | 10.0 W |
+| 14 threads | 74.9 to 79.8 W | 21.4 W | 20.9 W |
+| GPU ALU | 37.9 W, 7516 GFLOPS | 37.5 W, 7516 GFLOPS | 37.1 W, 7518 GFLOPS |
+
+The two legs take another 0.55 W off Power Saver at idle (-11 %), so Power
+Saver idles 1 W (-19 %) under Balanced. Under load they change nothing. macOS
+Low Power Mode on the same Mac does not lower idle power. Leaving Power
+Saver put the values found at start back (`rt_floor` 1024, `aspm` default).
+
+The GPU row shows the leg that is still missing. On this Mac, macOS Low Power
+Mode lowers GPU power by a third (16.4 to 11.0 W on the same ALU load, -12.5 %
+throughput) and holds CPU plus GPU near 12 W. Linux has no GPU power control
+to drive yet.
+
 ## Not covered yet
 
 - **GPU and ANE.** macOS also lowers the GPU's power target in Low Power Mode.
   Linux has no qualified GPU power-limit interface yet (the absolute power
   request in the GPU driver is still being qualified), and none for the ANE.
-- **Display refresh and brightness.** Whether macOS drops to 60 Hz in Low
-  Power Mode is not established; brightness is left to the user.
-- **Fans.** The SMC keeps its own fan policy in every profile.
+- **Display refresh and brightness.** macOS Low Power Mode and High Power
+  Mode leave the panel's refresh range and brightness unchanged on the
+  MacBook Pro M4 Pro, so the profiles do not change them either.
+- **Fans.** The SMC keeps its own fan policy. Where the kernel sends macOS's
+  High Power mode record to the SMC (the performance profile), the SMC lets
+  the fans use their full range; the `platform` leg makes that reachable on
+  Fedora.
 - **Measured feedback.** The model is feed-forward. A one-second correction
   from the SMC package power sensor, and a kernel coordinator (DTPM or a
   platform-profile provider) that owns the CPU and GPU legs together, are the
