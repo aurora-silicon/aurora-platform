@@ -5,7 +5,7 @@ SYSCONFDIR ?= /etc
 LOCALSTATEDIR ?= /var
 SELINUX_DEVEL ?= /usr/share/selinux/devel/Makefile
 
-install: install-common install-dracut install-mkinitcpio install-power install-secboot install-secboot-mkinitcpio
+install: install-common install-dracut install-mkinitcpio install-power install-gamemode install-secboot install-secboot-mkinitcpio
 
 install-common:
 	install -Dm755 libexec/aurora-initrd-root $(DESTDIR)$(LIBDIR)/aurora/aurora-initrd-root
@@ -36,6 +36,12 @@ install-power:
 	install -Dm644 power/aurora-power-budget.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-power-budget.service
 	install -Dm644 power/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/README.md
 	install -Dm644 power/DESIGN.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/DESIGN.md
+
+# GameMode defaults (power/GAMEMODE.md): an administrator-level config that
+# GameMode merges over its shipped one. Packages ship it as a config file.
+install-gamemode:
+	install -Dm644 power/gamemode.ini $(DESTDIR)$(SYSCONFDIR)/gamemode.ini
+	install -Dm644 power/GAMEMODE.md $(DESTDIR)$(PREFIX)/share/doc/aurora-gamemode/GAMEMODE.md
 
 # The secure boot path: aurora-secboot, its kernel-install plugin, the
 # first-boot key adoption service and the default configuration (secboot/).
