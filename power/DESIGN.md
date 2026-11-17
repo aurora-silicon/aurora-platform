@@ -9,7 +9,7 @@ would take on Linux, in order, and how each step is measured.
 | Layer | macOS | Aurora Linux now |
 | --- | --- | --- |
 | Frequency choice | Performance controller picks each cluster's frequency from load and thread QoS, with feedback | `schedutil` on every Mac |
-| Placement | QoS classes steer work between E and P cores | Energy-aware scheduling: the scheduler uses the device tree energy model and the per-core capacities (M2: E 571, P 1024; `sched_energy_aware=1`) |
+| Placement | QoS classes steer work between E and P cores | Energy-aware scheduling: the scheduler uses the device tree energy model and the per-core capacities (M2: E 571, P 1024; `sched_energy_aware=1`); games under GameMode are pinned to the P cores ([GAMEMODE.md](GAMEMODE.md)) |
 | Thermal | Firmware and kernel limits on die temperature | PMP fast-die limit and thermal zones per board (step-wise / power allocator) |
 | Fabric and memory | Demand-driven fabric and memory floors | Apple CLPC driver sets fabric and memory floors from demand |
 | Low Power Mode | Short-window package budget split across CPU, GPU, ANE | `aurora-power-budget`: CPU budget split across clusters every 100 ms (this package) |

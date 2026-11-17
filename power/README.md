@@ -98,6 +98,11 @@ twice, so the daemon writes nothing, logs
 `kernel apple-clpc profile handler present; not capping`, and says so in
 `/run/aurora-power-budget/status.json`.
 
+## Games
+
+Games that ask for Feral GameMode run on the P cores with the governor left
+at `schedutil`; see [GAMEMODE.md](GAMEMODE.md).
+
 ## Not covered yet
 
 - **GPU and ANE.** macOS also lowers the GPU's power target in Low Power Mode.
