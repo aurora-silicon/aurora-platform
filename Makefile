@@ -34,6 +34,8 @@ install-common:
 install-power:
 	install -Dm755 power/aurora-power-budget $(DESTDIR)$(PREFIX)/libexec/aurora/aurora-power-budget
 	install -Dm644 power/aurora-power-budget.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-power-budget.service
+	install -Dm755 power/aurora-power-modes $(DESTDIR)$(PREFIX)/libexec/aurora/aurora-power-modes
+	install -Dm644 power/aurora-power-modes.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-power-modes.service
 	install -Dm644 power/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/README.md
 	install -Dm644 power/DESIGN.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/DESIGN.md
 

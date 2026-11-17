@@ -24,6 +24,11 @@ class SourceTests(unittest.TestCase):
             unit = (staged / 'usr/lib/systemd/system/aurora-power-budget.service').read_text()
             self.assertIn('ExecStart=/usr/libexec/aurora/aurora-power-budget', unit)
             self.assertNotIn('ProtectKernelTunables', unit)  # it writes cpufreq limits in /sys
+            modes = staged / 'usr/libexec/aurora/aurora-power-modes'
+            self.assertTrue(modes.is_file() and os.access(modes, os.X_OK))
+            unit = (staged / 'usr/lib/systemd/system/aurora-power-modes.service').read_text()
+            self.assertIn('ExecStart=/usr/libexec/aurora/aurora-power-modes', unit)
+            self.assertNotIn('ProtectKernelTunables', unit)  # it writes /proc/sys/kernel and /sys
             mapper = staged / 'usr/lib/aurora/initrd/aurora-root-mapper.conf'
             self.assertIn('JobRunningTimeoutSec=infinity', mapper.read_text())
             service = staged / 'usr/lib/aurora/initrd/aurora-initrd-root.service'

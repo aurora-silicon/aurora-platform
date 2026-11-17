@@ -103,6 +103,43 @@ twice, so the daemon writes nothing, logs
 Games that ask for Feral GameMode run on the P cores with the governor left
 at `schedutil`; see [GAMEMODE.md](GAMEMODE.md).
 
+## The other legs: `aurora-power-modes`
+
+`aurora-power-modes` runs next to the budget and gives each profile the parts
+of a power mode that are not CPU clocks. It follows the same D-Bus profile and
+writes only what a profile changes; every value it touches is read at start
+and put back outside those profiles and when the service stops.
+
+| Leg | Power Saver | Balanced | Performance |
+| --- | --- | --- | --- |
+| `rt_floor` (`kernel.sched_util_clamp_min_rt_default`) | 0: realtime threads (threaded IRQs, PipeWire) no longer run their CPU at its top clock | as found | as found |
+| `aspm` (PCIe ASPM policy) | `powersupersave`: Wi-Fi, Bluetooth and SD reader links use L1.1/L1.2 | as found | as found |
+| `platform` (every `/sys/class/platform-profile` handler) | `low-power` | `balanced` | `performance`: on Macs whose kernel knows High Power mode, this tells the SMC to give the fans their full range |
+
+The `platform` leg is there because tuned-ppd drives only the ACPI
+`platform_profile` file, which Apple device tree boots do not have.
+power-profiles-daemon writes the class itself; the daemon then writes the same
+value.
+
+### Low Power Mode on battery
+
+macOS lets the user run Low Power Mode never, always, only on battery or only
+on the power adapter. `/etc/aurora/power-modes.conf` has the same setting:
+
+```
+# never (default, as on macOS) | always | battery | adapter
+low_power_mode = battery
+# turn a leg off, or change its value for one profile
+# aspm = off
+# rt_floor.balanced = 0
+```
+
+When the power source starts to match, the profile switches to Power Saver;
+when it stops matching, the previous profile comes back, unless the user
+picked a profile in between. GNOME's own "Automatic Power Saver" (Power
+Saver at low battery, `power-saver-profile-on-low-battery`) is separate and
+stays on.
+
 ## Not covered yet
 
 - **GPU and ANE.** macOS also lowers the GPU's power target in Low Power Mode.
