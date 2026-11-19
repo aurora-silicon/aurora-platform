@@ -75,9 +75,12 @@ release_splash() {
 show_text_console() {
   [[ $console == /dev/tty[0-9]* && -c $console ]] || return 0
   exec 0<>"$console" 1>&0 2>&0
-  stty sane 2>/dev/null || true
-  ! command -v kbd_mode >/dev/null || kbd_mode -u 2>/dev/null || true
-  python3 - "$console" <<'PY' 2>/dev/null || true
+  # Setup goes on when one of these steps fails: the prompts are still read
+  # from the console. The journal says which step failed, which explains a
+  # console whose prompts are garbled or not drawn.
+  stty sane 2>/dev/null || log "stty sane failed on $console"
+  ! command -v kbd_mode >/dev/null || kbd_mode -u 2>/dev/null || log "kbd_mode -u failed on $console"
+  python3 -I - "$console" <<'PY' 2>/dev/null || log "KDSETMODE(KD_TEXT) failed on $console; the prompts may not be drawn"
 import fcntl, os, sys
 fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY)
 fcntl.ioctl(fd, 0x4B3A, 0)  # KDSETMODE, KD_TEXT
@@ -85,7 +88,7 @@ os.close(fd)
 PY
   # Clear whatever the splash or boot messages left on the console.
   printf '\033[H\033[2J'
-  ! command -v chvt >/dev/null || chvt "${console#/dev/tty}" 2>/dev/null || true
+  ! command -v chvt >/dev/null || chvt "${console#/dev/tty}" 2>/dev/null || log "chvt ${console#/dev/tty} failed"
 }
 
 # systemd status lines and kernel messages share this console with the
@@ -659,7 +662,10 @@ rekey_from_owner_password() {
   retire_declared_hooks
   # Rebuilding an initrd takes a while; it runs on its own, and again
   # whenever vconsole.conf changes (aurora-initrd-keymap.path).
-  [[ -e /etc/NIXOS ]] || systemctl start --no-block aurora-initrd-keymap.service 2>/dev/null || true
+  # NixOS rebuilds its initrd with the system. Elsewhere a unit that cannot
+  # be queued leaves the unlock prompt on the old keymap: say so.
+  [[ -e /etc/NIXOS ]] || systemctl start --no-block aurora-initrd-keymap.service ||
+    warn 'could not queue aurora-initrd-keymap.service; run "aurora-firstboot --sync-initrd-keymap" so the disk password prompt uses this keymap'
 }
 
 # Ask twice for the disk password: on the splash when it is up, otherwise on
