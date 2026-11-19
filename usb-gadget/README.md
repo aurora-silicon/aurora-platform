@@ -17,6 +17,11 @@ starts `aurora-usb-gadget@<controller>.service`. That service builds the
 gadget in configfs and binds it. At unplug the controller goes away, the
 service stops (`BindsTo=`) and the gadget is unbound.
 
+Use a USB 2 or USB 3 cable. A Thunderbolt or USB4 cable between two
+Thunderbolt-capable computers (two Macs, for example) gives Thunderbolt
+networking instead (`thunderbolt-net`), which is much faster. The USB gadget
+is for USB 2 and USB 3 cables and for hosts without Thunderbolt.
+
 ## Which Macs and ports
 
 The kernel decides this, not this package: `dwc3-apple` registers a device
@@ -28,6 +33,26 @@ and exits 0.
 Check a port by plugging in a host and running:
 
     aurora-usb-gadget status
+
+## When the other end is dual-role too
+
+If the other end can be a host or a device, as another Mac and many PCs can,
+the two port controllers settle who is host when the cable is attached. If
+the Mac ended up as the host, ask for a data role swap:
+
+    sudo aurora-usb-gadget role device
+
+This writes `device` to `/sys/class/typec/<port>/data_role`. The port
+controller then asks the far end to swap roles. If it agrees, the kernel moves
+the port's USB controller to device mode, a device controller appears, and the
+gadget starts as usual. `role host` swaps back.
+
+Without a port name, the command uses the only port that has something
+attached. If several do, it lists them and stops. Name a port by its Type-C
+name (`port0`) or by its connector label from the firmware, for example
+`sudo aurora-usb-gadget role device "USB-C Left Back"`. The command prints
+the data role before and after, and exits non-zero if the role has not
+changed after 5 seconds (for example, because the far end refused).
 
 ## Using it from the host
 
@@ -121,12 +146,13 @@ first port that gets a host. Unplugging that port moves it to the next one.
     aurora-usb-gadget down [UDC]        without UDC: unbind and remove it
     aurora-usb-gadget status
     aurora-usb-gadget console enable|disable
+    aurora-usb-gadget role device|host [PORT]   USB-C data role swap
 
 ## Testing
 
 `tests/test_usb_gadget.py` runs the script against a fake configfs and sysfs
 tree (`AURORA_GADGET_CONFIGFS`, `AURORA_GADGET_SYSFS`, `AURORA_GADGET_RUN`,
-`AURORA_GADGET_CONF`, `AURORA_GADGET_MACHINE_ID`) with stand-in `nmcli`,
+`AURORA_GADGET_CONF`, `AURORA_GADGET_MACHINE_ID`, `AURORA_GADGET_ROLE_WAIT`) with stand-in `nmcli`,
 `networkctl`, `systemctl`, `ip` and `modprobe`. The script was also run
 against the real configfs with the kernel's `dummy_hcd` virtual controller,
 including the udev and systemd hotplug path.

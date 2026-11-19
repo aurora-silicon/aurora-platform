@@ -334,6 +334,87 @@ class UsbGadget(unittest.TestCase):
         self.assertEqual(self.run_gadget('--help').returncode, 0)
 
 
+class DataRole(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sysfs = Path(self.tmp.name) / 'sys'
+        (self.sysfs / 'class/typec').mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def port(self, name, role='[host] device', partner=False, label=None):
+        d = self.sysfs / 'class/typec' / name
+        d.mkdir()
+        (d / 'data_role').write_text(role + '\n')
+        if partner:
+            (self.sysfs / 'class/typec' / f'{name}-partner').mkdir()
+        if label:
+            node = d / 'device/of_node/connector'
+            node.mkdir(parents=True)
+            (node / 'label').write_bytes(label.encode() + b'\0')
+        return d / 'data_role'
+
+    def role(self, *args, wait='0.3'):
+        env = dict(os.environ, AURORA_GADGET_SYSFS=str(self.sysfs), AURORA_GADGET_ROLE_WAIT=wait,
+                   AURORA_GADGET_CONF=str(Path(self.tmp.name) / 'none.conf'))
+        return subprocess.run(['bash', str(SCRIPT), 'role', *args], env=env,
+                              capture_output=True, text=True, timeout=20)
+
+    def test_swap_on_the_only_port_with_a_partner(self):
+        self.port('port0')
+        attr = self.port('port1', partner=True, label='USB-C Left Back')
+        r = self.role('device')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(attr.read_text(), 'device\n')
+        self.assertIn('port1 (USB-C Left Back): data role host', r.stdout)
+        self.assertIn('port1 (USB-C Left Back): data role device', r.stdout)
+
+    def test_port_by_name_or_label(self):
+        a = self.port('port0', partner=True, label='USB-C Right')
+        b = self.port('port1', partner=True, label='USB-C Left Back')
+        self.assertEqual(self.role('device', 'USB-C Left Back').returncode, 0)
+        self.assertEqual(b.read_text(), 'device\n')
+        self.assertEqual(self.role('device', 'port0').returncode, 0)
+        self.assertEqual(a.read_text(), 'device\n')
+        r = self.role('device', 'port7')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('no USB-C port port7', r.stdout)
+
+    def test_ambiguous_or_no_partner(self):
+        self.port('port0', partner=True, label='USB-C Right')
+        self.port('port1', partner=True)
+        r = self.role('host')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('port0 (USB-C Right)', r.stdout)
+        self.assertIn('  port1', r.stdout)
+        shutil.rmtree(self.sysfs / 'class/typec/port0-partner')
+        shutil.rmtree(self.sysfs / 'class/typec/port1-partner')
+        r = self.role('host')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('no USB-C port has anything attached', r.stdout)
+
+    def test_already_in_role(self):
+        attr = self.port('port0', role='host [device]', partner=True)
+        r = self.role('device')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(attr.read_text(), 'host [device]\n')
+
+    def test_role_did_not_change(self):
+        d = self.sysfs / 'class/typec/port0'
+        d.mkdir()
+        (self.sysfs / 'class/typec/port0-partner').mkdir()
+        # Writes vanish and the role reads back unchanged, as when the
+        # partner refuses the swap.
+        (d / 'data_role').symlink_to('/dev/null')
+        r = self.role('device', wait='0.2')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('did not change to device', r.stdout)
+
+    def test_bad_arguments(self):
+        self.assertEqual(self.role('sideways').returncode, 2)
+
+
 class Integration(unittest.TestCase):
     def test_udev_rule_starts_the_service_per_controller(self):
         text = RULES.read_text()

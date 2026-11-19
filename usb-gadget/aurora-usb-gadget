@@ -15,6 +15,10 @@
 #                                     interface and addresses.
 #   aurora-usb-gadget console enable|disable
 #                                     a login prompt on the serial port.
+#   aurora-usb-gadget role device|host [PORT]
+#                                     ask the USB-C port controller for a
+#                                     data role swap, for when the other end
+#                                     is dual-role too and became the device.
 #
 # No configfs, no USB device controller, or ENABLED=no: nothing happens and
 # the exit status is 0.
@@ -26,6 +30,7 @@ RUN=${AURORA_GADGET_RUN:-/run}
 CONF=${AURORA_GADGET_CONF:-/etc/aurora/usb-gadget.conf}
 MACHINE_ID=${AURORA_GADGET_MACHINE_ID:-/etc/machine-id}
 WAIT=${AURORA_GADGET_WAIT:-5}   # seconds to wait for the network interface after binding
+ROLE_WAIT=${AURORA_GADGET_ROLE_WAIT:-5}   # seconds to wait for a data role swap
 
 NAME=aurora
 G=$CONFIGFS/usb_gadget/$NAME
@@ -456,9 +461,101 @@ cmd_console() {
   log "login prompt on the USB serial port: ${1}d"
 }
 
+# --- USB-C data role -----------------------------------------------------
+
+# The selected value of a Type-C role attribute: "[host] device" -> host.
+current_role() {
+  local v
+  [[ -e $1 ]] || return 1
+  v=$(get "$1")
+  if [[ $v == *\[*\]* ]]; then
+    v=${v#*\[}
+    v=${v%%\]*}
+  fi
+  printf '%s' "$v"
+}
+
+# The connector's label from the firmware ("USB-C Left Back"), if any.
+port_label() {
+  local f
+  for f in "$1/device/of_node/connector/label" "$1/device/of_node/label" \
+           "$1/of_node/label" "$1/firmware_node/label" "$1/device/firmware_node/label"; do
+    [[ -r $f ]] && { tr -d '\0' < "$f"; return 0; }
+  done
+  return 1
+}
+
+typec_ports() {   # port names; only those with a partner attached when asked
+  local p n
+  for p in "$SYSFS"/class/typec/port[0-9]*; do
+    n=${p##*/}
+    [[ $n == *-* ]] && continue
+    [[ -e $p ]] || continue
+    if [[ ${1:-} == partner ]]; then
+      [[ -e $SYSFS/class/typec/$n-partner ]] || continue
+    fi
+    echo "$n"
+  done
+}
+
+describe_port() {
+  local label
+  label=$(port_label "$SYSFS/class/typec/$1") && echo "$1 ($label)" || echo "$1"
+}
+
+cmd_role() {
+  local want=${1:-} sel=${2:-} port='' p label='' before='' now='' tries=0
+  case $want in
+    device|host) ;;
+    *) usage >&2; return 2 ;;
+  esac
+  if [[ -n $sel ]]; then
+    for p in $(typec_ports); do
+      label=$(port_label "$SYSFS/class/typec/$p") || label=
+      if [[ $p == "$sel" || ( -n $label && $label == "$sel" ) ]]; then
+        port=$p
+        break
+      fi
+    done
+    [[ -n $port ]] || { log "no USB-C port $sel"; return 1; }
+  else
+    mapfile -t p < <(typec_ports partner)
+    if (( ${#p[@]} != 1 )); then
+      if (( ${#p[@]} == 0 )); then
+        log "no USB-C port has anything attached"
+      else
+        log "more than one USB-C port has something attached; name one:"
+        for port in "${p[@]}"; do echo "  $(describe_port "$port")"; done
+      fi
+      return 1
+    fi
+    port=${p[0]}
+  fi
+  local attr=$SYSFS/class/typec/$port/data_role
+  before=$(current_role "$attr") || { log "$port has no data role"; return 1; }
+  echo "$(describe_port "$port"): data role $before"
+  [[ $before == "$want" ]] && return 0
+  if ! { printf '%s\n' "$want" > "$attr"; } 2>/dev/null; then
+    log "the port controller refused a swap to $want"
+    return 1
+  fi
+  # The role changes when the port controller reports the swap; poll for
+  # at most ROLE_WAIT seconds, in tenths.
+  tries=$(awk -v w="$ROLE_WAIT" 'BEGIN { print int(w * 10) }')
+  while :; do
+    now=$(current_role "$attr")
+    [[ $now == "$want" ]] && break
+    (( tries-- > 0 )) || break
+    sleep 0.1
+  done
+  echo "$(describe_port "$port"): data role ${now:-unknown}"
+  [[ $now == "$want" ]] || { log "data role did not change to $want"; return 1; }
+}
+
 usage() {
   cat <<EOF
 usage: aurora-usb-gadget up [UDC] | down [UDC] | status | console enable|disable
+       aurora-usb-gadget role device|host [PORT]
 Configuration: $CONF
 EOF
 }
@@ -469,6 +566,7 @@ case ${1:-} in
   down) cmd_down "${2:-}"; exit 0 ;;
   status) cmd_status; exit 0 ;;
   console) cmd_console "${2:-}"; exit ;;
+  role) cmd_role "${2:-}" "${3:-}"; exit ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
