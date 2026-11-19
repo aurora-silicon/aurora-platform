@@ -1,0 +1,18 @@
+[Unit]
+Description=USB device mode: network and serial port for the USB host on %I
+Documentation=https://github.com/aurora-silicon/aurora-platform/blob/main/usb-gadget/README.md
+# Started by 86-aurora-usb-gadget.rules for each USB device controller.
+BindsTo=sys-subsystem-udc-devices-%i.device
+After=sys-subsystem-udc-devices-%i.device sys-kernel-config.mount
+After=NetworkManager.service systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/aurora-usb-gadget up %I
+ExecStop=/usr/bin/aurora-usb-gadget down %I
+TimeoutSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
