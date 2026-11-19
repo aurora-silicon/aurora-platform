@@ -30,8 +30,10 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+# The kernel scans the partition table while losetup attaches the image, and
+# devtmpfs creates each partition node before that returns, so the checks
+# below need nothing from udev. Nothing here uses /dev/disk links.
 loop=$(losetup --find --show --partscan --sector-size 4096 "$image")
-udevadm settle
 [[ $(lsblk -dnro TYPE "$loop") == loop ]]
 [[ $(lsblk -nro TYPE "$loop" | grep -c '^part$') == 3 ]]
 for number in 1 2 3; do [[ -b ${loop}p$number ]]; done
