@@ -45,6 +45,25 @@ ESP_UUID=$(blkid -c /dev/null -s UUID -o value "$ESP_DEVICE")
 
 omarchy_mac_encrypt_say() { printf 'aurora-root: %s\n' "$*"; }
 
+# BEGIN Aurora LUKS2 header geometry
+# The converter formats with cryptsetup's default 16 KiB LUKS2 metadata area.
+# That holds about three Secure Enclave password tokens and the recovery key's
+# offline keyslot, too few for a Mac with several users. Format with 256 KiB
+# metadata instead: the data offset stays at 16 MiB (inside the converter's
+# 32 MiB reduction), only the keyslot area gives up 480 KiB. The header size
+# is fixed at format time, so it is decided here for every install, also on
+# Macs that start with a plain password, so a later Secure Enclave enrolment
+# never needs a re-encryption.
+AURORA_LUKS2_METADATA_SIZE=${AURORA_LUKS2_METADATA_SIZE:-256k}
+cryptsetup() {
+  if [[ ${1:-} == reencrypt && ${2:-} == --encrypt ]]; then
+    command cryptsetup reencrypt --encrypt --luks2-metadata-size "$AURORA_LUKS2_METADATA_SIZE" "${@:3}"
+  else
+    command cryptsetup "$@"
+  fi
+}
+# END Aurora LUKS2 header geometry
+
 # BEGIN Aurora splash presentation
 # Aurora's splash shows only the conversion, so the bar and the message span
 # 0-100% of the encryption pass. Themes that ignore system-update progress,
@@ -197,6 +216,51 @@ aurora_verify_opened_root() {
     omarchy_mac_encrypt_fail 'The opened root UUID differs from this image'
 }
 
+# The recovery key opens its keyslot as written (XXXX-XXXX-...). Accept it
+# typed in lower case, without dashes or with spaces, as aurora-sep-fde does.
+aurora_recovery_form() {
+  local plain i
+  plain=$(printf '%s' "$1" | tr -d ' \t-' | tr '[:lower:]' '[:upper:]')
+  [[ $plain =~ ^[ABCDEFGHJKLMNPQRSTUVWXYZ2-9]{24}$ ]] || return 1
+  AURORA_RECOVERY_FORM=${plain:0:4}
+  for i in 4 8 12 16 20; do AURORA_RECOVERY_FORM+=-${plain:i:4}; done
+  [[ $AURORA_RECOVERY_FORM != "$1" ]]
+}
+
+# A root sealed by the Secure Enclave (aurora-sep-fde, the FileVault model)
+# carries aurora-sep tokens in its LUKS2 header. systemd-cryptsetup opens it:
+# it asks for the password on the splash, the token plugin has the enclave
+# check it (the enclave counts wrong ones), and when the enclave cannot
+# answer it asks for a passphrase, which the recovery key's offline keyslot
+# accepts.
+aurora_sep_sealed() {
+  command cryptsetup luksDump "$ROOT_DEV" 2>/dev/null | grep -Eq '^[[:space:]]+[0-9]+: aurora-sep$'
+}
+
+aurora_systemd_cryptsetup() {
+  local candidate
+  for candidate in ${AURORA_SYSTEMD_CRYPTSETUP:-} /usr/lib/systemd/systemd-cryptsetup \
+    /lib/systemd/systemd-cryptsetup /usr/bin/systemd-cryptsetup; do
+    [[ -x $candidate ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+aurora_sep_open() {
+  local tool
+  tool=$(aurora_systemd_cryptsetup) ||
+    omarchy_mac_encrypt_fail 'systemd-cryptsetup is missing from this initrd; it is needed to unlock a Secure Enclave root'
+  # tries=0: ask again after every wrong password, as the Mac does; the
+  # enclave enforces the delays. The key store can take most of a minute to
+  # come up after boot; the token plugin waits that long before it gives up
+  # and the passphrase prompt appears.
+  AURORA_SEP_WAIT=${AURORA_SEP_WAIT:-90} "$tool" attach root "$ROOT_DEV" - luks,tries=0 ||
+    omarchy_mac_encrypt_fail 'The disk password did not unlock this installation'
+  udevadm settle
+  aurora_verify_opened_root
+  omarchy_mac_encrypt_point_sysroot
+}
+
 omarchy_mac_encrypt_open_continue() {
   if [[ $STATE_PHASE == encrypted ]]; then
     omarchy_mac_encrypt_require_key
@@ -214,9 +278,15 @@ omarchy_mac_encrypt_open_continue() {
       return
     fi
   fi
+  if aurora_sep_sealed; then
+    aurora_sep_open
+    return
+  fi
   for attempt in 1 2 3; do
     answer=$(systemd-ask-password --timeout=0 --id=aurora-root 'Unlock Aurora root:') || return 1
-    if printf '%s' "$answer" | cryptsetup open --key-file=- "$ROOT_DEV" root; then
+    if printf '%s' "$answer" | cryptsetup open --key-file=- "$ROOT_DEV" root ||
+       { aurora_recovery_form "$answer" && printf '%s' "$AURORA_RECOVERY_FORM" | cryptsetup open --key-file=- "$ROOT_DEV" root; }; then
+      unset AURORA_RECOVERY_FORM
       unset answer
       udevadm settle
       aurora_verify_opened_root

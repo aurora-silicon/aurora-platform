@@ -141,7 +141,7 @@ class KeyboardTests(unittest.TestCase):
                       (ROOT / 'systemd/aurora-initrd-root.service').read_text())
         rekey = between('rekey_from_owner_password() {', '# Ask twice for the disk password')
         # The keyboard is checked before the password is enrolled.
-        self.assertLess(rekey.index('follow_desktop_keyboard'), rekey.index('protect_disk "$password"'))
+        self.assertLess(rekey.index('follow_desktop_keyboard'), rekey.index('protect_disk_for "$user" "$password"'))
         with tempfile.TemporaryDirectory() as temporary:
             subprocess.run(['make', '-s', 'install-common', 'DESTDIR=' + temporary], cwd=ROOT, check=True)
             units = Path(temporary) / 'usr/lib/systemd/system'
