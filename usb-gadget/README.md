@@ -162,7 +162,7 @@ first port that gets a host. Unplugging that port moves it to the next one.
 
 `tests/test_usb_gadget.py` runs the script against a fake configfs and sysfs
 tree (`AURORA_GADGET_CONFIGFS`, `AURORA_GADGET_SYSFS`, `AURORA_GADGET_RUN`,
-`AURORA_GADGET_CONF`, `AURORA_GADGET_MACHINE_ID`, `AURORA_GADGET_ROLE_WAIT`) with stand-in `nmcli`,
+`AURORA_GADGET_CONF`, `AURORA_GADGET_MACHINE_ID`) with stand-in `nmcli`,
 `networkctl`, `systemctl`, `ip` and `modprobe`. The script was also run
 against the real configfs with the kernel's `dummy_hcd` virtual controller,
 including the udev and systemd hotplug path.

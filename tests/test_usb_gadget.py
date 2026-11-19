@@ -59,7 +59,6 @@ class UsbGadget(unittest.TestCase):
                    AURORA_GADGET_RUN=str(self.run_dir),
                    AURORA_GADGET_CONF=str(self.conf),
                    AURORA_GADGET_MACHINE_ID=str(self.machine_id),
-                   AURORA_GADGET_WAIT='0',
                    STUB_LOG=str(self.log))
         return subprocess.run(['bash', str(SCRIPT), *args], env=env,
                               capture_output=True, text=True, timeout=20)
@@ -372,8 +371,8 @@ class DataRole(unittest.TestCase):
             (node / 'label').write_bytes(label.encode() + b'\0')
         return d / 'data_role'
 
-    def role(self, *args, wait='0.3'):
-        env = dict(os.environ, AURORA_GADGET_SYSFS=str(self.sysfs), AURORA_GADGET_ROLE_WAIT=wait,
+    def role(self, *args):
+        env = dict(os.environ, AURORA_GADGET_SYSFS=str(self.sysfs),
                    AURORA_GADGET_CONF=str(Path(self.tmp.name) / 'none.conf'))
         return subprocess.run(['bash', str(SCRIPT), 'role', *args], env=env,
                               capture_output=True, text=True, timeout=20)
@@ -424,7 +423,7 @@ class DataRole(unittest.TestCase):
         # Writes vanish and the role reads back unchanged, as when the
         # partner refuses the swap.
         (d / 'data_role').symlink_to('/dev/null')
-        r = self.role('device', wait='0.2')
+        r = self.role('device')
         self.assertEqual(r.returncode, 1)
         self.assertIn('did not change to device', r.stdout)
 

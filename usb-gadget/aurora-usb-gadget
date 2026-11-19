@@ -29,8 +29,6 @@ SYSFS=${AURORA_GADGET_SYSFS:-/sys}
 RUN=${AURORA_GADGET_RUN:-/run}
 CONF=${AURORA_GADGET_CONF:-/etc/aurora/usb-gadget.conf}
 MACHINE_ID=${AURORA_GADGET_MACHINE_ID:-/etc/machine-id}
-WAIT=${AURORA_GADGET_WAIT:-5}   # seconds to wait for the network interface after binding
-ROLE_WAIT=${AURORA_GADGET_ROLE_WAIT:-5}   # seconds to wait for a data role swap
 
 NAME=aurora
 G=$CONFIGFS/usb_gadget/$NAME
@@ -315,13 +313,13 @@ remove_network() {
 # up, and a NetworkManager that does not manage the interface (yet) leaves it
 # down; NetworkManager or systemd-networkd then configure the up link.
 # Without either, the kernel still gives it an IPv6 link-local address.
+# Nothing to wait for: configfs binds the gadget before the write to UDC
+# returns (or fails it when the controller is busy), and f_ncm registers its
+# interface in that bind, so the name is final here.
 link_up() {
-  local n deadline=$((SECONDS + WAIT))
+  local n
   has_function ncm || return 0
-  until n=$(ifname); do
-    (( SECONDS < deadline )) || { log "network interface not registered"; return 0; }
-    sleep 0.2
-  done
+  n=$(ifname) || { log "network interface not registered"; return 0; }
   command -v ip >/dev/null && ip link set dev "$n" up 2>/dev/null
   log "network interface $n"
 }
@@ -506,7 +504,7 @@ describe_port() {
 }
 
 cmd_role() {
-  local want=${1:-} sel=${2:-} port='' p label='' before='' now='' tries=0
+  local want=${1:-} sel=${2:-} port='' p label='' before='' now=''
   case $want in
     device|host) ;;
     *) usage >&2; return 2 ;;
@@ -541,15 +539,10 @@ cmd_role() {
     log "the port controller refused a swap to $want"
     return 1
   fi
-  # The role changes when the port controller reports the swap; poll for
-  # at most ROLE_WAIT seconds, in tenths.
-  tries=$(awk -v w="$ROLE_WAIT" 'BEGIN { print int(w * 10) }')
-  while :; do
-    now=$(current_role "$attr")
-    [[ $now == "$want" ]] && break
-    (( tries-- > 0 )) || break
-    sleep 0.1
-  done
+  # The write returns once the port controller has done the swap: the
+  # Type-C class waits for the driver's dr_set, which runs the swap command
+  # and reads the new role back before it reports success.
+  now=$(current_role "$attr")
   echo "$(describe_port "$port"): data role ${now:-unknown}"
   [[ $now == "$want" ]] || { log "data role did not change to $want"; return 1; }
 }
