@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import socket
 import tempfile
 import unittest
 
@@ -123,6 +124,38 @@ class Source(unittest.TestCase):
             self.assertEqual(pm.power_source(str(root)), 'battery')
             (root / 'macsmc-ac' / 'online').write_text('1\n')
             self.assertEqual(pm.power_source(str(root)), 'adapter')
+
+
+class SourceEvents(unittest.TestCase):
+    AC = (b'change@/devices/platform/soc/23e400000.smc/macsmc-power/power_supply/macsmc-ac\0'
+          b'ACTION=change\0DEVPATH=/devices/platform/soc/23e400000.smc/macsmc-power/power_supply/macsmc-ac\0'
+          b'SUBSYSTEM=power_supply\0POWER_SUPPLY_NAME=macsmc-ac\0POWER_SUPPLY_TYPE=Mains\0'
+          b'POWER_SUPPLY_ONLINE=0\0SEQNUM=4242\0')
+    USB = (b'add@/devices/platform/usb-drd1/xhci-hcd.1.auto/usb3/3-1\0ACTION=add\0'
+           b'DEVPATH=/devices/platform/usb-drd1/xhci-hcd.1.auto/usb3/3-1\0SUBSYSTEM=usb\0SEQNUM=4243\0')
+
+    def test_only_power_supply_events_count(self):
+        self.assertTrue(pm.is_power_supply_event(self.AC))
+        self.assertFalse(pm.is_power_supply_event(self.USB))
+        self.assertFalse(pm.is_power_supply_event(b'change@/x\0SUBSYSTEM=power_supply_x\0'))
+
+    def test_drain_reads_every_queued_event(self):
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        with a, b:
+            b.setblocking(False)
+            self.assertFalse(pm.drain_power_supply_events(b))
+            a.send(self.USB)
+            self.assertFalse(pm.drain_power_supply_events(b))
+            a.send(self.USB)
+            a.send(self.AC)
+            a.send(self.USB)
+            self.assertTrue(pm.drain_power_supply_events(b))
+            self.assertFalse(pm.drain_power_supply_events(b))
+
+    def test_the_kernel_uevent_socket_opens_unprivileged(self):
+        sock = pm.uevents()
+        self.assertIsNotNone(sock)
+        sock.close()
 
 
 class Schedule(unittest.TestCase):

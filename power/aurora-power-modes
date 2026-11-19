@@ -36,6 +36,7 @@ import json
 import os
 import select
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -48,7 +49,9 @@ PPD = (
     ('net.hadess.PowerProfiles', '/net/hadess/PowerProfiles'),
 )
 PROFILES = ('power-saver', 'balanced', 'performance')
-SOURCE_PERIOD = 5.0     # seconds between power source checks
+SOURCE_PERIOD = 5.0     # seconds between power source checks, only without uevents
+NETLINK_KOBJECT_UEVENT = 15
+UEVENT_KERNEL_GROUP = 1  # the kernel's own uevents, before udev
 LOW_POWER_MODES = ('never', 'always', 'battery', 'adapter')
 
 # Policy: the value of each leg per profile.  A profile without an entry gets
@@ -270,14 +273,54 @@ def set_profile(profile):
 
 
 def monitor():
+    """busctl printing a line for each profile change and each time a profile
+    daemon starts or stops, so a daemon that starts after us is noticed."""
     args = ['busctl', '--system', 'monitor', '--json=short']
-    for _, path in PPD:
+    for name, path in PPD:
         args.append("--match=type='signal',interface='org.freedesktop.DBus.Properties',"
                     "member='PropertiesChanged',path='%s'" % path)
+        args.append("--match=type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
+                    "member='NameOwnerChanged',arg0='%s'" % name)
     try:
         return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
         return None
+
+
+def uevents():
+    """A socket that receives the kernel's uevents, or None.
+
+    power_supply_changed() sends one for the adapter and the battery whenever
+    the charger or a USB-C power source comes or goes, so the power source is
+    read again on those events instead of on a timer.
+    """
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC,
+                             NETLINK_KOBJECT_UEVENT)
+        sock.bind((0, UEVENT_KERNEL_GROUP))
+    except OSError as e:
+        log('no kernel uevents (%s): checking the power source every %.0f s' % (e, SOURCE_PERIOD))
+        return None
+    sock.setblocking(False)
+    return sock
+
+
+def is_power_supply_event(data):
+    """Whether a kernel uevent (ACTION@DEVPATH, then KEY=VALUE fields) is a power supply's."""
+    return b'\0SUBSYSTEM=power_supply\0' in data + b'\0'
+
+
+def drain_power_supply_events(sock):
+    """Read every queued uevent; True when one of them is a power supply's."""
+    found = False
+    while True:
+        try:
+            data = sock.recv(16384)
+        except BlockingIOError:
+            return found
+        except OSError:     # ENOBUFS: events were dropped; read the source again
+            return True
+        found = found or is_power_supply_event(data)
 
 
 def write_status(state):
@@ -311,6 +354,9 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     mon = monitor()
+    # Only these modes follow the power source.
+    follow_source = mode in ('battery', 'adapter')
+    events = uevents() if follow_source else None
     profile = active_profile()
     source = power_source()
     while True:
@@ -324,19 +370,27 @@ def main():
         write_status({'profile': profile, 'source': source, 'low_power_mode': mode,
                       'legs': {leg.name: leg.applied for leg in legs},
                       'restore': sched.previous})
-        ready = []
-        if mon and mon.stdout:
-            ready, _, _ = select.select([mon.stdout], [], [], SOURCE_PERIOD)
-        else:
-            time.sleep(SOURCE_PERIOD)
-        if ready:
+        # Wait for a profile change on D-Bus or a power supply uevent. Only
+        # when busctl, or the uevent socket a mode needs, is missing are the
+        # two read on a timer.
+        watched = [f for f in (mon.stdout if mon else None, events) if f is not None]
+        polling = mon is None or (follow_source and events is None)
+        timeout = SOURCE_PERIOD if polling else None
+        ready, _, _ = select.select(watched, [], [], timeout)
+        if not ready:
+            profile = active_profile()
+            source = power_source()
+            continue
+        if mon and mon.stdout in ready:
             line = mon.stdout.readline()
-            if not line:
+            if not line:    # busctl exited (bus restart): reap it and start another
                 mon.wait()
+                # Rate limit: while the bus is down a new busctl exits at once.
                 time.sleep(1)
                 mon = monitor()
-        profile = active_profile()
-        source = power_source()
+            profile = active_profile()
+        if events in ready and drain_power_supply_events(events):
+            source = power_source()
 
 
 if __name__ == '__main__':
