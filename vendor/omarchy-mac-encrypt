@@ -596,7 +596,14 @@ omarchy_mac_encrypt_open() {
         omarchy_mac_encrypt_fail "/dev/mapper/root already exists; refusing to replace it"
     fi
     udevadm settle 2>/dev/null || true
-    cryptsetup open --batch-mode --key-file "$BOOT_KEY" --keyfile-size "$KEY_BYTES" \
+    # Pass discards to the SSD, as Fedora's installer does for new LUKS
+    # volumes. The first open after conversion also stores the flag in the
+    # LUKS2 header, so sd-encrypt and a plain cryptsetup open keep it; later
+    # opens skip --persistent, which rewrites the header on every use.
+    local persistent=()
+    [[ ${STATE_PHASE:-} != encrypted ]] || persistent=(--persistent)
+    cryptsetup open --batch-mode --allow-discards "${persistent[@]}" \
+        --key-file "$BOOT_KEY" --keyfile-size "$KEY_BYTES" \
         "$ROOT_DEV" root || { omarchy_mac_encrypt_say "could not open LUKS root with the throwaway key"; return 1; }
     udevadm settle 2>/dev/null || true
 }
@@ -738,7 +745,7 @@ omarchy_mac_encrypt_finish() {
 
     # The initrd cannot read /boot; rd.luks.key= on the cmdline supplies the key
     # until the owner's re-key removes it, then sd-encrypt prompts.
-    printf 'root UUID=%s none luks\n' "$uuid" >"$ROOT_MNT/etc/crypttab"
+    printf 'root UUID=%s none luks,discard\n' "$uuid" >"$ROOT_MNT/etc/crypttab"
     chmod 0644 "$ROOT_MNT/etc/crypttab"
 
     # A Limine Mac's command line is derived from GRUB's defaults file too.
