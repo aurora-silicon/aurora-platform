@@ -164,6 +164,64 @@ Mode lowers GPU power by a third (16.4 to 11.0 W on the same ALU load, -12.5 %
 throughput) and holds CPU plus GPU near 12 W. Linux has no GPU power control
 to drive yet.
 
+## Charge to Full Now: `aurora-charge-full-now`
+
+macOS offers "Charge to Full Now" in the battery menu while its charge limit
+holds the battery below full: the battery charges to 100 % once, then the
+limit applies again. On Linux the limit belongs to UPower 1.91: GNOME
+Settings > Power > Preserve Battery Health calls the battery's
+`EnableChargeThreshold` method, UPower writes `charge_control_*_threshold`
+(on Apple silicon `macsmc-battery`, 80 % from the udev `CHARGE_LIMIT`) and
+keeps the on/off state in `/var/lib/upower/charging-threshold-status`.
+
+```
+aurora-charge-full-now start           # charge to 100 % once
+aurora-charge-full-now cancel          # stop now; the limit is back on
+aurora-charge-full-now status [--json]
+```
+
+`start` asks systemd for `aurora-charge-full-now.service`. The polkit rule
+`50-aurora-charge-full-now.rules` lets the active local user start and stop
+that one unit without a password, as UPower's own
+`org.freedesktop.UPower.enable-charging-limit` action does
+(`allow_active=yes`); anyone else is asked for an administrator password.
+
+The service lifts the limit only through UPower, so GNOME always shows what
+the battery does (Settings shows "Maximize Charge" during the one-shot):
+
+1. It writes `/var/lib/aurora/charge-full-now/active`, then calls
+   `EnableChargeThreshold(false)`.
+2. It waits on D-Bus signals, not a timer: UPower's `PropertiesChanged` on the
+   battery and on UPower itself (`OnBattery`), UPower restarts, and logind's
+   `PrepareForSleep`, so a resume from s2idle is seen at once.
+3. It ends when the battery is full (`State` fully-charged or 100 %), when the
+   adapter goes away (macOS keeps the request until full; here a one-shot
+   never outlives the charge session it was asked for), on `cancel`, or after
+   12 hours counted on `CLOCK_BOOTTIME`, so time in suspend counts.
+   `RuntimeMaxSec=13h` is a backstop.
+4. It calls `EnableChargeThreshold(true)` and removes the marker. If the user
+   turns Preserve Battery Health back on during the one-shot, the one-shot
+   ends and UPower's limit is left as the user set it.
+
+While the marker exists, every way out restores the limit: `ExecStopPost`
+runs `aurora-charge-full-now restore` when the process ends however it ends
+(also on a crash or kill), and `aurora-charge-full-now-restore.service`
+(enable it) runs it at boot after a power loss or a hard reset, when UPower
+has come up with the limit off. `restore` waits up to 60 s for UPower to
+list the battery.
+
+Nothing happens, with a message and exit status 0, when there is no battery
+(desktop Macs), when UPower cannot limit the battery, when the limit is off,
+when the battery is already full, or on battery power. Nothing in it is
+specific to a Mac: it works on any laptop whose battery UPower reports with
+`ChargeThresholdSupported`.
+
+GNOME 51.1 has no equivalent: Settings offers only the persistent choice
+between Maximize Charge and Preserve Battery Health, and the Shell reads
+`ChargeThresholdEnabled` only to draw the plugged-in battery icon. A quick
+settings item would call `aurora-charge-full-now start` and `cancel` and
+follow `status --json`.
+
 ## Not covered yet
 
 - **GPU and ANE.** macOS also lowers the GPU's power target in Low Power Mode.

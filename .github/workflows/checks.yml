@@ -18,6 +18,8 @@ jobs:
           repository: aurora-silicon/aura
           ref: f3f38a5a87f2ab25ea3fbfeac6164537b2d10b28  # aura main with #195
           path: .aura
+      # A mock UPower on a private system bus, for tests/test_charge_full_now_dbus.py.
+      - run: sudo apt-get install -y --no-install-recommends python3-dbusmock dbus-daemon
       - run: |
           python3 -m unittest discover -s tests
           bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion tests/loop-rekey tests/selinux-labels tests/selinux-policy images/finalize-image images/label-fedora-rootfs
