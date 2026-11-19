@@ -851,6 +851,9 @@ class HookTests(TempCase):
 # --- Stage 1 for an existing install, Stage 2 signing ---------------------------------------------
 
 AURA = os.environ.get('AURORA_TEST_AURA') or str(ROOT.parent / 'aura')
+# aurora-installer, whose macOS/scripts/stage1-execute-window.json defines the execute-window chips.
+INSTALLER = os.environ.get('AURORA_TEST_INSTALLER') or (
+    str(ROOT.parent / 'aurora-installer') if (ROOT.parent / 'aurora-installer/macOS/scripts').is_dir() else None)
 HAVE_AURA = all(os.path.exists(os.path.join(AURA, 'tools', n)) for n in
                 ('fill_stage1_config.py', 'secboot_sign.py', 'macho_boot_object.py', 'recovery/enroll-stage1.sh'))
 ESP_UUID = '5a3c8f1e-2b4d-4c6e-8f00-1234567890ab'
@@ -1136,7 +1139,18 @@ class Stage1Tests(TempCase):
         (fx.keys / 'stage2.key').unlink()
         self.assertIn('no', fx.run('stage2', 'hook', '/in.bin', '/out.bin').stderr)
 
-    def test_execute_window_bounds_match_the_installer(self):
+
+class ExecuteWindowTests(unittest.TestCase):
+    @unittest.skipUnless(INSTALLER, 'needs an aurora-installer checkout next to this repo, or AURORA_TEST_INSTALLER')
+    def test_execute_window_chips_are_the_installers_definition(self):
+        doc = json.loads((Path(INSTALLER) / 'macOS/scripts/stage1-execute-window.json').read_text())
+        self.assertEqual(doc['schema_version'], 1)
+        ranges = tuple((int(e['first'], 16), int(e['last'], 16)) for e in doc['chip_id_ranges'])
+        self.assertEqual(ranges, sb.EXECUTE_WINDOW_CHIP_IDS)
+        for chip in range(0x10000):
+            self.assertEqual(sb.uses_execute_window(chip), any(a <= chip <= b for a, b in ranges), hex(chip))
+
+    def test_execute_window_splits_m1_to_m3_from_m4_and_later(self):
         for chip in (0x8103, 0x8112, 0x8122, 0x6000, 0x6020, 0x6031, 0x6034):
             self.assertFalse(sb.uses_execute_window(chip), hex(chip))
         for chip in (0x8132, 0x8140, 0x8142, 0x6040, 0x6041, 0x6050):

@@ -975,10 +975,18 @@ def soc(sysobj):
     return chip, board
 
 
+# Chip IDs whose CPUs run kernel-mode code only inside a configured execute window (M4, A18 Pro, M5 and
+# every later generation; chip IDs rise with each generation, so one range per chip family). On these the
+# Stage 1 Mach-O is padded to cover the window and loads the confined Stage 2. The definition is
+# aurora-installer's macOS/scripts/stage1-execute-window.json; tests/test_secboot.py fails if this drifts
+# from it. A constant here, not a file read at run time, so the boot path has nothing more to go missing.
+EXECUTE_WINDOW_CHIP_IDS = ((0x8130, 0x8FFF), (0x6040, 0x6FFF))
+
+
 def uses_execute_window(chip):
-    """M4-generation and later (T8132, T6040 and up): a padded Stage 1 that loads the confined Stage 2.
-    The same bounds as aurora-installer's AuraStage1Format.usesExecuteWindow."""
-    return 0x8130 <= chip <= 0x8FFF or 0x6040 <= chip <= 0x6FFF
+    """Whether the chip's CPUs confine kernel code to an execute window: a padded Stage 1 that loads the
+    confined Stage 2."""
+    return any(first <= chip <= last for first, last in EXECUTE_WINDOW_CHIP_IDS)
 
 
 def boot_record(sysobj):
