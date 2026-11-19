@@ -896,12 +896,15 @@ def key_block(obj):
 
 @unittest.skipUnless(HAVE_AURA, 'needs aura tools (an aura checkout next to this repo, or AURORA_TEST_AURA)')
 class Stage1Tests(TempCase):
-    def ready(self, chip='t8112', board='j413', owner='owner', extra='', flavour='secure', stage2=True):
+    def ready(self, chip='t8112', board='j413', owner='owner', extra='', flavour='secure', stage2=True,
+              legacy_dt=False, legacy_esp=False):
         fx = Fixture(tempfile.mkdtemp(dir=self.tmp), owner=owner, extra_conf='ESP=/boot/efi\n' + extra)
         dt = fx.root / 'proc/device-tree'
         (dt / 'chosen').mkdir(parents=True)
         (dt / 'compatible').write_bytes(f'apple,{board}\0apple,{chip}\0apple,arm-platform\0'.encode())
-        (dt / 'chosen/asahi,efi-system-partition').write_bytes(ESP_UUID.encode() + b'\0')
+        # LEGACY-ASAHI(2027-02-28): legacy_dt/legacy_esp model an install from before the rename.
+        prop = 'asahi,efi-system-partition' if legacy_dt else 'aurora,efi-system-partition'
+        (dt / 'chosen' / prop).write_bytes(ESP_UUID.encode() + b'\0')
         aura = fx.root / 'usr/share/aura'
         (aura / 'stage1').mkdir(parents=True)
         (aura / 'tools').mkdir()
@@ -916,8 +919,9 @@ class Stage1Tests(TempCase):
             (fx.keys / 'stage2.pub').write_bytes(sb.ed25519_public(SEED))
         if stage2:
             name = 'boot-ctxr.bin' if sb.uses_execute_window(int(chip[1:], 16)) else 'boot.bin'
-            (fx.esp / 'm1n1').mkdir(parents=True)
-            (fx.esp / 'm1n1' / name).write_bytes(stage2_image())
+            sub = 'm1n1' if legacy_esp else 'aurora'
+            (fx.esp / sub).mkdir(parents=True, exist_ok=True)
+            (fx.esp / sub / name).write_bytes(stage2_image())
         return fx
 
     def record(self, fx, verdict='verified', policy='audit', key_id=None):
@@ -946,7 +950,7 @@ class Stage1Tests(TempCase):
         count, floor, flags, keys = key_block(obj)
         self.assertEqual((count, floor, flags, keys), (1, 1, 0, sb.ed25519_public(SEED)))
         self.assertIn(ESP_UUID.encode(), obj)
-        self.assertIn(b';m1n1/boot.bin', obj)
+        self.assertIn(b';aurora/boot.bin', obj)
         stock = (out / 'stage1-stock.macho').read_bytes()
         self.assertIn(ESP_UUID.encode(), stock)
         self.assertNotIn(b'AURORA-S1-KEY01', stock)
@@ -961,8 +965,38 @@ class Stage1Tests(TempCase):
         self.assertEqual(len(manifests), 1)
         m = json.loads(manifests[0].read_text())
         self.assertEqual((m['object_md5'], m['esp_partuuid'], m['stage2_path'], m['padded']),
-                         (md5, ESP_UUID, 'm1n1/boot.bin', False))
+                         (md5, ESP_UUID, 'aurora/boot.bin', False))
         self.assertEqual(stat.S_IMODE(manifests[0].stat().st_mode), 0o600)
+
+    def test_legacy_esp_name_and_stage2_path(self):
+        # LEGACY-ASAHI(2027-02-28): pre-rename aura and an ESP whose updater still writes the old path.
+        fx = self.ready(legacy_dt=True, legacy_esp=True)
+        r = fx.run('stage1', 'build', '--audit')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        obj = (self.objects(fx) / 'stage1-audit.macho').read_bytes()
+        self.assertIn(ESP_UUID.encode(), obj)
+        self.assertIn(b';m1n1/boot.bin', obj)
+        # Once the new file exists the new Stage 1 loads it.
+        (fx.esp / 'aurora').mkdir(exist_ok=True)
+        (fx.esp / 'aurora/boot.bin').write_bytes(stage2_image())
+        shutil.rmtree(self.objects(fx))
+        self.assertEqual(fx.run('stage1', 'build', '--audit').returncode, 0)
+        obj = (self.objects(fx) / 'stage1-audit.macho').read_bytes()
+        self.assertIn(b';aurora/boot.bin', obj)
+        self.assertNotIn(b';m1n1/boot.bin', obj)
+
+    def test_stage2_sign_keeps_the_legacy_file_signed(self):
+        # LEGACY-ASAHI(2027-02-28): an enrolled pre-rename Stage 1 still loads m1n1/boot.bin.
+        fx = self.ready()
+        (fx.esp / 'm1n1').mkdir()
+        legacy = fx.esp / 'm1n1/boot.bin'
+        legacy.write_bytes(stage2_image())
+        r = fx.run('stage2', 'sign')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for f in (fx.esp / 'aurora/boot.bin', legacy):
+            self.assertTrue(f.read_bytes().endswith(b'AURSIGT1'), f)
+        v = fx.run('stage2', 'verify')
+        self.assertEqual(v.stdout.count(': verified'), 2, v.stdout)
 
     def test_m4_object_is_padded_and_loads_the_confined_stage2(self):
         fx = self.ready(chip='t8132', board='j713')
@@ -972,7 +1006,7 @@ class Stage1Tests(TempCase):
         self.assertGreater(obj.stat().st_size, 146 << 20)
         with open(obj, 'rb') as f:
             head = f.read(1 << 20)
-        self.assertIn(b';m1n1/boot-ctxr.bin', head)
+        self.assertIn(b';aurora/boot-ctxr.bin', head)
         self.assertIn('enroll-stage1.sh --compress --keep stage1-stock.macho', r.stdout)
         self.assertIn('<VOLUME>', r.stdout)
 
@@ -1037,7 +1071,7 @@ class Stage1Tests(TempCase):
         self.assertIn('1111111111111111', fx.run('stage1', 'build', '--enforce').stderr)
         shutil.rmtree(fx.root / 'proc/device-tree/chosen/aurora,boot-security')
         self.record(fx)
-        (fx.esp / 'aura-try').write_bytes(b'armed\nm1n1/boot.bin.next\n')
+        (fx.esp / 'aura-try').write_bytes(b'armed\naurora/boot.bin.next\n')
         self.assertIn('trial is armed', fx.run('stage1', 'build', '--enforce').stderr)
         (fx.esp / 'aura-try').unlink()
         r = fx.run('stage1', 'build', '--enforce', '--volume', 'Fedora')
@@ -1072,10 +1106,10 @@ class Stage1Tests(TempCase):
 
     def test_stage2_sign_verify_and_status(self):
         fx = self.ready()
-        boot = fx.esp / 'm1n1/boot.bin'
+        boot = fx.esp / 'aurora/boot.bin'
         before = boot.read_bytes()
         self.assertEqual(fx.run('stage2', 'verify').returncode, 1)
-        nxt = fx.esp / 'm1n1/boot.bin.next'
+        nxt = fx.esp / 'aurora/boot.bin.next'
         nxt.write_bytes(stage2_image())
         r = fx.run('stage2', 'sign')
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1115,7 +1149,7 @@ class Stage1Tests(TempCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('signed', r.stdout)
         self.assertEqual(sb.read_trailer(dst.read_bytes())[0], len(src.read_bytes()))
-        # Deterministic: the same input gives the same bytes (update-m1n1 compares them).
+        # Deterministic: the same input gives the same bytes (update-aura compares them).
         first = dst.read_bytes()
         fx.run('stage2', 'hook', '/in.bin', '/out.bin')
         self.assertEqual(dst.read_bytes(), first)
