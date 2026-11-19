@@ -42,6 +42,10 @@ import time
 
 CONFIG = '/etc/aurora/power-modes.conf'
 STATUS = '/run/aurora-power-modes/status.json'
+# Each leg's value as found at the first start of this boot.  /run outlives a
+# restart of the daemon but not a reboot, so after a crash (Restart=on-failure)
+# the legs go back to these values, not to whatever power-saver had written.
+BASELINES = '/run/aurora-power-modes/baselines.json'
 POWER_SUPPLY = '/sys/class/power_supply'
 PPD = (
     ('org.freedesktop.UPower.PowerProfiles', '/org/freedesktop/UPower/PowerProfiles'),
@@ -92,13 +96,17 @@ class Leg:
         self.baseline = None
         self.applied = None
 
-    def start(self):
+    def start(self, saved=None):
+        """Take the baseline: the value saved earlier this boot if there is one, else the file's."""
         try:
-            self.baseline = current_value(self.path)
+            found = current_value(self.path)
         except OSError:
-            self.baseline = None
-        # Nothing has been written: outside the profiles that change it the leg stays as found.
-        self.applied = self.baseline
+            found = None
+        self.baseline = saved if saved is not None and found is not None else found
+        # What the file holds now.  On a first start that is the baseline, and outside the
+        # profiles that change it the leg stays as found; after a crash it may still hold a
+        # profile's value, which apply() then puts back to the baseline.
+        self.applied = found
         return self.baseline is not None
 
     def want(self, profile):
@@ -280,6 +288,36 @@ def monitor():
         return None
 
 
+def load_baselines(path=BASELINES):
+    """Baselines saved by an earlier run in this boot, by sysfs path; empty if none."""
+    try:
+        with open(path) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(saved, dict):
+        return {}
+    return {k: v for k, v in saved.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def save_baselines(legs, path=BASELINES):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({leg.path: leg.baseline for leg in legs if leg.baseline is not None}, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        log('cannot save the baselines to %s: %s' % (path, e))
+
+
+def drop_baselines(path=BASELINES):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def write_status(state):
     try:
         os.makedirs(os.path.dirname(STATUS), exist_ok=True)
@@ -293,7 +331,9 @@ def write_status(state):
 
 def main():
     conf = load_config()
-    legs = [leg for leg in legs_from_config(conf) if leg.start()]
+    saved = load_baselines()
+    legs = [leg for leg in legs_from_config(conf) if leg.start(saved.get(leg.path))]
+    save_baselines(legs)
     mode = conf.get('low_power_mode', 'never').lower()
     if mode not in LOW_POWER_MODES:
         log('low_power_mode %r unknown; using never' % mode)
@@ -305,6 +345,8 @@ def main():
     def stop(*_):
         for leg in legs:
             leg.end()
+        # Clean stop: every leg is back at its baseline, so the next start reads the files again.
+        drop_baselines()
         write_status({'profile': None, 'legs': {}})
         sys.exit(0)
 
