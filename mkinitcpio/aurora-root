@@ -1,6 +1,10 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 build() {
+  # Without this the initramfs may create /dev/btrfs-control before its static-node
+  # list exists, and the Btrfs root then never becomes ready (see the drop-in).
+  add_file /usr/lib/aurora/initrd/aurora-static-nodes.conf \
+    /usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service.d/aurora-static-nodes.conf
   local layout=${AURORA_IMAGE_LAYOUT:-/etc/aurora/image-layout}
   [[ -f $layout ]] || return 0
   local binary unit

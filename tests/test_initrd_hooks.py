@@ -33,6 +33,16 @@ class InitrdHookTests(unittest.TestCase):
             self.assertIn(f'{mapper}|/usr/lib/systemd/system/{unit}.d/aurora-root.conf', calls)
         self.assertTrue(any(call.endswith('|/etc/aurora/image-layout') for call in calls))
 
+    def test_mkinitcpio_hook_orders_static_nodes_before_dev_setup(self):
+        calls = self.run_hook(f'''
+            add_binary() {{ :; }}; add_module() {{ :; }}; add_symlink() {{ :; }}
+            add_file() {{ printf '%s|%s\\n' "$1" "${{2:-$1}}"; }}
+            source {ROOT / 'mkinitcpio/aurora-root'}; build''')
+        self.assertIn('/usr/lib/aurora/initrd/aurora-static-nodes.conf|'
+                      '/usr/lib/systemd/system/systemd-tmpfiles-setup-dev.service.d/aurora-static-nodes.conf', calls)
+        dropin = (ROOT / 'systemd/aurora-static-nodes.conf').read_text()
+        self.assertIn('After=kmod-static-nodes.service', dropin.splitlines())
+
     def test_dracut_module_bounds_no_root_device_wait(self):
         calls = self.run_hook(f'''
             systemdsystemunitdir=/usr/lib/systemd/system; initdir=$(mktemp -d)
