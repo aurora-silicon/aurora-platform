@@ -218,9 +218,9 @@ specific to a Mac: it works on any laptop whose battery UPower reports with
 
 GNOME 51.1 has no equivalent: Settings offers only the persistent choice
 between Maximize Charge and Preserve Battery Health, and the Shell reads
-`ChargeThresholdEnabled` only to draw the plugged-in battery icon. A quick
-settings item would call `aurora-charge-full-now start` and `cancel` and
-follow `status --json`.
+`ChargeThresholdEnabled` only to draw the plugged-in battery icon.
+[`gnome/`](../gnome/README.md) has an optional quick settings toggle that calls
+`aurora-charge-full-now start` and `cancel`; it is not installed by default.
 
 ## Not covered yet
 

@@ -47,6 +47,15 @@ install-charge-full-now:
 	install -Dm644 power/aurora-charge-full-now.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-charge-full-now.service
 	install -Dm644 power/aurora-charge-full-now-restore.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-charge-full-now-restore.service
 	install -Dm644 power/50-aurora-charge-full-now.rules $(DESTDIR)$(PREFIX)/share/polkit-1/rules.d/50-aurora-charge-full-now.rules
+	install -dm755 $(DESTDIR)$(LOCALSTATEDIR)/lib/aurora/charge-full-now
+
+# Optional, not part of install: the GNOME Shell 50/51 quick settings toggle for
+# aurora-charge-full-now (gnome/README.md).  Installed system wide it stays off
+# until a user runs gnome-extensions enable charge-full-now@aurorasilicon.org.
+GNOME_EXT = charge-full-now@aurorasilicon.org
+install-gnome-charge-full-now:
+	install -Dm644 gnome/$(GNOME_EXT)/metadata.json $(DESTDIR)$(PREFIX)/share/gnome-shell/extensions/$(GNOME_EXT)/metadata.json
+	install -Dm644 gnome/$(GNOME_EXT)/extension.js $(DESTDIR)$(PREFIX)/share/gnome-shell/extensions/$(GNOME_EXT)/extension.js
 
 # GameMode defaults (power/GAMEMODE.md): an administrator-level config that
 # GameMode merges over its shipped one. Packages ship it as a config file.

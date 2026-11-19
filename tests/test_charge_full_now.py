@@ -393,6 +393,21 @@ class Install(unittest.TestCase):
             self.assertIn('"%s"' % cf.UNIT, rules)
             self.assertIn('subject.active', rules)
             self.assertNotIn('ConditionPathExists=/sys/firmware/devicetree', unit + boot)   # any laptop
+            self.assertFalse((staged / 'usr/share/gnome-shell').exists())     # the extension is opt-in
+
+    def test_gnome_extension_staged(self):
+        uuid = 'charge-full-now@aurorasilicon.org'
+        with tempfile.TemporaryDirectory() as t:
+            subprocess.run(['make', '-s', 'install-gnome-charge-full-now', 'DESTDIR=' + t], cwd=ROOT, check=True)
+            ext = Path(t) / 'usr/share/gnome-shell/extensions' / uuid
+            meta = json.loads((ext / 'metadata.json').read_text())
+            self.assertEqual(meta['uuid'], uuid)
+            self.assertIn('51', meta['shell-version'])
+            js = (ext / 'extension.js').read_text()
+            self.assertIn("'%s'" % cf.MARKER, js)
+            self.assertIn('ChargeThresholdEnabled', js)
+            self.assertNotIn('_sync(Gio', js)
+            self.assertNotIn('new_for_bus_sync', js)   # no blocking D-Bus calls in the compositor
 
 
 if __name__ == '__main__':
