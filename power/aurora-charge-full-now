@@ -24,10 +24,16 @@ boot when a reboot or power loss came first.
 
 Commands:
   start      ask systemd to start aurora-charge-full-now.service
-  cancel     stop it; the limit comes back
+  start --by HH:MM
+             keep the limit and start the one-shot so that the battery is
+             full by the next HH:MM (local time), as macOS Optimised Charging
+             finishes before the usual unplug time
+  cancel     stop the one-shot and clear a schedule; the limit comes back
   status     the one-shot state, battery and limit (--json for programs)
   run        the one-shot itself (the service's ExecStart)
   restore    put the limit back if a marker says it is ours (ExecStopPost, boot)
+  arm HHMM   plan and arm the schedule (aurora-charge-full-now-schedule@HHMM.service)
+  fire       the schedule's timer went off: start the one-shot
 
 Nothing here is specific to a machine: any battery for which UPower reports
 ChargeThresholdSupported works.
@@ -45,6 +51,15 @@ UNIT = 'aurora-charge-full-now.service'
 MARKER = '/var/lib/aurora/charge-full-now/active'
 CEILING = 12 * 3600         # seconds; the longest a one-shot may hold the limit off
 SETTLE = 60                 # seconds restore waits for UPower to list the battery at boot
+
+# "start --by HH:MM": hold the limit, start the one-shot early enough to be full by then.
+SCHEDULE = 'aurora-charge-full-now-schedule'        # transient .timer and .service, made by arm
+SCHEDULE_FILE = '/run/aurora-charge-full-now/schedule.json'
+POWER_SUPPLY = '/sys/class/power_supply'
+DERATE = 0.6                # of the adapter's input_power_limit that is assumed to reach the battery
+MIN_RATE = 10.0             # W; never assume a slower charge than this
+MARGIN = 30 * 60            # seconds of slack before the deadline
+FALLBACK_WH = 100.0         # assumed capacity when UPower reports no energy
 
 UPOWER = 'org.freedesktop.UPower'
 UPOWER_PATH = '/org/freedesktop/UPower'
@@ -239,7 +254,7 @@ def describe(p):
     return '%.0f %% %s' % (p.get('Percentage', 0), STATE_NAMES.get(p.get('State'), 'unknown'))
 
 
-def preflight(bus, marker):
+def preflight(bus, marker, need_adapter=True):
     """(path, props, message): path is None when there is nothing to do."""
     path, p = find_battery(bus)
     if path is None:
@@ -251,7 +266,7 @@ def preflight(bus, marker):
                          '(Settings > Power > Preserve Battery Health)')
     if is_full(p):
         return None, p, 'the battery is full (%s)' % describe(p)
-    if bus.on_battery():
+    if need_adapter and bus.on_battery():
         return None, p, 'connect the power adapter first; the battery is at %s' % describe(p)
     return path, p, None
 
@@ -337,11 +352,87 @@ def restore(bus, marker_path=MARKER, settle=SETTLE, clock=boottime):
     return 0
 
 
+# ---- schedules: start --by HH:MM ----------------------------------------
+
+def parse_by(text):
+    """(hour, minute) from "HH:MM" or "HHMM", else None."""
+    text = (text or '').strip()
+    digits = text.replace(':', '', 1) if len(text) == 5 and text[2] == ':' else text
+    if len(digits) != 4 or not digits.isdigit():
+        return None
+    h, m = int(digits[:2]), int(digits[2:])
+    if h > 23 or m > 59:
+        return None
+    return h, m
+
+
+def next_deadline(h, m, now):
+    """Epoch seconds of the next local HH:MM strictly after now."""
+    t = time.localtime(now)
+    for days in range(0, 3):
+        cand = time.mktime((t.tm_year, t.tm_mon, t.tm_mday + days, h, m, 0, 0, 0, -1))
+        if cand > now:
+            return cand
+    raise ValueError('no next %02d:%02d' % (h, m))
+
+
+def adapter_watts(root=POWER_SUPPLY):
+    """The largest input_power_limit (W) of an online power adapter, else None."""
+    best = None
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for name in names:
+        base = os.path.join(root, name)
+        try:
+            with open(os.path.join(base, 'type')) as f:
+                if f.read().strip() == 'Battery':
+                    continue
+            with open(os.path.join(base, 'online')) as f:
+                if f.read().strip() != '1':
+                    continue
+            with open(os.path.join(base, 'input_power_limit')) as f:
+                watts = int(f.read().strip()) / 1e6
+        except (OSError, ValueError):
+            continue
+        if watts > 0 and (best is None or watts > best):
+            best = watts
+    return best
+
+
+def charge_rate(p, adapter_w):
+    """A conservative charge power in W: the lower of the derated adapter limit
+    and UPower's present rate while charging, never below MIN_RATE."""
+    rates = []
+    if adapter_w:
+        rates.append(adapter_w * DERATE)
+    if p.get('State') == 1 and (p.get('EnergyRate') or 0) > 0:
+        rates.append(p['EnergyRate'])
+    return max(min(rates) if rates else MIN_RATE, MIN_RATE)
+
+
+def plan(p, deadline, now, adapter_w):
+    """When to start so the battery is full by deadline: {start, deadline, deficit_wh, rate_w}."""
+    full, energy = p.get('EnergyFull') or 0, p.get('Energy') or 0
+    if full > 0:
+        deficit = max(full - energy, 0.0)
+    else:
+        deficit = FALLBACK_WH * max(100 - (p.get('Percentage') or 0), 0) / 100
+    rate = charge_rate(p, adapter_w)
+    start = deadline - deficit / rate * 3600 - MARGIN
+    return {'deadline': int(deadline), 'start': int(max(start, now)), 'deficit_wh': round(deficit, 2),
+            'rate_w': round(rate, 1), 'now': start <= now}
+
+
 # ---- the command line -----------------------------------------------------
+
+RUN = subprocess.run        # replaced in tests
+
 
 def systemctl(*args):
     try:
-        out = subprocess.run(['systemctl'] + list(args), text=True, capture_output=True)
+        out = RUN(['systemctl'] + list(args), text=True, capture_output=True)
     except OSError as e:
         log('systemctl: %s' % e)
         return 1
@@ -350,20 +441,138 @@ def systemctl(*args):
     return out.returncode
 
 
-def unit_active():
+def unit_active(unit=UNIT):
     try:
-        out = subprocess.run(['systemctl', 'is-active', UNIT], text=True, capture_output=True)
+        out = RUN(['systemctl', 'is-active', unit], text=True, capture_output=True)
     except OSError:
         return 'unknown'
     return out.stdout.strip() or 'unknown'
 
 
-def cmd_start(bus):
+def clear_schedule(schedule_file=None):
+    """Stop a pending schedule timer; returns True if one was pending."""
+    schedule_file = schedule_file or SCHEDULE_FILE
+    pending = unit_active(SCHEDULE + '.timer') in ('active', 'activating')
+    if pending:
+        systemctl('stop', SCHEDULE + '.timer')
+    try:
+        os.unlink(schedule_file)
+    except OSError:
+        pass        # an unprivileged cancel cannot; status ignores it once the timer is gone
+    return pending
+
+
+def stamp(t):
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t))
+
+
+def arm(bus, by, now=None, root=POWER_SUPPLY, schedule_file=None):
+    """Plan "full by HH:MM" and arm the timer, as root.  The limit is never touched here:
+    only the one-shot service lifts it, with its own restore paths."""
+    schedule_file = schedule_file or SCHEDULE_FILE
+    hm = parse_by(by)
+    if hm is None:
+        log('arm: %r is not HH:MM' % by)
+        return 2
+    now = time.time() if now is None else now
+    path, p, why = preflight(bus, read_marker(MARKER), need_adapter=False)
+    clear_schedule(schedule_file)
+    try:        # a failed or lingering transient unit would block the new one's name
+        RUN(['systemctl', 'reset-failed', SCHEDULE + '.timer', SCHEDULE + '.service'],
+            text=True, capture_output=True)
+    except OSError:
+        pass
+    if path is None:
+        log('nothing to schedule: %s' % why)
+        return 0
+    pl = plan(p, next_deadline(hm[0], hm[1], now), now, adapter_watts(root))
+    log('full by %s: %.1f Wh to go at %.1f W plus %d min margin; start %s' % (
+        stamp(pl['deadline']), pl['deficit_wh'], pl['rate_w'], MARGIN // 60,
+        'now' if pl['now'] else stamp(pl['start'])))
+    if pl['now']:
+        return 0 if systemctl('start', '--no-block', UNIT) == 0 else 1
+    try:
+        os.makedirs(os.path.dirname(schedule_file), exist_ok=True)
+        with open(schedule_file + '.tmp', 'w') as f:
+            json.dump(pl, f)
+        os.chmod(schedule_file + '.tmp', 0o644)
+        os.replace(schedule_file + '.tmp', schedule_file)
+    except OSError as e:
+        log('arm: %s' % e)
+    try:
+        out = RUN(['systemd-run', '--unit=' + SCHEDULE, '--on-calendar=' + stamp(pl['start']),
+                   '--timer-property=AccuracySec=1min',
+                   '--description=Charge the battery to full by %s' % stamp(pl['deadline']),
+                   '/usr/bin/aurora-charge-full-now', 'fire'],
+                  text=True, capture_output=True)
+        rc = out.returncode
+        if rc != 0:
+            log('systemd-run: %s' % out.stderr.strip())
+    except OSError as e:
+        log('systemd-run: %s' % e)
+        rc = 1
+    if rc != 0:
+        try:
+            os.unlink(schedule_file)
+        except OSError:
+            pass
+        return 1
+    return 0
+
+
+def fire(schedule_file=None):
+    schedule_file = schedule_file or SCHEDULE_FILE
+    try:
+        os.unlink(schedule_file)
+    except OSError:
+        pass
+    log('scheduled charge to full: starting %s' % UNIT)
+    return 0 if systemctl('start', '--no-block', UNIT) == 0 else 1
+
+
+def read_schedule(schedule_file=None):
+    schedule_file = schedule_file or SCHEDULE_FILE
+    if unit_active(SCHEDULE + '.timer') not in ('active', 'activating'):
+        return None
+    try:
+        with open(schedule_file) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def cmd_start(bus, by=None):
     marker = read_marker(MARKER)
+    if by is not None:
+        hm = parse_by(by)
+        if hm is None:
+            print('--by wants a time of day, HH:MM (24 h)', file=sys.stderr)
+            return 2
+        path, p, why = preflight(bus, marker, need_adapter=False)
+        if path is None:
+            print(why)
+            return 0
+        unit = '%s@%02d%02d.service' % (SCHEDULE, hm[0], hm[1])
+        rc = systemctl('start', unit)
+        if rc != 0:
+            print('could not start %s (systemctl exit %d)' % (unit, rc), file=sys.stderr)
+            return 1
+        sch = read_schedule()
+        if sch:
+            print('The %s %% limit holds until %s, so the battery is full by %s '
+                  '(%.0f Wh at %.0f W, 30 min margin). "aurora-charge-full-now cancel" clears it.'
+                  % (p.get('ChargeEndThreshold'), stamp(sch['start'])[:16], stamp(sch['deadline'])[:16],
+                     sch['deficit_wh'], sch['rate_w']))
+        elif unit_active() in ('active', 'activating'):
+            print('Not enough time left before %02d:%02d: charging to full now.' % hm)
+        else:
+            print('See "journalctl -u %s" for the plan.' % unit)
+        return 0
     path, p, why = preflight(bus, marker)
     if path is None:
         print(why)
         return 0
+    clear_schedule()            # starting now replaces a schedule
     rc = systemctl('start', UNIT)
     if rc != 0:
         print('could not start %s (systemctl exit %d)' % (UNIT, rc), file=sys.stderr)
@@ -375,8 +584,9 @@ def cmd_start(bus):
 
 
 def cmd_cancel():
+    had_schedule = clear_schedule()
     if unit_active() not in ('active', 'activating'):
-        print('no charge to full is running')
+        print('schedule cleared' if had_schedule else 'no charge to full is running or scheduled')
         return 0
     rc = systemctl('stop', UNIT)
     if rc != 0:
@@ -386,10 +596,13 @@ def cmd_cancel():
     return 0
 
 
-def status(bus, active, marker):
+def status(bus, active, marker, schedule=None):
     path, p = find_battery(bus)
     out = {'active': active in ('active', 'activating'), 'unit': active, 'marker': marker,
-           'battery': None}
+           'battery': None, 'schedule': None}
+    if schedule is not None:
+        out['schedule'] = {'by': schedule.get('deadline'), 'start_at': schedule.get('start'),
+                           'deficit_wh': schedule.get('deficit_wh'), 'rate_w': schedule.get('rate_w')}
     if path is not None:
         out['battery'] = {
             'path': path,
@@ -403,7 +616,7 @@ def status(bus, active, marker):
 
 
 def cmd_status(bus, as_json):
-    st = status(bus, unit_active(), read_marker(MARKER))
+    st = status(bus, unit_active(), read_marker(MARKER), read_schedule())
     if as_json:
         print(json.dumps(st))
         return 0
@@ -424,21 +637,40 @@ def cmd_status(bus, as_json):
         print('charge to full: interrupted; the limit comes back at the next restore')
     else:
         print('charge to full: not running')
+    sch = st['schedule']
+    if sch is not None:
+        if sch.get('by'):
+            print('scheduled: full by %s, starts %s' % (stamp(sch['by'])[:16], stamp(sch['start_at'])[:16]))
+        else:
+            print('scheduled: yes')
     return 0
 
 
+USAGE = 'usage: aurora-charge-full-now start [--by HH:MM] | cancel | status [--json]'
+
+
 def main(argv):
-    if len(argv) < 2 or argv[1] not in ('start', 'cancel', 'status', 'run', 'restore'):
-        print('usage: aurora-charge-full-now start | cancel | status [--json]', file=sys.stderr)
+    if len(argv) < 2 or argv[1] not in ('start', 'cancel', 'status', 'run', 'restore', 'arm', 'fire'):
+        print(USAGE, file=sys.stderr)
         return 2
-    cmd = argv[1]
+    cmd, rest = argv[1], argv[2:]
+    if cmd == 'start' and rest and (rest[0] != '--by' or len(rest) != 2):
+        print(USAGE, file=sys.stderr)
+        return 2
+    if cmd == 'arm' and len(rest) != 1:
+        print(USAGE, file=sys.stderr)
+        return 2
+    if cmd == 'fire':
+        return fire()
     bus = UPowerBus()
     if cmd == 'start':
-        return cmd_start(bus)
+        return cmd_start(bus, rest[1] if rest else None)
     if cmd == 'cancel':
         return cmd_cancel()
     if cmd == 'status':
-        return cmd_status(bus, '--json' in argv[2:])
+        return cmd_status(bus, '--json' in rest)
+    if cmd == 'arm':
+        return arm(bus, rest[0])
 
     def cancel(*_):
         # Once: the restore that follows must not be interrupted by a second signal.

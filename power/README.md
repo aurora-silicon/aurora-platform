@@ -176,13 +176,15 @@ keeps the on/off state in `/var/lib/upower/charging-threshold-status`.
 
 ```
 aurora-charge-full-now start           # charge to 100 % once
-aurora-charge-full-now cancel          # stop now; the limit is back on
+aurora-charge-full-now start --by 07:30  # hold the limit, be full by the next 07:30
+aurora-charge-full-now cancel          # stop now and clear a schedule; the limit is back on
 aurora-charge-full-now status [--json]
 ```
 
 `start` asks systemd for `aurora-charge-full-now.service`. The polkit rule
 `50-aurora-charge-full-now.rules` lets the active local user start and stop
-that one unit without a password, as UPower's own
+that one unit, start the planner `aurora-charge-full-now-schedule@HHMM.service`
+and stop the schedule timer without a password, as UPower's own
 `org.freedesktop.UPower.enable-charging-limit` action does
 (`allow_active=yes`); anyone else is asked for an administrator password.
 
@@ -221,6 +223,36 @@ between Maximize Charge and Preserve Battery Health, and the Shell reads
 `ChargeThresholdEnabled` only to draw the plugged-in battery icon.
 [`gnome/`](../gnome/README.md) has an optional quick settings toggle that calls
 `aurora-charge-full-now start` and `cancel`; it is not installed by default.
+
+### Full by a time: `start --by HH:MM`
+
+Like macOS Optimised Battery Charging, the limit holds overnight and the
+battery reaches 100 % just before the usual unplug time. `start --by 07:30`
+starts the planner, which picks the next 07:30 in local time and starts
+the one-shot at
+
+    07:30 - (EnergyFull - Energy) / rate - 30 min
+
+The charge rate is conservative: the lower of 0.6 x the `input_power_limit`
+of the online adapter in `/sys/class/power_supply` and UPower's `EnergyRate`
+while charging, never below 10 W (also the value used with no adapter
+connected). If that start time has already passed, the one-shot starts at
+once. Otherwise the planner arms a transient timer,
+`aurora-charge-full-now-schedule.timer` (`systemd-run --on-calendar`,
+`AccuracySec=1min`), that starts `aurora-charge-full-now.service`. The plan is
+in the planner's journal and in `status`.
+
+- The planner never touches the limit. Only the one-shot lifts it, with the
+  restore paths above, and it repeats its own checks when the timer fires:
+  with the adapter unplugged, the limit off or the battery full at that
+  moment, nothing happens.
+- The timer does not wake the Mac. A start time that passes during suspend
+  fires at resume (systemd catches up calendar timers that elapsed while the
+  clock was suspended).
+- A schedule does not survive a reboot or power-off: the transient timer is
+  gone and the limit simply keeps holding (the battery stays at the limit,
+  which is the safe side). Set it again after a restart.
+- `start` without `--by` and `cancel` clear a pending schedule.
 
 ## Not covered yet
 
