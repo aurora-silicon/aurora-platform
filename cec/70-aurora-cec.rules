@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+# HDMI-CEC on the built-in HDMI port (aurora-platform cec/README.md).
+# systemd's 50-udev-default.rules gives /dev/cec* to group video only; let
+# the local seat's user run cec-ctl too, as for video4linux devices. This
+# must run before 73-seat-late.rules.
+SUBSYSTEM=="cec", KERNEL=="cec[0-9]*", TAG+="uaccess"
+# Turn the TV on and select this Mac once the adapter appears.
+SUBSYSTEM=="cec", KERNEL=="cec[0-9]*", DRIVERS=="apple-dcp", TAG+="systemd", ENV{SYSTEMD_WANTS}+="aurora-cec@%k.service"
