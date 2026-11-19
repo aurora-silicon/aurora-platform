@@ -228,6 +228,18 @@ class UsbGadget(unittest.TestCase):
         self.assertEqual(self.read('functions/mass_storage.usb0/lun.0/ro'), '0')
         self.assertEqual(self.read('functions/mass_storage.usb0/lun.0/cdrom'), '1')
 
+    def test_storage_image_refused(self):
+        self.udc('a.usb')
+        image = Path(self.tmp.name) / 'disk.img'
+        image.write_bytes(b'\0' * 4096)
+        self.config(f'STORAGE_IMAGE={image}\n')
+        self.run_gadget('up')
+        self.run_gadget('down', 'a.usb')
+        # The kernel refuses the backing file: the attribute keeps its old value.
+        (self.g / 'functions/mass_storage.usb0/lun.0/file').chmod(0o444)
+        r = self.run_gadget('up', 'a.usb')
+        self.assertIn('did not take', r.stdout)
+
     def test_storage_image_missing(self):
         self.udc('a.usb')
         self.config('STORAGE_IMAGE=/nonexistent/disk.img\n')
@@ -246,6 +258,11 @@ class UsbGadget(unittest.TestCase):
         self.udc('a.usb')
         (self.run_dir / 'NetworkManager').mkdir()
         self.run_gadget('up')
+        # The link comes up with NetworkManager too: the host only sees the network once it is up.
+        (self.g / 'functions/ncm.usb0/ifname').write_text('usbaurora0\n')
+        self.run_gadget('down', 'a.usb')
+        self.run_gadget('up', 'a.usb')
+        self.assertIn('ip link set dev usbaurora0 up', self.calls())
         path, text = self.nm_profile()
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertIn('interface-name=usbaurora*', text)

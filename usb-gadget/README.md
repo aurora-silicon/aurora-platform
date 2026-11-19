@@ -61,7 +61,8 @@ addresses, plus the MAC address the host's side of the link will have. Both
 stay the same across reboots.
 
 To log in over the network, the Mac must run an SSH server. On Fedora:
-`sudo systemctl enable --now sshd`. If Avahi runs on the Mac, as on Fedora
+`sudo systemctl enable --now sshd`. Fedora's firewall puts the interface in its
+default zone, which allows SSH; other services need a firewall rule. If Avahi runs on the Mac, as on Fedora
 desktops, `ssh user@<hostname>.local` works from all three host systems.
 Otherwise use the link-local address:
 
@@ -75,6 +76,15 @@ for example) with `ifconfig` by matching the host-side MAC address from
 
 Serial port: `screen /dev/cu.usbmodem*` (the name ends in the gadget's serial
 number).
+
+macOS names a network interface it has never seen only while someone is
+logged in with the screen unlocked; with the screen locked, the interface
+waits (`printf 'show Plugin:InterfaceNamer\n' | sudo scutil` lists it under
+`_Locked_`). Unlock the Mac once, or allow it ahead of time with
+`sudo scutil --allow-new-interfaces on`. macOS remembers the interface after
+that. macOS uses the NCM function; its CDC-ECM driver does not bring the link
+up. Measured from a MacBook Pro M4 Pro to a Mac mini M2 over USB 2: about
+280 Mbit/s into the gadget and 310 Mbit/s out of it, 0.8 ms ping.
 
 **Linux.** The `cdc_ncm` driver creates an `enx…` or `enu…` interface. The
 host's NetworkManager tries DHCP and falls back to IPv6 link-local only. Use

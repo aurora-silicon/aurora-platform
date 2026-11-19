@@ -204,6 +204,8 @@ build() {
     put 1 "$lun/removable"
     put "$(truthy "${CFG[STORAGE_CDROM]}" && echo 1 || echo 0)" "$lun/cdrom"
     put "$image" "$lun/file"
+    [[ $(get "$lun/file") == "$image" ]] ||
+      log "the kernel did not take $image as the disk; the host sees no medium"
   else
     [[ -n $image ]] && log "storage image $image not found; no disk offered"
     drop_function mass_storage.usb0
@@ -309,8 +311,10 @@ remove_network() {
   return 0
 }
 
-# Without NetworkManager or systemd-networkd, bring the link up so the
-# kernel at least gives it an IPv6 link-local address.
+# Bring the link up. The host sees the network as connected only once it is
+# up, and a NetworkManager that does not manage the interface (yet) leaves it
+# down; NetworkManager or systemd-networkd then configure the up link.
+# Without either, the kernel still gives it an IPv6 link-local address.
 link_up() {
   local n deadline=$((SECONDS + WAIT))
   has_function ncm || return 0
@@ -318,9 +322,7 @@ link_up() {
     (( SECONDS < deadline )) || { log "network interface not registered"; return 0; }
     sleep 0.2
   done
-  if [[ ! -e $NM_FILE && ! -e $NETWORKD_FILE ]] && command -v ip >/dev/null; then
-    ip link set dev "$n" up 2>/dev/null
-  fi
+  command -v ip >/dev/null && ip link set dev "$n" up 2>/dev/null
   log "network interface $n"
 }
 
