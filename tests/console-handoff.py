@@ -11,6 +11,7 @@ import fcntl
 import os
 from pathlib import Path
 import pty
+import select
 import signal
 import subprocess
 import tempfile
@@ -27,6 +28,18 @@ def wait_for(path, timeout):
             return True
         time.sleep(0.05)
     return False
+
+
+def read_until(fd, text, timeout):
+    """Read the terminal's output until text appears; False on timeout."""
+    seen = b''
+    until = time.monotonic() + timeout
+    while text not in seen:
+        left = until - time.monotonic()
+        if left <= 0 or not select.select([fd], [], [], left)[0]:
+            return False
+        seen += os.read(fd, 4096)
+    return True
 
 
 def main():
@@ -65,7 +78,11 @@ def main():
                             '--property=Type=oneshot', '--property=StandardInput=null',
                             '--property=StandardOutput=journal', '--property=TimeoutStartSec=8s',
                             '/bin/bash', '-c', prompt], check=True)
-            time.sleep(1)
+            # Type the answer once the prompt is on the terminal: the service
+            # has taken it over and is reading.
+            if not read_until(master, b'Linux username: ', 8):
+                subprocess.run(['journalctl', '-u', unit, '--no-pager'])
+                raise AssertionError('the prompt did not appear on the terminal')
             os.write(master, b'owner\n')
             if not wait_for(marker, 5):
                 subprocess.run(['systemctl', 'status', '--no-pager', unit])
