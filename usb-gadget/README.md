@@ -84,7 +84,15 @@ waits (`printf 'show Plugin:InterfaceNamer\n' | sudo scutil` lists it under
 `sudo scutil --allow-new-interfaces on`. macOS remembers the interface after
 that. macOS uses the NCM function; its CDC-ECM driver does not bring the link
 up. Measured from a MacBook Pro M4 Pro to a Mac mini M2 over USB 2: about
-280 Mbit/s into the gadget and 310 Mbit/s out of it, 0.8 ms ping.
+280 Mbit/s into the gadget and 310 Mbit/s out of it, 0.8 ms ping; a 1 GiB
+file copies at about 41 MB/s out of the gadget and 35 MB/s into it.
+
+The disk shows up in the Finder like a USB stick (about 41 MB/s to read over
+USB 2). While the screen is locked or the Mac sits at the login window, macOS
+ejects removable media as soon as they appear, a USB stick or this disk
+alike: the host sends an eject and the disk reports no medium
+(`aurora-usb-gadget status` says so). Unlock the Mac and run
+`aurora-usb-gadget up` to insert it again, or plug the cable in again.
 
 **Linux.** The `cdc_ncm` driver creates an `enx…` or `enu…` interface. The
 host's NetworkManager tries DHCP and falls back to IPv6 link-local only. Use

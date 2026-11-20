@@ -229,6 +229,22 @@ teardown() {
   rmnode "$G"
 }
 
+# A host may eject the disk (SCSI START STOP UNIT): f_mass_storage then closes
+# the image and reports no medium until it is given the file again. macOS does
+# this by itself for removable media while its screen is locked or at the
+# login window. Put the configured image back in.
+insert_storage() {
+  local lun=$G/functions/mass_storage.usb0/lun.0 image=${CFG[STORAGE_IMAGE]}
+  [[ -n $image && -f $image && -e $lun/file ]] || return 0
+  [[ -z $(get "$lun/file") ]] || return 0
+  put "$image" "$lun/file"
+  if [[ $(get "$lun/file") == "$image" ]]; then
+    log "disk inserted again (the host had ejected it)"
+  else
+    log "the kernel did not take $image as the disk; the host sees no medium"
+  fi
+}
+
 release_storage() {   # let go of the image file while unbound
   local lun=$G/functions/mass_storage.usb0/lun.0
   [[ -e $lun/file ]] && put "" "$lun/file"
@@ -366,6 +382,7 @@ cmd_up() {
     else
       log "bound to $cur; $want left free"
     fi
+    insert_storage
     return 0
   fi
   # Unbound, or bound to a controller that went away: build afresh.
@@ -435,7 +452,13 @@ cmd_status() {
   fi
   if [[ -d $G/functions/mass_storage.usb0 ]]; then
     local lun=$G/functions/mass_storage.usb0/lun.0
-    echo "disk: $(get "$lun/file") ($( [[ $(get "$lun/ro") == 1 ]] && echo read-only || echo read-write))"
+    local file
+    file=$(get "$lun/file")
+    if [[ -n $file ]]; then
+      echo "disk: $file ($( [[ $(get "$lun/ro") == 1 ]] && echo read-only || echo read-write))"
+    else
+      echo "disk: no medium (ejected by the host; 'aurora-usb-gadget up' inserts it again)"
+    fi
   fi
 }
 

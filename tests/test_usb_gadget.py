@@ -218,6 +218,27 @@ class UsbGadget(unittest.TestCase):
         self.run_gadget('down', 'a.usb')
         self.assertEqual(self.read(f'{lun}/file'), '')
 
+    def test_storage_ejected_by_the_host_is_inserted_again(self):
+        self.udc('a.usb')
+        image = Path(self.tmp.name) / 'disk.img'
+        image.write_bytes(b'\0' * 4096)
+        self.config(f'STORAGE_IMAGE={image}\n')
+        self.run_gadget('up')
+        lun = 'functions/mass_storage.usb0/lun.0'
+        # The host ejects the disk (START STOP UNIT): the kernel drops the file.
+        (self.g / lun / 'file').write_text('\n')
+        r = self.run_gadget('status')
+        self.assertIn('disk: no medium (ejected by the host', r.stdout)
+        r = self.run_gadget('up')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('already bound to a.usb', r.stdout)
+        self.assertIn('disk inserted again', r.stdout)
+        self.assertEqual(self.read(f'{lun}/file'), str(image))
+        self.assertIn(f'disk: {image} (read-only)', self.run_gadget('status').stdout)
+        # A disk that is still in stays untouched.
+        r = self.run_gadget('up')
+        self.assertNotIn('inserted again', r.stdout)
+
     def test_storage_writable_and_cdrom(self):
         self.udc('a.usb')
         image = Path(self.tmp.name) / 'disk.iso'
