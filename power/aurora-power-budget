@@ -47,7 +47,7 @@ KERNEL_HANDLERS = ('apple-clpc',)
 UNBOUNDED = 2147483647  # kHz: removes the user maximum request
 PERIOD = 0.1            # seconds: macOS's Low Power Mode budget window
 RAISE_PERIODS = 2       # periods a higher cap must persist before it is applied
-IDLE_RECHECK = 30.0     # seconds between profile re-reads while not capping
+IDLE_RECHECK = 30.0     # seconds between profile re-reads while not capping, only without busctl
 PPD = (
     ('org.freedesktop.UPower.PowerProfiles', '/org/freedesktop/UPower/PowerProfiles'),
     ('net.hadess.PowerProfiles', '/net/hadess/PowerProfiles'),
@@ -370,10 +370,14 @@ def active_profile():
 
 
 def monitor():
+    """busctl printing a line for each profile change and each time a profile
+    daemon starts or stops, so a daemon that starts after us is noticed."""
     args = ['busctl', '--system', 'monitor', '--json=short']
-    for _, path in PPD:
+    for name, path in PPD:
         args.append("--match=type='signal',interface='org.freedesktop.DBus.Properties',"
                     "member='PropertiesChanged',path='%s'" % path)
+        args.append("--match=type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
+                    "member='NameOwnerChanged',arg0='%s'" % name)
     try:
         return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
@@ -441,7 +445,12 @@ def main():
             capping = False
             log('profile %s: CPU caps released' % profile)
             write_status({'profile': profile, 'capping': False, 'budget_mw': round(budget)})
-        timeout = PERIOD if capping else IDLE_RECHECK
+        # Capping samples every PERIOD. Otherwise wait for D-Bus: the profile
+        # is re-read on a timer only when busctl could not be started.
+        if capping:
+            timeout = PERIOD
+        else:
+            timeout = None if mon else IDLE_RECHECK
         ready = []
         if mon and mon.stdout:
             ready, _, _ = select.select([mon.stdout], [], [], timeout)
@@ -451,6 +460,7 @@ def main():
             line = mon.stdout.readline()
             if not line:    # busctl exited (bus restart): reap it and start another
                 mon.wait()
+                # Rate limit: while the bus is down a new busctl exits at once.
                 time.sleep(1)
                 mon = monitor()
             profile = active_profile()

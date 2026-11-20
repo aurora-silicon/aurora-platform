@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import socket
 import tempfile
 import unittest
 
@@ -55,6 +56,41 @@ class Legs(unittest.TestCase):
             leg.apply('power-saver')
             leg.end()
         self.assertEqual(self.rt.read_text(), '1024')
+
+    def test_restart_after_crash_keeps_the_boot_baseline(self):
+        saved = self.base / 'run' / 'baselines.json'
+        legs = pm.legs_from_config({}, self.legs)
+        first = pm.load_baselines(str(saved))
+        self.assertEqual(first, {})
+        for leg in legs:
+            leg.start(first.get(leg.path))
+        pm.save_baselines(legs, str(saved))
+        for leg in legs:
+            leg.apply('power-saver')
+        # The daemon dies here without end(): power-saver values stay in sysfs.
+        legs = pm.legs_from_config({}, self.legs)
+        found = pm.load_baselines(str(saved))
+        for leg in legs:
+            self.assertTrue(leg.start(found.get(leg.path)))
+        self.assertEqual({leg.name: leg.baseline for leg in legs},
+                         {'rt_floor': '1024', 'aspm': 'default'})
+        for leg in legs:
+            leg.apply('balanced')
+        self.assertEqual(self.rt.read_text(), '1024')
+        self.assertEqual(self.aspm.read_text(), 'default')
+
+    def test_without_saved_baselines_the_files_are_read(self):
+        self.assertEqual(pm.load_baselines(str(self.base / 'missing.json')), {})
+        bad = self.base / 'bad.json'
+        bad.write_text('[1, 2]')
+        self.assertEqual(pm.load_baselines(str(bad)), {})
+        saved = self.base / 'baselines.json'
+        legs = pm.legs_from_config({}, self.legs)
+        for leg in legs:
+            leg.start()
+        pm.save_baselines(legs, str(saved))
+        pm.drop_baselines(str(saved))
+        self.assertFalse(saved.exists())
 
     def test_config_override_and_off(self):
         legs = pm.legs_from_config({'aspm': 'off', 'rt_floor.balanced': '0'}, self.legs)
@@ -123,6 +159,38 @@ class Source(unittest.TestCase):
             self.assertEqual(pm.power_source(str(root)), 'battery')
             (root / 'macsmc-ac' / 'online').write_text('1\n')
             self.assertEqual(pm.power_source(str(root)), 'adapter')
+
+
+class SourceEvents(unittest.TestCase):
+    AC = (b'change@/devices/platform/soc/23e400000.smc/macsmc-power/power_supply/macsmc-ac\0'
+          b'ACTION=change\0DEVPATH=/devices/platform/soc/23e400000.smc/macsmc-power/power_supply/macsmc-ac\0'
+          b'SUBSYSTEM=power_supply\0POWER_SUPPLY_NAME=macsmc-ac\0POWER_SUPPLY_TYPE=Mains\0'
+          b'POWER_SUPPLY_ONLINE=0\0SEQNUM=4242\0')
+    USB = (b'add@/devices/platform/usb-drd1/xhci-hcd.1.auto/usb3/3-1\0ACTION=add\0'
+           b'DEVPATH=/devices/platform/usb-drd1/xhci-hcd.1.auto/usb3/3-1\0SUBSYSTEM=usb\0SEQNUM=4243\0')
+
+    def test_only_power_supply_events_count(self):
+        self.assertTrue(pm.is_power_supply_event(self.AC))
+        self.assertFalse(pm.is_power_supply_event(self.USB))
+        self.assertFalse(pm.is_power_supply_event(b'change@/x\0SUBSYSTEM=power_supply_x\0'))
+
+    def test_drain_reads_every_queued_event(self):
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        with a, b:
+            b.setblocking(False)
+            self.assertFalse(pm.drain_power_supply_events(b))
+            a.send(self.USB)
+            self.assertFalse(pm.drain_power_supply_events(b))
+            a.send(self.USB)
+            a.send(self.AC)
+            a.send(self.USB)
+            self.assertTrue(pm.drain_power_supply_events(b))
+            self.assertFalse(pm.drain_power_supply_events(b))
+
+    def test_the_kernel_uevent_socket_opens_unprivileged(self):
+        sock = pm.uevents()
+        self.assertIsNotNone(sock)
+        sock.close()
 
 
 class Schedule(unittest.TestCase):

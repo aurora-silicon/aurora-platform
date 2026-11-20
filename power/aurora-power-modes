@@ -36,19 +36,26 @@ import json
 import os
 import select
 import signal
+import socket
 import subprocess
 import sys
 import time
 
 CONFIG = '/etc/aurora/power-modes.conf'
 STATUS = '/run/aurora-power-modes/status.json'
+# Each leg's value as found at the first start of this boot.  /run outlives a
+# restart of the daemon but not a reboot, so after a crash (Restart=on-failure)
+# the legs go back to these values, not to whatever power-saver had written.
+BASELINES = '/run/aurora-power-modes/baselines.json'
 POWER_SUPPLY = '/sys/class/power_supply'
 PPD = (
     ('org.freedesktop.UPower.PowerProfiles', '/org/freedesktop/UPower/PowerProfiles'),
     ('net.hadess.PowerProfiles', '/net/hadess/PowerProfiles'),
 )
 PROFILES = ('power-saver', 'balanced', 'performance')
-SOURCE_PERIOD = 5.0     # seconds between power source checks
+SOURCE_PERIOD = 5.0     # seconds between power source checks, only without uevents
+NETLINK_KOBJECT_UEVENT = 15
+UEVENT_KERNEL_GROUP = 1  # the kernel's own uevents, before udev
 LOW_POWER_MODES = ('never', 'always', 'battery', 'adapter')
 
 # Policy: the value of each leg per profile.  A profile without an entry gets
@@ -92,13 +99,17 @@ class Leg:
         self.baseline = None
         self.applied = None
 
-    def start(self):
+    def start(self, saved=None):
+        """Take the baseline: the value saved earlier this boot if there is one, else the file's."""
         try:
-            self.baseline = current_value(self.path)
+            found = current_value(self.path)
         except OSError:
-            self.baseline = None
-        # Nothing has been written: outside the profiles that change it the leg stays as found.
-        self.applied = self.baseline
+            found = None
+        self.baseline = saved if saved is not None and found is not None else found
+        # What the file holds now.  On a first start that is the baseline, and outside the
+        # profiles that change it the leg stays as found; after a crash it may still hold a
+        # profile's value, which apply() then puts back to the baseline.
+        self.applied = found
         return self.baseline is not None
 
     def want(self, profile):
@@ -270,14 +281,84 @@ def set_profile(profile):
 
 
 def monitor():
+    """busctl printing a line for each profile change and each time a profile
+    daemon starts or stops, so a daemon that starts after us is noticed."""
     args = ['busctl', '--system', 'monitor', '--json=short']
-    for _, path in PPD:
+    for name, path in PPD:
         args.append("--match=type='signal',interface='org.freedesktop.DBus.Properties',"
                     "member='PropertiesChanged',path='%s'" % path)
+        args.append("--match=type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
+                    "member='NameOwnerChanged',arg0='%s'" % name)
     try:
         return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
         return None
+
+
+def uevents():
+    """A socket that receives the kernel's uevents, or None.
+
+    power_supply_changed() sends one for the adapter and the battery whenever
+    the charger or a USB-C power source comes or goes, so the power source is
+    read again on those events instead of on a timer.
+    """
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC,
+                             NETLINK_KOBJECT_UEVENT)
+        sock.bind((0, UEVENT_KERNEL_GROUP))
+    except OSError as e:
+        log('no kernel uevents (%s): checking the power source every %.0f s' % (e, SOURCE_PERIOD))
+        return None
+    sock.setblocking(False)
+    return sock
+
+
+def is_power_supply_event(data):
+    """Whether a kernel uevent (ACTION@DEVPATH, then KEY=VALUE fields) is a power supply's."""
+    return b'\0SUBSYSTEM=power_supply\0' in data + b'\0'
+
+
+def drain_power_supply_events(sock):
+    """Read every queued uevent; True when one of them is a power supply's."""
+    found = False
+    while True:
+        try:
+            data = sock.recv(16384)
+        except BlockingIOError:
+            return found
+        except OSError:     # ENOBUFS: events were dropped; read the source again
+            return True
+        found = found or is_power_supply_event(data)
+
+
+def load_baselines(path=BASELINES):
+    """Baselines saved by an earlier run in this boot, by sysfs path; empty if none."""
+    try:
+        with open(path) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(saved, dict):
+        return {}
+    return {k: v for k, v in saved.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def save_baselines(legs, path=BASELINES):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({leg.path: leg.baseline for leg in legs if leg.baseline is not None}, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        log('cannot save the baselines to %s: %s' % (path, e))
+
+
+def drop_baselines(path=BASELINES):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def write_status(state):
@@ -293,7 +374,9 @@ def write_status(state):
 
 def main():
     conf = load_config()
-    legs = [leg for leg in legs_from_config(conf) if leg.start()]
+    saved = load_baselines()
+    legs = [leg for leg in legs_from_config(conf) if leg.start(saved.get(leg.path))]
+    save_baselines(legs)
     mode = conf.get('low_power_mode', 'never').lower()
     if mode not in LOW_POWER_MODES:
         log('low_power_mode %r unknown; using never' % mode)
@@ -305,12 +388,17 @@ def main():
     def stop(*_):
         for leg in legs:
             leg.end()
+        # Clean stop: every leg is back at its baseline, so the next start reads the files again.
+        drop_baselines()
         write_status({'profile': None, 'legs': {}})
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     mon = monitor()
+    # Only these modes follow the power source.
+    follow_source = mode in ('battery', 'adapter')
+    events = uevents() if follow_source else None
     profile = active_profile()
     source = power_source()
     while True:
@@ -324,19 +412,27 @@ def main():
         write_status({'profile': profile, 'source': source, 'low_power_mode': mode,
                       'legs': {leg.name: leg.applied for leg in legs},
                       'restore': sched.previous})
-        ready = []
-        if mon and mon.stdout:
-            ready, _, _ = select.select([mon.stdout], [], [], SOURCE_PERIOD)
-        else:
-            time.sleep(SOURCE_PERIOD)
-        if ready:
+        # Wait for a profile change on D-Bus or a power supply uevent. Only
+        # when busctl, or the uevent socket a mode needs, is missing are the
+        # two read on a timer.
+        watched = [f for f in (mon.stdout if mon else None, events) if f is not None]
+        polling = mon is None or (follow_source and events is None)
+        timeout = SOURCE_PERIOD if polling else None
+        ready, _, _ = select.select(watched, [], [], timeout)
+        if not ready:
+            profile = active_profile()
+            source = power_source()
+            continue
+        if mon and mon.stdout in ready:
             line = mon.stdout.readline()
-            if not line:
+            if not line:    # busctl exited (bus restart): reap it and start another
                 mon.wait()
+                # Rate limit: while the bus is down a new busctl exits at once.
                 time.sleep(1)
                 mon = monitor()
-        profile = active_profile()
-        source = power_source()
+            profile = active_profile()
+        if events in ready and drain_power_supply_events(events):
+            source = power_source()
 
 
 if __name__ == '__main__':

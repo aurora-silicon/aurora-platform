@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       AURORA_TEST_AURA: ${{ github.workspace }}/.aura
+      AURORA_TEST_INSTALLER: ${{ github.workspace }}/.installer
     steps:
       - uses: actions/checkout@v5
       # aura's Stage 1 and signing tools, for the stage1/stage2 tests.
@@ -18,6 +19,14 @@ jobs:
           repository: aurora-silicon/aura
           ref: f3f38a5a87f2ab25ea3fbfeac6164537b2d10b28  # aura main with #195
           path: .aura
+      # The installer's current definition of the execute-window chips, which
+      # aurora-secboot must match (tests/test_secboot.py).
+      - uses: actions/checkout@v5
+        with:
+          repository: aurora-silicon/aurora-installer
+          ref: main
+          path: .installer
+          sparse-checkout: macOS/scripts
       # A mock UPower on a private system bus, for tests/test_charge_full_now_dbus.py.
       - run: sudo apt-get install -y --no-install-recommends python3-dbusmock dbus-daemon
       - run: |
