@@ -139,6 +139,17 @@ class Platform(unittest.TestCase):
     def test_off(self):
         self.assertEqual(pm.legs_from_config({'rt_floor': 'off', 'aspm': 'off', 'platform': 'off'}), [])
 
+    def test_budget_handlers_are_left_to_aurora_power_budget(self):
+        with tempfile.TemporaryDirectory() as t:
+            for dev, name in (('platform-profile-0', 'apple-clpc'), ('platform-profile-1', 'apple-smc')):
+                d = Path(t) / dev
+                d.mkdir()
+                (d / 'name').write_text(name + '\n')
+                (d / 'choices').write_text('low-power balanced performance\n')
+                (d / 'profile').write_text('low-power\n')
+            legs = pm.legs_from_config({'rt_floor': 'off', 'aspm': 'off', '_platform_root': t})
+            self.assertEqual([leg.name for leg in legs], ['platform:apple-smc'])
+
 
 class Source(unittest.TestCase):
     def supply(self, root, name, kind, **attrs):

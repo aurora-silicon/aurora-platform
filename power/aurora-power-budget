@@ -21,11 +21,19 @@ daemon (tuned-ppd or power-profiles-daemon) reports "power-saver", every
      stays schedutil).
 
 Under the budget only the biggest cores' ceiling applies.  In every other
-profile the daemon only waits for D-Bus and writes nothing.  The budget is the
+profile the daemon only waits for D-Bus and writes no CPU limit.  The budget is the
 sum of every CPU's energy-model power at a policy fraction of its cluster's
 maximum, and the ceiling a policy fraction of the biggest cores' maximum (see
 budget_mw() and ceilings()); /etc/aurora/power-budget.conf may override both.  GPU and ANE
 shares are not applied: Linux has no qualified actuator for them yet.
+
+Where the kernel budgets power-saver itself (a platform-profile handler in
+KERNEL_HANDLERS), the daemon hands it each profile instead, by the name its
+choices file offers, and caps the CPU only while the handler does not read
+back power-saver's value.  tuned-ppd drives only ACPI's
+/sys/firmware/acpi/platform_profile, which a device tree boot does not have;
+power-profiles-daemon writes the handler before it announces a profile, so
+there the handler already holds the value and nothing is written.
 """
 
 import json
@@ -42,8 +50,17 @@ CONFIG = '/etc/aurora/power-budget.conf'
 STATUS = '/run/aurora-power-budget/status.json'
 PLATFORM_PROFILE = '/sys/class/platform-profile'
 # Kernel platform-profile handlers whose low-power profile limits CPU power
-# itself; with one present a second budget here would cap the CPU twice.
+# itself; while one holds power-saver a second budget here would cap the CPU
+# twice.  This daemon is their one writer (aurora-power-modes leaves them).
 KERNEL_HANDLERS = ('apple-clpc',)
+# The platform-profile names for each profile daemon profile, in
+# power-profiles-daemon's order of preference: a handler gets the first one
+# its choices file lists, and nothing when it lists none.
+PLATFORM_NAMES = {
+    'power-saver': ('low-power', 'quiet', 'cool'),
+    'balanced': ('balanced',),
+    'performance': ('performance',),
+}
 UNBOUNDED = 2147483647  # kHz: removes the user maximum request
 PERIOD = 0.1            # seconds: macOS's Low Power Mode budget window
 RAISE_PERIODS = 2       # periods a higher cap must persist before it is applied
@@ -70,20 +87,78 @@ def read(path):
         return f.read().strip()
 
 
-def kernel_handler(root=PLATFORM_PROFILE):
-    """The name of a kernel handler that budgets power-saver itself, or None."""
-    try:
-        devices = sorted(os.listdir(root))
-    except OSError:
-        return None
-    for dev in devices:
-        try:
-            name = read(os.path.join(root, dev, 'name'))
-        except OSError:
-            continue
-        if name in KERNEL_HANDLERS:
-            return name
+def platform_value(profile, choices):
+    """The platform-profile name a handler with these choices gets for a profile, or None."""
+    for value in PLATFORM_NAMES.get(profile, ()):
+        if value in choices:
+            return value
     return None
+
+
+class KernelHandlers:
+    """The kernel platform-profile handlers that budget power-saver themselves."""
+
+    def __init__(self, root=PLATFORM_PROFILE):
+        self.root = root
+        self.said = {}      # device: the last thing logged about it
+
+    def devices(self):
+        """[(device, name, choices)] for each such handler present now."""
+        out = []
+        try:
+            devices = sorted(os.listdir(self.root))
+        except OSError:
+            return out
+        for dev in devices:
+            base = os.path.join(self.root, dev)
+            try:
+                name = read(os.path.join(base, 'name'))
+                choices = read(os.path.join(base, 'choices')).split()
+            except OSError:
+                continue
+            if name in KERNEL_HANDLERS:
+                out.append((dev, name, choices))
+        return out
+
+    def say(self, dev, msg):
+        if self.said.get(dev) != msg:
+            self.said[dev] = msg
+            log(msg)
+
+    def hand_over(self, profile):
+        """Give each handler the profile.
+
+        Returns ({device: the profile it reads back}, the name of a handler
+        that now holds power-saver, or None).  A handler is written only when
+        it reads something other than the profile's value, and never for an
+        unknown profile (the profile daemon is not up yet).
+        """
+        state, held = {}, None
+        if profile not in PLATFORM_NAMES:
+            return state, held
+        for dev, name, choices in self.devices():
+            path = os.path.join(self.root, dev, 'profile')
+            value = platform_value(profile, choices)
+            try:
+                now = read(path)
+                if value is not None and now != value:
+                    with open(path, 'w') as f:
+                        f.write(value)
+                    now = read(path)
+            except OSError as e:
+                self.say(dev, '%s (%s): cannot set %s for %s: %s' % (name, dev, value, profile, e))
+                continue
+            state[dev] = now
+            if value is None:
+                self.say(dev, '%s (%s) offers nothing for %s (choices: %s); left at %s' % (
+                    name, dev, profile, ' '.join(choices), now))
+            elif now != value:
+                self.say(dev, '%s (%s) reads %s after %s was written for %s' % (name, dev, now, value, profile))
+            else:
+                self.say(dev, '%s (%s): %s for %s' % (name, dev, value, profile))
+                if profile == 'power-saver' and held is None:
+                    held = name
+        return state, held
 
 
 def be_ints(raw, width):
@@ -395,30 +470,57 @@ def write_status(state):
         pass
 
 
+def cap_wanted(profile, held, have_budget):
+    """Whether this daemon caps the CPU: in power-saver, unless a kernel handler holds it."""
+    return profile == 'power-saver' and held is None and have_budget
+
+
+def idle_status(profile, budget, kernel_state, held):
+    state = {'profile': profile, 'capping': False}
+    if budget is not None:
+        state['budget_mw'] = round(budget)
+    if kernel_state:
+        state['kernel_profiles'] = kernel_state
+    if held:
+        state['reason'] = 'kernel %s holds power-saver' % held
+    elif budget is None:
+        state['reason'] = 'no energy model'
+    return state
+
+
 def main():
-    handler = kernel_handler()
-    if handler:
-        log('kernel %s profile handler present; not capping' % handler)
-        write_status({'profile': None, 'capping': False,
-                      'reason': 'kernel %s profile handler' % handler})
-        signal.pause()
-        return
-    cl = clusters()
-    if not cl:
+    kernel = KernelHandlers()
+    present = sorted({name for _, name, _ in kernel.devices()})
+    try:
+        cl = clusters()
+    except (OSError, ValueError) as e:
+        log('cannot read the CPU clusters: %s' % e)
+        cl = None
+    if not cl and not present:
         log('no device tree energy model for every CPU cluster: power-saver has no CPU budget here')
         write_status({'profile': None, 'capping': False, 'reason': 'no energy model'})
         signal.pause()
         return
+    if present:
+        log('kernel %s profile handler present: it gets each profile; the CPU is capped here '
+            'only while it does not hold power-saver' % ', '.join(present))
     conf = load_config()
-    budget = budget_mw(cl, conf)
-    ceiling = ceilings(cl, conf)
-    log('clusters: %s; power-saver CPU budget %.0f mW (energy-model units)' % (
-        ', '.join('%s %d-%d kHz x%d, ceiling %d' % (c.name, c.fmin, c.fmax, len(c.cpus), t)
-                  for c, t in zip(cl, ceiling)), budget))
+    budget = ceiling = None
+    if cl:
+        budget = budget_mw(cl, conf)
+        ceiling = ceilings(cl, conf)
+        log('clusters: %s; power-saver CPU budget %.0f mW (energy-model units)' % (
+            ', '.join('%s %d-%d kHz x%d, ceiling %d' % (c.name, c.fmin, c.fmax, len(c.cpus), t)
+                      for c, t in zip(cl, ceiling)), budget))
+    else:
+        log('no device tree energy model for every CPU cluster: power-saver has only the kernel\'s budget')
+        cl = []
 
     capping = False
 
     def stop(*_):
+        # The kernel handlers keep their profile: it is the profile daemon's
+        # choice, not a cap of ours, and power-profiles-daemon may own it.
         for c in cl:
             c.end()
         write_status({'profile': None, 'capping': False})
@@ -431,8 +533,9 @@ def main():
     last_status = 0.0
     est_acc, n_acc = 0.0, 0
     profile = active_profile()
+    kernel_state, held = kernel.hand_over(profile)
     while True:
-        want = profile == 'power-saver'
+        want = cap_wanted(profile, held, budget is not None)
         if want and not capping:
             for c in cl:
                 c.begin()
@@ -443,8 +546,12 @@ def main():
             for c in cl:
                 c.end()
             capping = False
-            log('profile %s: CPU caps released' % profile)
-            write_status({'profile': profile, 'capping': False, 'budget_mw': round(budget)})
+            if held:
+                log('power-saver: kernel %s holds it; CPU caps released' % held)
+            else:
+                log('profile %s: CPU caps released' % profile)
+        if not capping:
+            write_status(idle_status(profile, budget, kernel_state, held))
         # Capping samples every PERIOD. Otherwise wait for D-Bus: the profile
         # is re-read on a timer only when busctl could not be started.
         if capping:
@@ -464,9 +571,11 @@ def main():
                 time.sleep(1)
                 mon = monitor()
             profile = active_profile()
+            kernel_state, held = kernel.hand_over(profile)
             continue
         if not capping:
             profile = active_profile()
+            kernel_state, held = kernel.hand_over(profile)
             continue
         est, caps = step(cl, times, budget, ceiling)
         est_acc += est

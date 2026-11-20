@@ -14,10 +14,11 @@ clocks:
             that support L1.1/L1.2 (Wi-Fi, Bluetooth, the SD reader) enter
             them.
   platform  every kernel platform-profile handler (/sys/class/platform-profile)
-            follows the profile: low-power, balanced, performance.  On Macs
-            with High Power mode the kernel's performance profile is what
-            tells the SMC to give the fans their full range.  The profile
-            daemons that already drive the class write the same value.
+            follows the profile: low-power, balanced, performance.  The
+            profile daemons that already drive the class write the same
+            value.  apple-clpc is left to aurora-power-budget, which hands it
+            the profile (on Macs with High Power mode its performance profile
+            is what tells the SMC to give the fans their full range).
 
 Each leg records the value it found at start and puts that value back outside
 the profiles that change it, and when the daemon stops.  Nothing is written
@@ -140,10 +141,16 @@ class Leg:
 
 PLATFORM_PROFILE = '/sys/class/platform-profile'
 PLATFORM_NAMES = {'power-saver': 'low-power', 'balanced': 'balanced', 'performance': 'performance'}
+# Handlers whose power-saver profile is a CPU budget: aurora-power-budget
+# hands them the profile and caps the CPU itself while they do not hold it,
+# so it is their one writer.  A leg here would also put its start-time value
+# back when this daemon stops, under the profile the budget just gave them.
+BUDGET_HANDLERS = ('apple-clpc',)
 
 
 def platform_legs(root=PLATFORM_PROFILE):
-    """One leg per kernel platform-profile handler, with the choices it offers."""
+    """One leg per kernel platform-profile handler, with the choices it offers,
+    except the handlers aurora-power-budget drives."""
     out = []
     try:
         handlers = sorted(os.listdir(root))
@@ -157,6 +164,8 @@ def platform_legs(root=PLATFORM_PROFILE):
             with open(os.path.join(base, 'name')) as f:
                 name = f.read().strip()
         except OSError:
+            continue
+        if name in BUDGET_HANDLERS:
             continue
         values = {p: v for p, v in PLATFORM_NAMES.items() if v in choices}
         out.append(Leg('platform:%s' % name, os.path.join(base, 'profile'), values))

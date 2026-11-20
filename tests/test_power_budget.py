@@ -1,9 +1,12 @@
+import errno
 import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 loader = importlib.machinery.SourceFileLoader('power_budget', str(ROOT / 'power/aurora-power-budget'))
@@ -102,22 +105,232 @@ class PowerBudgetTests(unittest.TestCase):
             # P busy and over budget; idle E gets what one CPU can afford from the rest.
             self.assertEqual(pb.allocate(2 * 441 + 351, [(e, 0.0, e.fmin), (p, 2, p.fmax)]), [2424000, 1704000])
 
-    def test_a_kernel_handler_takes_over_the_budget(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.assertIsNone(pb.kernel_handler(str(root / 'missing')))
-            (root / 'platform-profile-0').mkdir()
-            (root / 'platform-profile-0' / 'name').write_text('thinkpad-acpi\n')
-            self.assertIsNone(pb.kernel_handler(str(root)))
-            (root / 'platform-profile-1').mkdir()
-            (root / 'platform-profile-1' / 'name').write_text('apple-clpc\n')
-            self.assertEqual(pb.kernel_handler(str(root)), 'apple-clpc')
-
     def test_config_parser_ignores_comments(self):
         with tempfile.TemporaryDirectory() as tmp:
             conf = Path(tmp) / 'power-budget.conf'
             conf.write_text('# comment\nbudget_mw = 2500  # watts x1000\nnoise\n')
             self.assertEqual(pb.load_config(str(conf)), {'budget_mw': '2500'})
+
+
+def handler(root, dev='platform-profile-0', name='apple-clpc',
+            choices='low-power balanced performance', profile='balanced'):
+    d = Path(root) / dev
+    d.mkdir(parents=True)
+    (d / 'name').write_text(name + '\n')
+    (d / 'choices').write_text(choices + '\n')
+    (d / 'profile').write_text(profile + '\n')
+    return d / 'profile'
+
+
+def failing_writes(err):
+    """open() for the module under test that refuses every write, as a kernel handler can."""
+    real = open
+
+    def fake(path, mode='r', *args, **kwargs):
+        if 'w' in mode:
+            raise OSError(err, os.strerror(err), path)
+        return real(path, mode, *args, **kwargs)
+    return fake
+
+
+def counting_writes(writes):
+    real = open
+
+    def fake(path, mode='r', *args, **kwargs):
+        if 'w' in mode:
+            writes.append(path)
+        return real(path, mode, *args, **kwargs)
+    return fake
+
+
+class KernelHandlerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.logged = []
+        patcher = mock.patch.object(pb, 'log', self.logged.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_only_named_handlers_count(self):
+        self.assertEqual(pb.KernelHandlers(str(self.root / 'missing')).devices(), [])
+        self.assertEqual(pb.KernelHandlers(str(self.root)).devices(), [])
+        handler(self.root, 'platform-profile-0', name='thinkpad-acpi')
+        self.assertEqual(pb.KernelHandlers(str(self.root)).devices(), [])
+        handler(self.root, 'platform-profile-1')
+        self.assertEqual(pb.KernelHandlers(str(self.root)).devices(),
+                         [('platform-profile-1', 'apple-clpc', ['low-power', 'balanced', 'performance'])])
+
+    def test_names_come_from_the_choices_file(self):
+        apple = 'low-power balanced performance'.split()
+        self.assertEqual([pb.platform_value(p, apple) for p in ('power-saver', 'balanced', 'performance')],
+                         ['low-power', 'balanced', 'performance'])
+        # power-profiles-daemon's fallbacks for power-saver, in its order.
+        self.assertEqual(pb.platform_value('power-saver', ['cool', 'quiet', 'balanced']), 'quiet')
+        self.assertEqual(pb.platform_value('power-saver', ['cool', 'balanced']), 'cool')
+        self.assertIsNone(pb.platform_value('power-saver', ['balanced', 'performance']))
+        self.assertIsNone(pb.platform_value('performance', ['low-power', 'balanced']))
+        self.assertIsNone(pb.platform_value(None, apple))
+
+    def test_each_profile_reaches_the_handler(self):
+        profile = handler(self.root)
+        kernel = pb.KernelHandlers(str(self.root))
+        self.assertEqual(kernel.hand_over('power-saver'), ({'platform-profile-0': 'low-power'}, 'apple-clpc'))
+        self.assertEqual(profile.read_text(), 'low-power')
+        self.assertEqual(kernel.hand_over('performance'), ({'platform-profile-0': 'performance'}, None))
+        self.assertEqual(profile.read_text(), 'performance')
+        self.assertEqual(kernel.hand_over('balanced'), ({'platform-profile-0': 'balanced'}, None))
+        self.assertEqual(profile.read_text(), 'balanced')
+
+    def test_a_handler_that_holds_the_value_is_not_written(self):
+        # power-profiles-daemon writes the class before it announces the profile.
+        handler(self.root, profile='low-power')
+        writes = []
+        with mock.patch.object(pb, 'open', counting_writes(writes), create=True):
+            state, held = pb.KernelHandlers(str(self.root)).hand_over('power-saver')
+        self.assertEqual((state, held, writes), ({'platform-profile-0': 'low-power'}, 'apple-clpc', []))
+
+    def test_unknown_profile_leaves_the_handler_alone(self):
+        profile = handler(self.root, profile='performance')
+        kernel = pb.KernelHandlers(str(self.root))
+        self.assertEqual(kernel.hand_over(None), ({}, None))
+        self.assertEqual(kernel.hand_over('custom'), ({}, None))
+        self.assertEqual(profile.read_text(), 'performance\n')
+
+    def test_no_class_device_is_a_no_op(self):
+        for root in (self.root / 'missing', self.root):
+            self.assertEqual(pb.KernelHandlers(str(root)).hand_over('power-saver'), ({}, None))
+        # So the CPU budget applies, as without a handler before.
+        self.assertTrue(pb.cap_wanted('power-saver', None, True))
+
+    def test_a_refused_write_leaves_power_saver_to_the_budget(self):
+        handler(self.root)
+        kernel = pb.KernelHandlers(str(self.root))
+        with mock.patch.object(pb, 'open', failing_writes(errno.EOPNOTSUPP), create=True):
+            self.assertEqual(kernel.hand_over('power-saver'), ({}, None))
+            kernel.hand_over('power-saver')
+        self.assertEqual(len([m for m in self.logged if 'cannot set low-power' in m]), 1)
+        self.assertTrue(pb.cap_wanted('power-saver', None, True))
+
+    def test_a_handler_without_a_power_saver_choice_does_not_hold_it(self):
+        profile = handler(self.root, choices='balanced performance')
+        state, held = pb.KernelHandlers(str(self.root)).hand_over('power-saver')
+        self.assertEqual((state, held), ({'platform-profile-0': 'balanced'}, None))
+        self.assertEqual(profile.read_text(), 'balanced\n')
+        self.assertTrue(any('offers nothing for power-saver' in m for m in self.logged))
+
+    def test_each_change_is_logged_once(self):
+        handler(self.root)
+        kernel = pb.KernelHandlers(str(self.root))
+        for p in ('power-saver', 'power-saver', 'balanced', 'balanced', 'power-saver'):
+            kernel.hand_over(p)
+        self.assertEqual(self.logged, ['apple-clpc (platform-profile-0): low-power for power-saver',
+                                       'apple-clpc (platform-profile-0): balanced for balanced',
+                                       'apple-clpc (platform-profile-0): low-power for power-saver'])
+
+    def test_who_caps(self):
+        self.assertTrue(pb.cap_wanted('power-saver', None, True))
+        self.assertFalse(pb.cap_wanted('power-saver', 'apple-clpc', True))
+        self.assertFalse(pb.cap_wanted('power-saver', None, False))
+        self.assertFalse(pb.cap_wanted('balanced', None, True))
+        self.assertFalse(pb.cap_wanted(None, None, True))
+
+    def test_idle_status(self):
+        self.assertEqual(pb.idle_status('power-saver', 1234.4, {'platform-profile-0': 'low-power'}, 'apple-clpc'),
+                         {'profile': 'power-saver', 'capping': False, 'budget_mw': 1234,
+                          'kernel_profiles': {'platform-profile-0': 'low-power'},
+                          'reason': 'kernel apple-clpc holds power-saver'})
+        self.assertEqual(pb.idle_status('balanced', None, {}, None),
+                         {'profile': 'balanced', 'capping': False, 'reason': 'no energy model'})
+
+
+class Done(Exception):
+    pass
+
+
+class MainLoopTests(unittest.TestCase):
+    """main() against a fake class device, fake clusters and a fake busctl monitor."""
+
+    def run_main(self, profiles, with_handler=True, with_model=True, refuse=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        fake = FakeSystem(base, missing_microwatt=not with_model)
+        classes = base / 'class'
+        classes.mkdir()
+        profile = handler(classes) if with_handler else None
+        seen, logged, status = [], [], []
+        queue = list(profiles)
+        r, w = os.pipe()
+        # One busctl line per profile read after the first, and one more that ends the run.
+        os.write(w, b'{}\n' * len(queue))
+        os.close(w)
+        mon = types.SimpleNamespace(stdout=os.fdopen(r, 'rb', buffering=0), wait=lambda: None)
+        self.addCleanup(mon.stdout.close)
+
+        def active_profile():
+            if not queue:
+                raise Done()
+            p = queue.pop(0)
+            if profile is not None:
+                seen.append(profile.read_text().strip())
+            return p
+
+        real_clusters, real_handlers = pb.clusters, pb.KernelHandlers
+        self.budget = pb.budget_mw(real_clusters(str(fake.sys), str(fake.dt)), {}) if with_model else None
+        patches = [
+            mock.patch.object(pb, 'clusters', lambda: real_clusters(str(fake.sys), str(fake.dt))),
+            mock.patch.object(pb, 'KernelHandlers', lambda: real_handlers(str(classes))),
+            mock.patch.object(pb, 'active_profile', active_profile),
+            mock.patch.object(pb, 'monitor', lambda: mon),
+            mock.patch.object(pb, 'log', logged.append),
+            mock.patch.object(pb, 'write_status', status.append),
+            mock.patch.object(pb.signal, 'signal', lambda *a: None),
+            mock.patch.object(pb.signal, 'pause', mock.Mock(side_effect=Done)),
+        ]
+        if refuse:
+            patches.append(mock.patch.object(pb, 'open', failing_writes(refuse), create=True))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        with self.assertRaises(Done):
+            pb.main()
+        if profile is not None:
+            seen.append(profile.read_text().strip())
+        return seen, logged, status
+
+    def test_tuned_ppd_profiles_reach_the_handler_and_the_kernel_owns_power_saver(self):
+        # seen: the handler's profile before each profile read, and at the end.
+        seen, logged, status = self.run_main(['balanced', 'power-saver', 'performance', 'balanced'])
+        self.assertEqual(seen, ['balanced', 'balanced', 'low-power', 'performance', 'balanced'])
+        self.assertFalse(any('CPU budget' in m and 'active' in m for m in logged))
+        self.assertIn({'profile': 'power-saver', 'capping': False, 'budget_mw': mock.ANY,
+                       'kernel_profiles': {'platform-profile-0': 'low-power'},
+                       'reason': 'kernel apple-clpc holds power-saver'}, status)
+
+    def test_a_handler_that_refuses_leaves_the_budget_capping(self):
+        seen, logged, _ = self.run_main(['balanced', 'power-saver', 'balanced'], refuse=errno.EOPNOTSUPP)
+        self.assertEqual(seen, ['balanced'] * 4)
+        self.assertEqual([m for m in logged if m.startswith(('power-saver:', 'profile '))],
+                         ['power-saver: CPU budget %.0f mW active' % self.budget, 'profile balanced: CPU caps released'])
+
+    def test_without_a_handler_the_budget_is_unchanged(self):
+        _, logged, _ = self.run_main(['power-saver', 'balanced'], with_handler=False)
+        self.assertEqual([m for m in logged if m.startswith(('power-saver:', 'profile ', 'kernel '))],
+                         ['power-saver: CPU budget %.0f mW active' % self.budget, 'profile balanced: CPU caps released'])
+
+    def test_a_handler_without_an_energy_model_still_gets_the_profile(self):
+        seen, logged, _ = self.run_main(['power-saver', 'balanced'], with_model=False)
+        self.assertEqual(seen, ['balanced', 'low-power', 'balanced'])
+        self.assertIn("no device tree energy model for every CPU cluster: power-saver has only the kernel's budget",
+                      logged)
+
+    def test_no_handler_and_no_energy_model_idles_as_before(self):
+        _, logged, status = self.run_main(['power-saver'], with_handler=False, with_model=False)
+        self.assertEqual(status, [{'profile': None, 'capping': False, 'reason': 'no energy model'}])
 
 
 if __name__ == '__main__':
