@@ -43,10 +43,24 @@ fi
 
 splash_up() { command -v plymouth >/dev/null 2>&1 && timeout 5 plymouth --ping 2>/dev/null; }
 
+# Wait up to $2 seconds for process $1, which is not a child of this script,
+# to exit. Its pidfd becomes readable when it exits, so this returns as soon
+# as it does; a process that is already gone counts as exited.
+wait_exit() {
+  python3 -I - "$1" "$2" <<'PY'
+import os, select, sys
+try:
+    fd = os.pidfd_open(int(sys.argv[1]))
+except ProcessLookupError:
+    sys.exit(0)
+sys.exit(0 if select.select([fd], [], [], float(sys.argv[2]))[0] else 1)
+PY
+}
+
 # Give the console a bounded chance to come back from the boot splash. A splash
 # that does not quit is stopped, so it can never hide this setup indefinitely.
 release_splash() {
-  local attempt pid=''
+  local pid=''
   command -v plymouth >/dev/null 2>&1 || return 0
   [[ ! -r /run/plymouth/pid ]] || pid=$(tr -cd '0-9' < /run/plymouth/pid)
   [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null || pid=$(pgrep -x plymouthd 2>/dev/null | head -n 1 || true)
@@ -56,16 +70,11 @@ release_splash() {
     log "the boot splash (pid $pid) is not responding"
   fi
   [[ -n $pid ]] || return 0
-  for attempt in {1..20}; do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 0.25
-  done
+  wait_exit "$pid" 5 && return 0
   log "stopping the boot splash (pid $pid)"
+  # The splash may exit between the wait and the signal.
   kill -TERM "$pid" 2>/dev/null || true
-  for attempt in {1..10}; do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 0.2
-  done
+  wait_exit "$pid" 2 && return 0
   kill -KILL "$pid" 2>/dev/null || true
 }
 
