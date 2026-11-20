@@ -54,10 +54,11 @@ PLATFORM_PROFILE = '/sys/class/platform-profile'
 # twice.  This daemon is their one writer (aurora-power-modes leaves them).
 KERNEL_HANDLERS = ('apple-clpc',)
 # The platform-profile names for each profile daemon profile, in
-# power-profiles-daemon's order of preference: a handler gets the first one
-# its choices file lists, and nothing when it lists none.
+# power-profiles-daemon 0.30's order of preference: a handler gets the first
+# one its choices file lists, and nothing when it lists none (where
+# power-profiles-daemon writes balanced, the CPU budget here applies instead).
 PLATFORM_NAMES = {
-    'power-saver': ('low-power', 'quiet', 'cool'),
+    'power-saver': ('low-power', 'quiet'),
     'balanced': ('balanced',),
     'performance': ('performance',),
 }
