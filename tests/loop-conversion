@@ -31,6 +31,9 @@ esp=${loop}p1; boot=${loop}p2; root=${loop}p3
 mkfs.vfat -F32 "$esp"
 mkfs.ext4 -q -L AURORA_BOOT "$boot"
 mkfs.btrfs -q -f -L AURORA_ROOT "$root"
+# Let udev pick up the new filesystems' UUIDs and labels; on a real Mac they
+# exist before boot, so aurora-initrd-root only waits for the partitions.
+udevadm settle
 mkdir -p "$scratch/mnt" "$scratch/systemd"
 mount "$root" "$scratch/mnt"
 btrfs subvolume create "$scratch/mnt/root"

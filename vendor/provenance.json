@@ -2,6 +2,6 @@
   "source_repository": "https://github.com/aurora-silicon/omarchy-pkgs",
   "checkout_head": "96d1cbcec74f51e42e6c7910d2722dfbe484fa36",
   "source_path": "omarchy-mac-boot/files/usr/lib/omarchy/initcpio/omarchy-mac-encrypt",
-  "file_sha256": "8b976a4895c9504f42aee20927becae97a7eec91f5e6fba31c9b7065d97fe7d7",
-  "scope": "Based on the captured Btrfs conversion and durable phase journal. Aurora adds guarded recovery of an abruptly interrupted LUKS2 hotzone before resume. The file hash identifies this patched implementation; checkout_head and source_path identify its upstream base."
+  "file_sha256": "4363725ca75aa642c95e7498613a7d144c0aca4c499113eb244f525c8ebf140d",
+  "scope": "Based on the captured Btrfs conversion and durable phase journal. Aurora adds guarded recovery of an abruptly interrupted LUKS2 hotzone before resume. The file hash identifies this patched implementation; checkout_head and source_path identify its upstream base. Aurora also waits for /dev/mapper/root with udevadm wait instead of settling the whole udev queue; the caller waits for the boot disk's partitions."
 }

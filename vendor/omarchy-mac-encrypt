@@ -595,10 +595,9 @@ omarchy_mac_encrypt_open() {
         fi
         omarchy_mac_encrypt_fail "/dev/mapper/root already exists; refusing to replace it"
     fi
-    udevadm settle 2>/dev/null || true
     cryptsetup open --batch-mode --key-file "$BOOT_KEY" --keyfile-size "$KEY_BYTES" \
         "$ROOT_DEV" root || { omarchy_mac_encrypt_say "could not open LUKS root with the throwaway key"; return 1; }
-    udevadm settle 2>/dev/null || true
+    udevadm wait --timeout=60 /dev/mapper/root
 }
 
 omarchy_mac_encrypt_resize_luks() {
@@ -871,7 +870,7 @@ omarchy_mac_encrypt_main() {
     STATE_EXTRA=""
 
     trap 'omarchy_mac_encrypt_surface_unexpected $?; omarchy_mac_encrypt_cleanup' EXIT
-    udevadm settle 2>/dev/null || true
+    # The caller has waited for the boot disk's partitions (udevadm wait).
     local mounts_ok=1
     omarchy_mac_encrypt_mount_esp || mounts_ok=0
     if (( mounts_ok )); then
