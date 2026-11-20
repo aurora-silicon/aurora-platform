@@ -33,7 +33,11 @@ while IFS='=' read -r key value; do
   esac
 done < "$layout"
 [[ $format == 1 && -n $BOOT_UUID && -n $AURORA_ROOT_UUID ]] || exit 1
-property=${AURORA_ESP_PROPERTY:-/sys/firmware/devicetree/base/chosen/asahi,efi-system-partition}
+property=${AURORA_ESP_PROPERTY:-/sys/firmware/devicetree/base/chosen/aurora,efi-system-partition}
+# LEGACY-ASAHI(2027-02-28): aura builds before the rename write only the asahi, name.
+if [[ -z ${AURORA_ESP_PROPERTY:-} && ! -r $property ]]; then
+  property=/sys/firmware/devicetree/base/chosen/asahi,efi-system-partition
+fi
 [[ -r $property ]] || { echo 'Apple EFI partition handoff is missing' >&2; exit 1; }
 ESP_PARTUUID=$(tr -d '\000' < "$property")
 [[ $ESP_PARTUUID =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || exit 1

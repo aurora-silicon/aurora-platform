@@ -90,7 +90,14 @@ else
   rm -rf "$scratch/root/etc/pacman.d/gnupg"
 fi
 # The ESP is formatted afresh by macOS; its volume_id is preserved in metadata.
-[[ -s $scratch/root/boot/efi/m1n1/boot.bin && -s $scratch/root/boot/efi/EFI/BOOT/BOOTAA64.EFI ]]
+# The image's Stage 2 and aura binary. LEGACY-ASAHI(2027-02-28): distribution packages from
+# before the rename write m1n1/boot.bin and ship /usr/lib/asahi-boot/m1n1.bin.
+stage2_dir=aurora aura_bin=$scratch/root/usr/lib/aurora-boot/aura.bin
+if [[ ! -s $scratch/root/boot/efi/aurora/boot.bin && -s $scratch/root/boot/efi/m1n1/boot.bin ]]; then
+  stage2_dir=m1n1
+fi
+[[ -s $aura_bin ]] || aura_bin=$scratch/root/usr/lib/asahi-boot/m1n1.bin
+[[ -s $scratch/root/boot/efi/$stage2_dir/boot.bin && -s $scratch/root/boot/efi/EFI/BOOT/BOOTAA64.EFI ]]
 cp -a "$scratch/root/boot/efi" "$output/esp"
 install -Dm644 "$scratch/root/usr/share/aura/stage1/aura-raw.bin" "$output/esp/aurora/stage1.bin"
 # The installer boots this Mach-O form of the same Stage 1 on M4 and later Macs.
@@ -102,9 +109,9 @@ else
   echo "Warning: no ${stage1_macho#"$scratch/root"} in the image; the ESP has no aurora/stage1.macho" >&2
 fi
 python3 "$(dirname -- "${BASH_SOURCE[0]}")/prepare-stage2.py" \
-  --combined "$output/esp/m1n1/boot.bin" \
-  --aura "$scratch/root/usr/lib/asahi-boot/m1n1.bin" \
-  --output "$output/esp/m1n1" --manifest "$output/stage2.json"
+  --combined "$output/esp/$stage2_dir/boot.bin" \
+  --aura "$aura_bin" --member-dir "esp/$stage2_dir" \
+  --output "$output/esp/$stage2_dir" --manifest "$output/stage2.json"
 cp "$scratch/root/etc/aurora/image-layout" "$output/image-layout"
 cp "$scratch/root/etc/fstab" "$output/fstab"
 if [[ $backend == dracut ]]; then
