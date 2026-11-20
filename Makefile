@@ -5,7 +5,7 @@ SYSCONFDIR ?= /etc
 LOCALSTATEDIR ?= /var
 SELINUX_DEVEL ?= /usr/share/selinux/devel/Makefile
 
-install: install-common install-dracut install-mkinitcpio install-power install-gamemode install-secboot install-secboot-mkinitcpio
+install: install-common install-dracut install-mkinitcpio install-power install-gamemode install-secboot install-secboot-mkinitcpio install-cec
 
 install-common:
 	install -Dm755 libexec/aurora-initrd-root $(DESTDIR)$(LIBDIR)/aurora/aurora-initrd-root
@@ -38,6 +38,15 @@ install-power:
 	install -Dm644 power/aurora-power-modes.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-power-modes.service
 	install -Dm644 power/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/README.md
 	install -Dm644 power/DESIGN.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/DESIGN.md
+
+# HDMI-CEC power and input sync for the built-in HDMI port (cec/README.md).
+# Packages add a preset that enables aurora-cec-sleep.service.
+install-cec:
+	install -Dm755 cec/aurora-cec $(DESTDIR)$(PREFIX)/libexec/aurora/aurora-cec
+	install -Dm644 cec/aurora-cec@.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-cec@.service
+	install -Dm644 cec/aurora-cec-sleep.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-cec-sleep.service
+	install -Dm644 cec/70-aurora-cec.rules $(DESTDIR)$(LIBDIR)/udev/rules.d/70-aurora-cec.rules
+	install -Dm644 cec/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-cec/README.md
 
 # GameMode defaults (power/GAMEMODE.md): an administrator-level config that
 # GameMode merges over its shipped one. Packages ship it as a config file.

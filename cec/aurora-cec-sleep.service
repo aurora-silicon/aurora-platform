@@ -1,0 +1,21 @@
+[Unit]
+Description=HDMI-CEC: TV standby on sleep, TV on after resume
+Documentation=https://github.com/aurora-silicon/aurora-platform/blob/main/cec/README.md
+ConditionPathExistsGlob=/dev/cec*
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/aurora/aurora-cec suspend
+# After resume: run each adapter's wake again, without holding up resume.
+ExecStop=/usr/bin/systemctl --no-block restart aurora-cec@*.service
+TimeoutStartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=sleep.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=HDMI-CEC: turn the TV on and select this Mac (%I)
+Documentation=https://github.com/aurora-silicon/aurora-platform/blob/main/cec/README.md
+# Started by 70-aurora-cec.rules for each apple-dcp CEC adapter.
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/aurora/aurora-cec wake %I
+TimeoutStartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict

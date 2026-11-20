@@ -1,0 +1,116 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# HDMI-CEC power and input sync for the built-in HDMI port, as macOS does:
+#
+#   aurora-cec wake cecN   claim a Playback logical address, turn the TV on
+#                          (Image View On) and switch it to this Mac
+#                          (Active Source). Run at boot and after resume.
+#   aurora-cec suspend     put the TV in standby, unless another device is
+#                          the active source. Bounded to about 1 s in total.
+#
+# Only adapters of the Apple display coprocessor (driver apple-dcp) are
+# touched. No adapter, no TV, or a TV without CEC: nothing happens and the
+# exit status is 0.
+set -uo pipefail
+
+SYSFS=${AURORA_CEC_SYSFS:-/sys}
+DEV=${AURORA_CEC_DEV:-/dev}
+CEC_CTL=${AURORA_CEC_CTL:-cec-ctl}
+WAKE_WAIT=${AURORA_CEC_WAKE_WAIT:-15}   # seconds to wait for the TV after boot or resume
+INVALID_PA=f.f.f.f
+
+log() { echo "$*"; }
+
+ctl() {   # ctl <seconds> <cecN> <cec-ctl args...>
+  local limit=$1 dev=$2
+  shift 2
+  timeout --kill-after=0.2 "$limit" "$CEC_CTL" -d "$DEV/$dev" -s "$@" 2>/dev/null
+}
+
+is_apple() {
+  local node
+  node=$(readlink -f "$SYSFS/bus/cec/devices/$1" 2>/dev/null) || return 1
+  [[ $(basename "$(readlink -f "$node/../driver" 2>/dev/null)") == apple-dcp ]]
+}
+
+adapters() {
+  local path
+  for path in "$SYSFS"/bus/cec/devices/cec*; do
+    [[ -e $path ]] || continue
+    is_apple "${path##*/}" && echo "${path##*/}"
+  done
+}
+
+phys_addr() { ctl 0.3 "$1" -x | tail -n 1; }
+
+# The first claimed logical address, or nothing (15 means still claiming).
+log_addr() {
+  local la
+  la=$(ctl 0.3 "$1" -l | tail -n 1)
+  [[ $la =~ ^[0-9]+$ && $la != 15 ]] && echo "$la"
+}
+
+# The OSD name the TV shows: the Mac's model ("Mac mini", "MacBook Pro").
+osd_name() {
+  local model
+  model=$(tr -d '\0' < "$SYSFS/firmware/devicetree/base/model" 2>/dev/null)
+  model=${model#Apple }
+  model=${model%% (*}
+  [[ $model == Mac* ]] || model=Mac
+  echo "${model:0:14}"
+}
+
+wake() {
+  local dev=${1:?cec adapter required} pa la deadline
+  [[ -e $DEV/$dev ]] && is_apple "$dev" || exit 0
+  # The kernel keeps the logical address and claims it again by itself
+  # whenever the TV reappears; configure only an unconfigured adapter.
+  if [[ -z $(ctl 0.3 "$dev" -L | tr -d ' \n') ]]; then
+    ctl 3 "$dev" --playback --osd-name "$(osd_name)" >/dev/null
+  fi
+  deadline=$((SECONDS + WAKE_WAIT))
+  while :; do
+    pa=$(phys_addr "$dev")
+    la=$(log_addr "$dev")
+    [[ -n $pa && $pa != "$INVALID_PA" && -n $la ]] && break
+    (( SECONDS < deadline )) || exit 0
+    sleep 0.5
+  done
+  ctl 2 "$dev" --to 0 --image-view-on >/dev/null || exit 0
+  ctl 2 "$dev" --to 15 --active-source phys-addr="$pa" >/dev/null || exit 0
+  log "$dev: TV on, input set to $pa"
+}
+
+# The physical address another device reports as active source, if any.
+active_source() {
+  ctl 0.5 "$1" --to 15 --timeout 300 --request-active-source |
+    awk '/Received from/ { got = 1 } got && $1 == "phys-addr:" { print $2; exit }'
+}
+
+suspend_one() {
+  local dev=$1 pa active
+  pa=$(phys_addr "$dev")
+  [[ -n $pa && $pa != "$INVALID_PA" && -n $(log_addr "$dev") ]] || return 0
+  active=$(active_source "$dev")
+  if [[ -n $active && $active != "$pa" ]]; then
+    log "$dev: $active is the active source, TV left on"
+    return 0
+  fi
+  ctl 0.4 "$dev" --to 0 --standby >/dev/null && log "$dev: TV standby"
+  return 0
+}
+
+suspend_all() {
+  local dev
+  for dev in $(adapters); do
+    suspend_one "$dev" &
+  done
+  wait
+}
+
+case ${1:-} in
+  wake) wake "${2:-}" ;;
+  suspend) suspend_all ;;
+  *) echo "usage: aurora-cec wake cecN | suspend" >&2; exit 2 ;;
+esac
+exit 0
