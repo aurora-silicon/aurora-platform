@@ -10,6 +10,9 @@ ExecStart=/usr/libexec/aurora/aurora-power-modes
 Restart=on-failure
 RestartSec=5
 RuntimeDirectory=aurora-power-modes
+# Keeps baselines.json across Restart=on-failure, so a restarted daemon restores
+# the values found at boot, not the ones its last profile wrote.
+RuntimeDirectoryPreserve=restart
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
