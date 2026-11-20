@@ -168,9 +168,9 @@ class KernelHandlerTests(unittest.TestCase):
         apple = 'low-power balanced performance'.split()
         self.assertEqual([pb.platform_value(p, apple) for p in ('power-saver', 'balanced', 'performance')],
                          ['low-power', 'balanced', 'performance'])
-        # power-profiles-daemon's fallbacks for power-saver, in its order.
+        # power-profiles-daemon 0.30's fallback for power-saver.
         self.assertEqual(pb.platform_value('power-saver', ['cool', 'quiet', 'balanced']), 'quiet')
-        self.assertEqual(pb.platform_value('power-saver', ['cool', 'balanced']), 'cool')
+        self.assertIsNone(pb.platform_value('power-saver', ['cool', 'balanced']))
         self.assertIsNone(pb.platform_value('power-saver', ['balanced', 'performance']))
         self.assertIsNone(pb.platform_value('performance', ['low-power', 'balanced']))
         self.assertIsNone(pb.platform_value(None, apple))

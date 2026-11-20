@@ -101,8 +101,8 @@ Power Mode's measured package power, on the T6041 at 2808 MHz only. On the
 to the SMC.
 
 The daemon hands that handler every profile, by the name its `choices` file
-lists (power-saver: `low-power`, else `quiet`, else `cool`, as
-power-profiles-daemon picks them). tuned-ppd, on Fedora, drives only ACPI's
+lists (power-saver: `low-power`, else `quiet`, as power-profiles-daemon 0.30
+picks them). tuned-ppd, on Fedora, drives only ACPI's
 `/sys/firmware/acpi/platform_profile`, which a device tree boot never has, so
 without this the handler would stay at `balanced`. power-profiles-daemon,
 with Aurora's class-device patch on Arch Linux ARM and NixOS, writes the
