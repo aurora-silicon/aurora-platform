@@ -1,0 +1,20 @@
+[Unit]
+Description=Charge the battery to full once, then restore the charge limit
+Documentation=https://github.com/aurora-silicon/aurora-platform/blob/main/power/README.md
+Wants=upower.service
+After=upower.service aurora-charge-full-now-restore.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/aurora-charge-full-now run
+# Runs however the one-shot ends (done, cancelled, crashed, killed): the limit comes back.
+ExecStopPost=/usr/bin/aurora-charge-full-now restore
+# Backstop for the program's own 12 h ceiling (that one also counts time in suspend).
+RuntimeMaxSec=13h
+TimeoutStopSec=90
+StateDirectory=aurora/charge-full-now
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX

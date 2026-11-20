@@ -1,0 +1,19 @@
+[Unit]
+Description=Restore the battery charge limit after an interrupted charge to full
+Documentation=https://github.com/aurora-silicon/aurora-platform/blob/main/power/README.md
+ConditionPathExists=/var/lib/aurora/charge-full-now/active
+Wants=upower.service
+After=upower.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/aurora-charge-full-now restore
+StateDirectory=aurora/charge-full-now
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

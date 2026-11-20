@@ -5,7 +5,7 @@ SYSCONFDIR ?= /etc
 LOCALSTATEDIR ?= /var
 SELINUX_DEVEL ?= /usr/share/selinux/devel/Makefile
 
-install: install-common install-dracut install-mkinitcpio install-power install-gamemode install-secboot install-secboot-mkinitcpio
+install: install-common install-dracut install-mkinitcpio install-power install-charge-full-now install-gamemode install-secboot install-secboot-mkinitcpio
 
 install-common:
 	install -Dm755 libexec/aurora-initrd-root $(DESTDIR)$(LIBDIR)/aurora/aurora-initrd-root
@@ -38,6 +38,25 @@ install-power:
 	install -Dm644 power/aurora-power-modes.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-power-modes.service
 	install -Dm644 power/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/README.md
 	install -Dm644 power/DESIGN.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/DESIGN.md
+
+# Charge to Full Now (power/README.md): the command, the one-shot service, the
+# boot-time restore and the polkit rule for the active local user.  Enable the
+# restore unit (systemctl enable aurora-charge-full-now-restore.service).
+install-charge-full-now:
+	install -Dm755 power/aurora-charge-full-now $(DESTDIR)$(PREFIX)/bin/aurora-charge-full-now
+	install -Dm644 power/aurora-charge-full-now.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-charge-full-now.service
+	install -Dm644 power/aurora-charge-full-now-restore.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-charge-full-now-restore.service
+	install -Dm644 'power/aurora-charge-full-now-schedule@.service' '$(DESTDIR)$(LIBDIR)/systemd/system/aurora-charge-full-now-schedule@.service'
+	install -Dm644 power/50-aurora-charge-full-now.rules $(DESTDIR)$(PREFIX)/share/polkit-1/rules.d/50-aurora-charge-full-now.rules
+	install -dm755 $(DESTDIR)$(LOCALSTATEDIR)/lib/aurora/charge-full-now
+
+# Optional, not part of install: the GNOME Shell 50/51 quick settings toggle for
+# aurora-charge-full-now (gnome/README.md).  Installed system wide it stays off
+# until a user runs gnome-extensions enable charge-full-now@aurorasilicon.org.
+GNOME_EXT = charge-full-now@aurorasilicon.org
+install-gnome-charge-full-now:
+	install -Dm644 gnome/$(GNOME_EXT)/metadata.json $(DESTDIR)$(PREFIX)/share/gnome-shell/extensions/$(GNOME_EXT)/metadata.json
+	install -Dm644 gnome/$(GNOME_EXT)/extension.js $(DESTDIR)$(PREFIX)/share/gnome-shell/extensions/$(GNOME_EXT)/extension.js
 
 # GameMode defaults (power/GAMEMODE.md): an administrator-level config that
 # GameMode merges over its shipped one. Packages ship it as a config file.
