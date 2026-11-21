@@ -5,7 +5,12 @@ set -euo pipefail
 image=$(realpath "${1:?raw image required}")
 profile=${2:?installation profile required}
 output=$(realpath -m "${3:?new output directory required}")
-case $profile in fedora-kde|fedora-gnome|fedora-minimal) backend=dracut;; arch-kde|arch-gnome|arch-minimal) backend=mkinitcpio;; *) echo 'Unsupported image finalizer profile' >&2; exit 2;; esac
+case $profile in
+  fedora-kde|fedora-gnome|fedora-minimal) distribution=fedora backend=dracut;;
+  arch-kde|arch-gnome|arch-minimal) distribution=arch backend=mkinitcpio;;
+  debian-kde|debian-gnome|debian-minimal) distribution=debian backend=dracut;;
+  *) echo 'Unsupported image finalizer profile' >&2; exit 2;;
+esac
 [[ $(id -u) == 0 && $(uname -m) == aarch64 ]] || { echo 'Requires a disposable privileged native AArch64 builder' >&2; exit 2; }
 [[ -f $image && ! -L $image && ! -e $output ]] || exit 2
 mkdir -p "$output"
@@ -62,16 +67,26 @@ chroot "$scratch/root" systemctl enable aurora-firstboot.service
 # Aurora owns account setup on tty1; the generic base wizard must not compete.
 chroot "$scratch/root" systemctl mask systemd-firstboot.service
 # GRUB must never probe other disks or NVMe namespaces; see harden-grub.py.
+# Debian's GRUB has Arch's layout: /boot/grub and /usr/lib/grub/arm64-efi.
 flavor=fedora
-[[ $backend == dracut ]] || flavor=arch
+[[ $distribution == fedora ]] || flavor=arch
 python3 "$(dirname -- "${BASH_SOURCE[0]}")/harden-grub.py" "$scratch/root" --flavor "$flavor" \
   --boot-uuid "$boot_uuid" --efi-uuid "$efi_uuid"
 if [[ $backend == dracut ]]; then
-  chroot "$scratch/root" systemctl disable initial-setup.service initial-setup-graphical.service 2>/dev/null || true
-  rm -f "$scratch/root/etc/reconfigSys"
+  preset_mode=full
+  initrd=initramfs-KERNEL.img
+  if [[ $distribution == fedora ]]; then
+    chroot "$scratch/root" systemctl disable initial-setup.service initial-setup-graphical.service 2>/dev/null || true
+    rm -f "$scratch/root/etc/reconfigSys"
+  else
+    # Debian's maintainer scripts enable units without consulting presets, and
+    # the first boot applies presets in enable-only mode, as checked here.
+    preset_mode=enable-only
+    initrd=initrd.img-KERNEL
+  fi
   # systemd applies every preset on the first boot, while / is still
   # read-only, so the image must already be in its preset state.
-  presets=$(chroot "$scratch/root" systemctl preset-all 2>&1) || true
+  presets=$(chroot "$scratch/root" systemctl preset-all --preset-mode="$preset_mode" 2>&1) || true
   if grep -E '^(Created symlink|Removed) ' <<<"$presets" >&2; then
     echo 'Unit states differ from their presets; the first boot cannot apply them' >&2
     exit 1
@@ -79,11 +94,14 @@ if [[ $backend == dracut ]]; then
   kernels=("$scratch/root/usr/lib/modules/"*)
   (( ${#kernels[@]} == 1 ))
   kernel=${kernels[0]##*/}
-  chroot "$scratch/root" dracut --force --no-hostonly --add 'aurora-root systemd-ask-password' "/boot/initramfs-$kernel.img" "$kernel"
-  chroot "$scratch/root" lsinitrd "/boot/initramfs-$kernel.img" > "$output/initramfs-inventory.txt"
+  initrd=/boot/${initrd/KERNEL/$kernel}
+  chroot "$scratch/root" dracut --force --no-hostonly --add 'aurora-root systemd-ask-password' "$initrd" "$kernel"
+  chroot "$scratch/root" lsinitrd "$initrd" > "$output/initramfs-inventory.txt"
   grep -q 'aurora-initrd-root.service' "$output/initramfs-inventory.txt"
   grep -q 'aurora/image-layout' "$output/initramfs-inventory.txt"
-  chroot "$scratch/root" /bin/bash -s -- / < "$(dirname -- "${BASH_SOURCE[0]}")/label-fedora-rootfs"
+  if [[ $distribution == fedora ]]; then
+    chroot "$scratch/root" /bin/bash -s -- / < "$(dirname -- "${BASH_SOURCE[0]}")/label-fedora-rootfs"
+  fi
 else
   chroot "$scratch/root" mkinitcpio -P
   # Each installed Mac creates its own pacman master key; only public keyrings ship.
@@ -107,8 +125,10 @@ python3 "$(dirname -- "${BASH_SOURCE[0]}")/prepare-stage2.py" \
   --output "$output/esp/m1n1" --manifest "$output/stage2.json"
 cp "$scratch/root/etc/aurora/image-layout" "$output/image-layout"
 cp "$scratch/root/etc/fstab" "$output/fstab"
-if [[ $backend == dracut ]]; then
+if [[ $distribution == fedora ]]; then
   chroot "$scratch/root" rpm -qa --qf '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > "$output/packages.txt"
+elif [[ $distribution == debian ]]; then
+  chroot "$scratch/root" dpkg-query -W -f '${Package} ${Version} ${Architecture}\n' | sort > "$output/packages.txt"
 else
   chroot "$scratch/root" pacman -Q > "$output/packages.txt"
 fi
@@ -119,7 +139,7 @@ for path in dev proc sys run boot/efi boot ''; do
 done
 dd if="${loop}p2" of="$output/boot.img" bs=4M conv=sparse status=none
 dd if="${loop}p3" of="$output/root.img" bs=4M conv=sparse status=none
-python3 - "$output" "$profile" "$root_uuid" "$boot_uuid" "$efi_uuid" "$(blockdev --getsize64 "${loop}p1")" <<'PY'
+python3 - "$output" "$profile" "$root_uuid" "$boot_uuid" "$efi_uuid" "$(blockdev --getsize64 "${loop}p1")" "$distribution" <<'PY'
 import hashlib,json,sys
 from pathlib import Path
 out=Path(sys.argv[1]); profile=sys.argv[2]
@@ -129,7 +149,7 @@ for name in ('boot.img','root.img'):
  with path.open('rb') as stream: digest=hashlib.file_digest(stream,'sha256').hexdigest()
  images[name]={'bytes':path.stat().st_size,'sha256':digest}
 (out/'image.json').write_text(json.dumps({'schema':1,'installation_profile':profile,
- 'layout_kind':('fedora' if profile.startswith('fedora-') else 'alarm')+'-btrfs-v1',
+ 'layout_kind':{'fedora':'fedora','arch':'alarm','debian':'debian'}[sys.argv[7]]+'-btrfs-v1',
  'root_uuid':sys.argv[3],'boot_uuid':sys.argv[4],'efi_uuid':sys.argv[5],
  'efi_volume_id':sys.argv[5].replace('-',''),'efi_bytes':int(sys.argv[6]),
  'root_subvolume':'root','home_subvolume':'home','images':images},indent=2)+'\n')

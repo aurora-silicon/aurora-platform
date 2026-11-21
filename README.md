@@ -1,10 +1,12 @@
 # Aurora first boot
 
-Shared first-boot integration for Fedora Aurora Remix, Aurora ALARM and Aurora NixOS. This is distribution support code, separate from the native macOS installer. The native app records the encryption choice on the target EFI partition; Linux creates a separate owner account and password.
+Shared first-boot integration for Fedora Aurora Remix, Aurora ALARM, Aurora NixOS and Aurora Debian. This is distribution support code, separate from the native macOS installer. The native app records the encryption choice on the target EFI partition; Linux creates a separate owner account and password.
 
 The image contract uses a Btrfs root subvolume named `root`, an ext4 boot filesystem, and the EFI partition handed off by Aura in the device tree. `/etc/aurora/image-layout` contains only version 1, the root filesystem UUID, the boot filesystem UUID and the root subvolume. Image production supplies it and copies it into every initrd; installing this package alone does not arm conversion. A fresh image also supplies `/usr/lib/aurora/image-format` (`aurora-btrfs-v1`) and `/var/lib/aurora/firstboot/pending`.
 
 `aurora-initrd-root` adapts the captured conversion state machine to those identities and mounts. It verifies that all target filesystems belong to the handed-off EFI disk, records the root GPT identity before conversion, and retains the resumable phase journal. Every initrd includes the unlock service, so the normal root filesystem UUID remains valid after opening its LUKS container. The first-boot account wizard replaces the temporary key with the Linux password, verifies unlock, retires the temporary key copies and releases the login services. NixOS persists the account declaration and a private password-hash file outside the public Nix store.
+
+Aurora Debian (Debian testing) uses the dracut path with Debian's initrd name, `/boot/initrd.img-<kernel>`, and GRUB's Arch layout (`/boot/grub`, `/usr/lib/grub/arm64-efi`). Debian's maintainer scripts enable units without consulting presets and its systemd ships no `disable *` preset, so the image supplies one and `finalize-image` checks the preset state in the enable-only mode the first boot uses. Debian has no `wheel` group; the image creates it.
 
 ## Desktop and text setup
 

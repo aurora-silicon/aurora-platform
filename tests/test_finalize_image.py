@@ -57,5 +57,43 @@ class Stage1Tests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+def image_record_block():
+    """The finalizer's image.json writer."""
+    text = FINALIZE.read_text()
+    start = text.index("<<'PY'\n") + len("<<'PY'\n")
+    return text[start:text.index('\nPY\n', start)]
+
+
+class ImageRecordTests(unittest.TestCase):
+    def write_record(self, profile, distribution):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            for name in ('boot.img', 'root.img'):
+                (output / name).write_bytes(name.encode())
+            subprocess.run(['python3', '-c', image_record_block(), str(output), profile, 'r-uuid', 'b-uuid',
+                            'ABCD-1234', '536870912', distribution], check=True)
+            import json
+            return json.loads((output / 'image.json').read_text())
+
+    def test_each_distribution_names_its_own_layout(self):
+        for profile, distribution, layout in (('fedora-kde', 'fedora', 'fedora-btrfs-v1'),
+                                              ('arch-gnome', 'arch', 'alarm-btrfs-v1'),
+                                              ('debian-minimal', 'debian', 'debian-btrfs-v1')):
+            record = self.write_record(profile, distribution)
+            self.assertEqual(record['layout_kind'], layout)
+            self.assertEqual(record['installation_profile'], profile)
+            self.assertEqual(record['root_subvolume'], 'root')
+            self.assertEqual(record['efi_volume_id'], 'ABCD1234')
+
+    def test_debian_profiles_use_dracut_and_their_initrd_name(self):
+        text = FINALIZE.read_text()
+        self.assertIn('debian-kde|debian-gnome|debian-minimal) distribution=debian backend=dracut;;', text)
+        self.assertIn('initrd=initrd.img-KERNEL', text)
+        self.assertIn("dpkg-query -W -f '${Package} ${Version} ${Architecture}\\n'", text)
+        # SELinux labelling and Anaconda's initial setup are Fedora's alone.
+        fedora_only = text[text.index('if [[ $distribution == fedora ]]; then\n    chroot "$scratch/root" /bin/bash'):]
+        self.assertIn('label-fedora-rootfs', fedora_only.split('fi', 1)[0])
+
+
 if __name__ == '__main__':
     unittest.main()
