@@ -450,7 +450,8 @@ sync_initrd_keymap() {
   exec 8> "$run_dir/aurora-initrd-keymap.lock"
   flock 8
   wanted=$(console_keymap)
-  for image in "$initrd_dir"/initramfs-*.img; do
+  # dracut names the image initramfs-<kernel>.img, or initrd.img-<kernel> on Debian.
+  for image in "$initrd_dir"/initramfs-*.img "$initrd_dir"/initrd.img-*; do
     [[ -f $image && $image != *rescue* && $image != *kdump* ]] || continue
     if ! current=$(initrd_keymap "$image"); then
       warn "cannot read the console keymap in $image"
