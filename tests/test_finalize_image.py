@@ -198,6 +198,13 @@ class StepTests(unittest.TestCase):
                 self.assertIn('against their presets', result.stderr)
                 self.assertFalse([entry for entry in log if entry.startswith('dracut')])
 
+    def test_a_debian_image_without_a_wheel_group_fails(self):
+        result, log, _ = self.run_step('dracut', 'debian-gnome', {'unit-files': ''})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('no wheel group', result.stderr)
+        self.assertIn('getent group wheel', log)
+        self.assertFalse([line for line in log if line.startswith('dracut')])
+
     def test_fedora_relies_on_its_full_preset_pass(self):
         result, log, _ = self.run_step('dracut', 'fedora-kde')
         self.assertEqual(result.returncode, 0, result.stderr)
