@@ -154,7 +154,7 @@ class StepTests(unittest.TestCase):
                 self.assertIn(f'--flavor {flavor} --boot-uuid b-uuid --efi-uuid e-uuid', log[0])
 
     def test_debian_checks_presets_as_its_first_boot_and_writes_its_initrd_name(self):
-        result, log, _ = self.run_step('dracut', 'debian-minimal', {'wheel': ''})
+        result, log, _ = self.run_step('dracut', 'debian-minimal', {'wheel': '', 'unit-files': ''})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('systemctl preset-all --preset-mode=enable-only', log)
         self.assertIn('dracut --force --no-hostonly --add aurora-root systemd-ask-password '
@@ -175,10 +175,33 @@ class StepTests(unittest.TestCase):
         for profile, mode in (('debian-kde', 'enable-only'), ('fedora-minimal', 'full')):
             with self.subTest(profile=profile):
                 change = "Created symlink '/etc/systemd/system/timers.target.wants/fstrim.timer'.\n"
-                result, log, _ = self.run_step('dracut', profile, {'wheel': '', f'preset-{mode}': change})
+                result, log, _ = self.run_step('dracut', profile, {'wheel': '', 'unit-files': '',
+                                                                   f'preset-{mode}': change})
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('first boot cannot apply them', result.stderr)
                 self.assertFalse([line for line in log if line.startswith('dracut')])
+
+    def test_debian_units_must_match_their_presets_in_both_directions(self):
+        listing = ('NetworkManager.service enabled enabled\n'
+                   'default.target alias -\n'
+                   'multi-user.target static -\n'
+                   'ssh.service disabled disabled\n')
+        result, log, _ = self.run_step('dracut', 'debian-kde', {'wheel': '', 'unit-files': listing})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('systemctl list-unit-files --no-legend --no-pager', log)
+        for line in ('fstrim.timer enabled disabled', 'bluetooth.service disabled enabled'):
+            with self.subTest(unit=line):
+                result, log, _ = self.run_step('dracut', 'debian-kde',
+                                               {'wheel': '', 'unit-files': listing + line + '\n'})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(line, result.stderr)
+                self.assertIn('against their presets', result.stderr)
+                self.assertFalse([entry for entry in log if entry.startswith('dracut')])
+
+    def test_fedora_relies_on_its_full_preset_pass(self):
+        result, log, _ = self.run_step('dracut', 'fedora-kde')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse([line for line in log if 'list-unit-files' in line])
 
     def test_debian_lists_its_packages_with_dpkg(self):
         result, _, packages = self.run_step('package list', 'debian-kde',

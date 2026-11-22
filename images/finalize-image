@@ -96,6 +96,20 @@ if [[ $backend == dracut ]]; then
     echo 'Unit states differ from their presets; the first boot cannot apply them' >&2
     exit 1
   fi
+  if [[ $distribution == debian ]]; then
+    # Enable-only mode never reports a unit that is enabled against the
+    # image's "disable *" catch-all, such as one a maintainer script enabled.
+    # A full preset pass would, but it also drops the image's default.target
+    # link, which the first boot keeps. Compare each unit's state with its
+    # preset instead, which changes nothing.
+    units=$(chroot "$scratch/root" systemctl list-unit-files --no-legend --no-pager)
+    against=$(awk '($2 == "enabled" && $3 == "disabled") || ($2 == "disabled" && $3 == "enabled")' <<<"$units")
+    if [[ -n $against ]]; then
+      printf '%s\n' "$against" >&2
+      echo 'Units are enabled or disabled against their presets' >&2
+      exit 1
+    fi
+  fi
   kernels=("$scratch/root/usr/lib/modules/"*)
   (( ${#kernels[@]} == 1 ))
   kernel=${kernels[0]##*/}
