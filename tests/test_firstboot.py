@@ -80,6 +80,27 @@ class GrubTests(unittest.TestCase):
                                  self.grub.fedora_stub(BOOT, '/grub2'))
             self.assertEqual(self.grub.harden(root, 'fedora', BOOT, EFI), [])
 
+    def test_arch_core_is_replaced_only_when_it_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            core = root / 'boot/efi/EFI/BOOT/BOOTAA64.EFI'
+            core.parent.mkdir(parents=True)
+            core.write_bytes(b'grub-install core')
+            main = root / 'boot/grub/grub.cfg'
+            main.parent.mkdir(parents=True)
+            main.write_text(f'search --no-floppy --fs-uuid --set=root {BOOT}\n')
+            mkimage = root / 'grub-mkimage'
+            mkimage.write_text('#!/bin/sh\nfor argument; do case $argument in\n'
+                               '  --output=*) printf aurora-core > "${argument#--output=}";;\nesac; done\n')
+            mkimage.chmod(0o755)
+            changed = self.grub.harden(root, 'arch', BOOT, EFI, mkimage=str(mkimage), modules_dir=str(root))
+            self.assertIn(core, changed)
+            self.assertEqual(core.read_bytes(), b'aurora-core')
+            # Run again, as after every update-grub: nothing is rewritten.
+            self.assertEqual(self.grub.harden(root, 'arch', BOOT, EFI, mkimage=str(mkimage),
+                                              modules_dir=str(root)), [])
+            self.assertEqual(sorted(path.name for path in core.parent.iterdir()), ['BOOTAA64.EFI', 'grub.cfg'])
+
 
 class SplashTests(unittest.TestCase):
     def test_encryption_percentage_is_in_the_message(self):
