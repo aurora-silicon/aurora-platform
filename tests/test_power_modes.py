@@ -136,6 +136,9 @@ class Platform(unittest.TestCase):
             self.assertFalse(leg.apply('power-saver'))
             self.assertTrue(leg.apply('balanced'))
 
+    def test_shipped_config_keeps_the_defaults(self):
+        self.assertEqual(pm.load_config(str(ROOT / 'power/power-modes.conf')), {})
+
     def test_off(self):
         self.assertEqual(pm.legs_from_config({'rt_floor': 'off', 'aspm': 'off', 'platform': 'off'}), [])
 

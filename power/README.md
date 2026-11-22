@@ -153,7 +153,8 @@ stops, under the profile aurora-power-budget had just given the handler.
 ### Low Power Mode on battery
 
 macOS lets the user run Low Power Mode never, always, only on battery or only
-on the power adapter. `/etc/aurora/power-modes.conf` has the same setting:
+on the power adapter. `/etc/aurora/power-modes.conf` (installed with every
+line commented out, so the defaults apply) has the same setting:
 
 ```
 # never (default, as on macOS) | always | battery | adapter
