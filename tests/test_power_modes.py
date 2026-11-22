@@ -150,6 +150,48 @@ class Platform(unittest.TestCase):
             legs = pm.legs_from_config({'rt_floor': 'off', 'aspm': 'off', '_platform_root': t})
             self.assertEqual([leg.name for leg in legs], ['platform:apple-smc'])
 
+    def test_profile_daemon_that_drives_the_class_owns_it(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t) / 'platform-profile-0'
+            d.mkdir()
+            (d / 'name').write_text('apple-smc\n')
+            (d / 'choices').write_text('low-power balanced performance\n')
+            (d / 'profile').write_text('balanced\n')
+            rt = Path(t) / 'rt'
+            rt.write_text('1024\n')
+            legs = pm.legs_from_config({'aspm': 'off', '_platform_root': t},
+                                       legs={'rt_floor': (str(rt), {'power-saver': '0'})})
+            for leg in legs:
+                leg.start()
+            # tuned-ppd: this daemon writes the handler.
+            self.assertEqual(pm.apply_legs(legs, 'power-saver', False), ['rt_floor', 'platform:apple-smc'])
+            self.assertEqual((d / 'profile').read_text(), 'low-power')
+            # power-profiles-daemon took over and wrote the class itself.
+            (d / 'profile').write_text('low-power\n')
+            self.assertEqual(pm.apply_legs(legs, 'power-saver', True), [])
+            for leg in legs:
+                leg.end()
+            # Its choice stays at stop; the other legs go back.
+            self.assertEqual((d / 'profile').read_text(), 'low-power\n')
+            self.assertEqual(rt.read_text(), '1024')
+
+    def test_profiles_property(self):
+        tuned = ('{"type":"aa{sv}","data":[{"Profile":{"type":"s","data":"power-saver"},'
+                 '"Driver":{"type":"s","data":"tuned"}}]}')
+        ppd = ('{"type":"aa{sv}","data":[{"Profile":{"type":"s","data":"power-saver"},'
+               '"Driver":{"type":"s","data":"multiple"},"PlatformDriver":{"type":"s","data":"platform_profile"},'
+               '"CpuDriver":{"type":"s","data":"intel_pstate"}}]}')
+        ppd_old = ('{"type":"aa{sv}","data":[{"Profile":{"type":"s","data":"balanced"},'
+                   '"Driver":{"type":"s","data":"platform_profile"}}]}')
+        placeholder = ('{"type":"aa{sv}","data":[{"Profile":{"type":"s","data":"balanced"},'
+                       '"Driver":{"type":"s","data":"placeholder"}}]}')
+        self.assertFalse(pm.profiles_drive_class(tuned))
+        self.assertTrue(pm.profiles_drive_class(ppd))
+        self.assertTrue(pm.profiles_drive_class(ppd_old))
+        self.assertFalse(pm.profiles_drive_class(placeholder))
+        for bad in ('', 'not json', '{"data": 3}', '{"data": [1, {"Driver": "x"}]}'):
+            self.assertFalse(pm.profiles_drive_class(bad))
+
 
 class Source(unittest.TestCase):
     def supply(self, root, name, kind, **attrs):

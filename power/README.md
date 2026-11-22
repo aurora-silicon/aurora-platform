@@ -142,8 +142,10 @@ and put back outside those profiles and when the service stops.
 
 The `platform` leg is there because tuned-ppd drives only the ACPI
 `platform_profile` file, which Apple device tree boots do not have.
-power-profiles-daemon writes the class itself; the daemon then writes the same
-value. `apple-clpc` is the exception: aurora-power-budget hands it the profile,
+power-profiles-daemon writes the class itself when its `Profiles` property
+lists the `platform_profile` driver; the leg then writes nothing, not even at
+stop, so a restart of this daemon (every package upgrade) never puts its
+start-time value back over power-profiles-daemon's choice. `apple-clpc` is the exception: aurora-power-budget hands it the profile,
 because its own Power Saver cap depends on whether the handler holds it (see
 above). A leg here would also put back its start-time value when this daemon
 stops, under the profile aurora-power-budget had just given the handler.
