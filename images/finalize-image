@@ -87,6 +87,8 @@ if [[ $backend == dracut ]]; then
     # Debian's maintainer scripts enable units without consulting presets, and
     # the first boot applies presets in enable-only mode, as checked here.
     preset_mode=enable-only
+    # Debian's dracut names the image initrd.img-<kernel> (initrdname in its
+    # 01-debian.conf); dracut's own default is initramfs-<kernel>.img.
     initrd=initrd.img-KERNEL
     # aurora-firstboot puts the owner in wheel, which Debian has only because
     # the image creates it.
