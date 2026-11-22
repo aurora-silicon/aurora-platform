@@ -231,6 +231,43 @@ class KernelHandlerTests(unittest.TestCase):
                                        'apple-clpc (platform-profile-0): balanced for balanced',
                                        'apple-clpc (platform-profile-0): low-power for power-saver'])
 
+    def test_stop_puts_balanced_back_where_this_daemon_set_the_handler(self):
+        # tuned-ppd: this daemon is the class's only writer.
+        profile = handler(self.root)
+        kernel = pb.KernelHandlers(str(self.root))
+        kernel.hand_over('power-saver')
+        kernel.hand_over('power-saver')     # still ours on a repeat
+        kernel.release()
+        self.assertEqual(profile.read_text(), 'balanced')
+        self.assertIn('apple-clpc (platform-profile-0): back to balanced at stop', self.logged)
+
+    def test_stop_leaves_a_value_this_daemon_did_not_write(self):
+        # power-profiles-daemon set it before announcing the profile.
+        profile = handler(self.root, profile='low-power')
+        kernel = pb.KernelHandlers(str(self.root))
+        kernel.hand_over('power-saver')
+        writes = []
+        with mock.patch.object(pb, 'open', counting_writes(writes), create=True):
+            kernel.release()
+        self.assertEqual((profile.read_text(), writes), ('low-power\n', []))
+
+    def test_stop_leaves_a_handler_someone_changed_since(self):
+        profile = handler(self.root)
+        kernel = pb.KernelHandlers(str(self.root))
+        kernel.hand_over('power-saver')
+        profile.write_text('performance\n')
+        kernel.release()
+        self.assertEqual(profile.read_text(), 'performance\n')
+
+    def test_stop_after_balanced_writes_nothing(self):
+        profile = handler(self.root, profile='performance')
+        kernel = pb.KernelHandlers(str(self.root))
+        kernel.hand_over('balanced')
+        writes = []
+        with mock.patch.object(pb, 'open', counting_writes(writes), create=True):
+            kernel.release()
+        self.assertEqual((profile.read_text(), writes), ('balanced', []))
+
     def test_who_caps(self):
         self.assertTrue(pb.cap_wanted('power-saver', None, True))
         self.assertFalse(pb.cap_wanted('power-saver', 'apple-clpc', True))
@@ -263,6 +300,7 @@ class MainLoopTests(unittest.TestCase):
         classes.mkdir()
         profile = handler(classes) if with_handler else None
         seen, logged, status = [], [], []
+        self.signals = {}
         queue = list(profiles)
         r, w = os.pipe()
         # One busctl line per profile read after the first, and one more that ends the run.
@@ -288,7 +326,7 @@ class MainLoopTests(unittest.TestCase):
             mock.patch.object(pb, 'monitor', lambda: mon),
             mock.patch.object(pb, 'log', logged.append),
             mock.patch.object(pb, 'write_status', status.append),
-            mock.patch.object(pb.signal, 'signal', lambda *a: None),
+            mock.patch.object(pb.signal, 'signal', self.signals.__setitem__),
             mock.patch.object(pb.signal, 'pause', mock.Mock(side_effect=Done)),
         ]
         if refuse:
@@ -300,6 +338,7 @@ class MainLoopTests(unittest.TestCase):
             pb.main()
         if profile is not None:
             seen.append(profile.read_text().strip())
+        self.profile = profile
         return seen, logged, status
 
     def test_tuned_ppd_profiles_reach_the_handler_and_the_kernel_owns_power_saver(self):
@@ -310,6 +349,14 @@ class MainLoopTests(unittest.TestCase):
         self.assertIn({'profile': 'power-saver', 'capping': False, 'budget_mw': mock.ANY,
                        'kernel_profiles': {'platform-profile-0': 'low-power'},
                        'reason': 'kernel apple-clpc holds power-saver'}, status)
+
+    def test_sigterm_in_power_saver_puts_the_handler_back_to_balanced(self):
+        seen, _, status = self.run_main(['balanced', 'power-saver'])
+        self.assertEqual(seen[-1], 'low-power')
+        with self.assertRaises(SystemExit):
+            self.signals[pb.signal.SIGTERM](pb.signal.SIGTERM, None)
+        self.assertEqual(self.profile.read_text().strip(), 'balanced')
+        self.assertEqual(status[-1], {'profile': None, 'capping': False})
 
     def test_a_handler_that_refuses_leaves_the_budget_capping(self):
         seen, logged, _ = self.run_main(['balanced', 'power-saver', 'balanced'], refuse=errno.EOPNOTSUPP)

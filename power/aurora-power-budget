@@ -102,6 +102,7 @@ class KernelHandlers:
     def __init__(self, root=PLATFORM_PROFILE):
         self.root = root
         self.said = {}      # device: the last thing logged about it
+        self.wrote = {}     # device: the value this daemon wrote and it still reads
 
     def devices(self):
         """[(device, name, choices)] for each such handler present now."""
@@ -146,6 +147,11 @@ class KernelHandlers:
                     with open(path, 'w') as f:
                         f.write(value)
                     now = read(path)
+                    if now == value:
+                        self.wrote[dev] = value
+                if self.wrote.get(dev) != now:
+                    # Someone else set it since (or nobody wrote it here).
+                    self.wrote.pop(dev, None)
             except OSError as e:
                 self.say(dev, '%s (%s): cannot set %s for %s: %s' % (name, dev, value, profile, e))
                 continue
@@ -160,6 +166,27 @@ class KernelHandlers:
                 if profile == 'power-saver' and held is None:
                     held = name
         return state, held
+
+    def release(self):
+        """Put each handler this daemon set back to balanced, the kernel's
+        default, so that no ceiling outlives the daemon.
+
+        A handler that reads something else than what was written here has
+        another writer (power-profiles-daemon, a user) and is left alone.
+        """
+        for dev, value in sorted(self.wrote.items()):
+            path = os.path.join(self.root, dev, 'profile')
+            try:
+                name = read(os.path.join(self.root, dev, 'name'))
+                choices = read(os.path.join(self.root, dev, 'choices')).split()
+                if value == 'balanced' or 'balanced' not in choices or read(path) != value:
+                    continue
+                with open(path, 'w') as f:
+                    f.write('balanced')
+                log('%s (%s): back to balanced at stop' % (name, dev))
+            except OSError as e:
+                log('%s: cannot put balanced back at stop: %s' % (dev, e))
+        self.wrote = {}
 
 
 def be_ints(raw, width):
@@ -520,10 +547,13 @@ def main():
     capping = False
 
     def stop(*_):
-        # The kernel handlers keep their profile: it is the profile daemon's
-        # choice, not a cap of ours, and power-profiles-daemon may own it.
+        # A handler this daemon set goes back to balanced: under tuned-ppd
+        # nothing else writes the class, so a low-power ceiling would
+        # otherwise stay under every later profile.  One that the profile
+        # daemon set (power-profiles-daemon) is its choice and stays.
         for c in cl:
             c.end()
+        kernel.release()
         write_status({'profile': None, 'capping': False})
         sys.exit(0)
 

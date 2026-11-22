@@ -115,10 +115,12 @@ handler refuses the write, reads back something else, or offers no
 power-saver choice, the daemon's own budget applies, as on Macs without a
 handler. Each change is logged once, for example
 `apple-clpc (platform-profile-0): low-power for power-saver`, and
-`/run/aurora-power-budget/status.json` lists `kernel_profiles`. The handler
-keeps its profile when the daemon stops: it is the profile daemon's choice,
-not a cap of this daemon. aurora-power-modes leaves `apple-clpc` alone, so the
-handler has one writer.
+`/run/aurora-power-budget/status.json` lists `kernel_profiles`. When the
+daemon stops, a handler it set goes back to `balanced`, the kernel's default,
+so a low-power ceiling never outlives it (under tuned-ppd nothing else writes
+the class). A handler that reads a value this daemon did not write, such as
+one power-profiles-daemon set, keeps it. aurora-power-modes leaves
+`apple-clpc` alone, so the handler has one writer.
 
 ## Games
 
