@@ -155,7 +155,9 @@ cp "$scratch/root/etc/fstab" "$output/fstab"
 if [[ $distribution == fedora ]]; then
   chroot "$scratch/root" rpm -qa --qf '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > "$output/packages.txt"
 elif [[ $distribution == debian ]]; then
-  chroot "$scratch/root" dpkg-query -W -f '${Package} ${Version} ${Architecture}\n' | sort > "$output/packages.txt"
+  # dpkg-query also lists removed packages whose configuration files remain.
+  chroot "$scratch/root" dpkg-query -W -f '${db:Status-Abbrev} ${Package} ${Version} ${Architecture}\n' |
+    awk '$1 == "ii" {print $2, $3, $4}' | sort > "$output/packages.txt"
 else
   chroot "$scratch/root" pacman -Q > "$output/packages.txt"
 fi

@@ -210,10 +210,13 @@ class StepTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse([line for line in log if 'list-unit-files' in line])
 
-    def test_debian_lists_its_packages_with_dpkg(self):
-        result, _, packages = self.run_step('package list', 'debian-kde',
-                                            {'dpkg-query': 'zstd 1.5 arm64\nbash 5.3 arm64\n'})
+    def test_debian_lists_only_its_installed_packages(self):
+        # A removed package whose configuration files remain is in state rc.
+        result, log, packages = self.run_step('package list', 'debian-kde',
+                                              {'dpkg-query': 'ii  zstd 1.5 arm64\nrc  oldtool 1.0 arm64\n'
+                                                             'ii  bash 5.3 arm64\n'})
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('${db:Status-Abbrev}', log[0])
         self.assertEqual(packages, 'bash 5.3 arm64\nzstd 1.5 arm64\n')
 
 
