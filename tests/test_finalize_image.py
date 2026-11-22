@@ -85,14 +85,106 @@ class ImageRecordTests(unittest.TestCase):
             self.assertEqual(record['root_subvolume'], 'root')
             self.assertEqual(record['efi_volume_id'], 'ABCD1234')
 
-    def test_debian_profiles_use_dracut_and_their_initrd_name(self):
-        text = FINALIZE.read_text()
-        self.assertIn('debian-kde|debian-gnome|debian-minimal) distribution=debian backend=dracut;;', text)
-        self.assertIn('initrd=initrd.img-KERNEL', text)
-        self.assertIn("dpkg-query -W -f '${Package} ${Version} ${Architecture}\\n'", text)
-        # SELinux labelling and Anaconda's initial setup are Fedora's alone.
-        fedora_only = text[text.index('if [[ $distribution == fedora ]]; then\n    chroot "$scratch/root" /bin/bash'):]
-        self.assertIn('label-fedora-rootfs', fedora_only.split('fi', 1)[0])
+
+def block(name):
+    """A marked step of the finalizer: from '# BEGIN name' to '# END name'."""
+    text = FINALIZE.read_text()
+    start = text.index(f'# BEGIN {name}\n')
+    return text[start:text.index(f'# END {name}\n', start)]
+
+
+# The commands the steps run inside the image, recorded and answered from files.
+STUBS = r'''
+record() { printf '%s\n' "$*" >> "$fixtures/log"; }
+chroot() {
+  shift
+  record "$*"
+  case $1 in
+    systemctl)
+      case $2 in
+        preset-all) cat "$fixtures/preset-${3#--preset-mode=}" 2>/dev/null || true;;
+        list-unit-files) cat "$fixtures/unit-files";;
+      esac;;
+    getent) [[ -e $fixtures/wheel ]];;
+    lsinitrd) printf 'usr/lib/systemd/system/aurora-initrd-root.service\netc/aurora/image-layout\n';;
+    dpkg-query|rpm|pacman) cat "$fixtures/$1";;
+  esac
+}
+python3() { record "python3 $*"; }
+'''
+
+
+class StepTests(unittest.TestCase):
+    """The profile, GRUB, initrd and package-list steps, run with stubbed image commands."""
+
+    def run_step(self, name, profile, files=None):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixtures = Path(temporary)
+            (fixtures / 'scratch/root/usr/lib/modules/7.3.0-1-aurora').mkdir(parents=True)
+            (fixtures / 'output').mkdir()
+            for path, text in (files or {}).items():
+                (fixtures / path).write_text(text)
+            script = (f'set -euo pipefail\nfixtures={fixtures}\nscratch=$fixtures/scratch\n'
+                      f'output=$fixtures/output\nprofile={profile}\nboot_uuid=b-uuid\nefi_uuid=e-uuid\n'
+                      + STUBS + block('profile') + (block(name) if name != 'profile' else ''))
+            # Run from a file: the steps find their helpers next to the script.
+            (fixtures / 'step').write_text(script)
+            (fixtures / 'label-fedora-rootfs').write_text('')
+            result = subprocess.run(['bash', str(fixtures / 'step')], capture_output=True, text=True)
+            log = (fixtures / 'log').read_text().splitlines() if (fixtures / 'log').exists() else []
+            packages = fixtures / 'output/packages.txt'
+            return result, log, packages.read_text() if packages.exists() else None
+
+    def test_profiles_select_their_distribution_and_initrd_tool(self):
+        for profile, expected in (('fedora-kde', 'fedora dracut'), ('arch-minimal', 'arch mkinitcpio'),
+                                  ('debian-gnome', 'debian dracut'), ('nixos-kde', None)):
+            with self.subTest(profile=profile):
+                script = f'profile={profile}\n' + block('profile') + 'echo "$distribution $backend"\n'
+                result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+                if expected is None:
+                    self.assertEqual(result.returncode, 2)
+                else:
+                    self.assertEqual(result.stdout.strip(), expected, result.stderr)
+
+    def test_only_fedora_uses_fedora_grub(self):
+        for profile, flavor in (('fedora-gnome', 'fedora'), ('arch-kde', 'arch'), ('debian-kde', 'arch')):
+            with self.subTest(profile=profile):
+                result, log, _ = self.run_step('grub', profile)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'--flavor {flavor} --boot-uuid b-uuid --efi-uuid e-uuid', log[0])
+
+    def test_debian_checks_presets_as_its_first_boot_and_writes_its_initrd_name(self):
+        result, log, _ = self.run_step('dracut', 'debian-minimal', {'wheel': ''})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('systemctl preset-all --preset-mode=enable-only', log)
+        self.assertIn('dracut --force --no-hostonly --add aurora-root systemd-ask-password '
+                      '/boot/initrd.img-7.3.0-1-aurora 7.3.0-1-aurora', log)
+        # Anaconda's initial setup and SELinux labelling are Fedora's alone.
+        self.assertFalse([line for line in log if 'initial-setup' in line or line.startswith('/bin/bash')])
+
+    def test_fedora_checks_presets_in_full_and_labels_its_root(self):
+        result, log, _ = self.run_step('dracut', 'fedora-kde')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('systemctl preset-all --preset-mode=full', log)
+        self.assertIn('dracut --force --no-hostonly --add aurora-root systemd-ask-password '
+                      '/boot/initramfs-7.3.0-1-aurora.img 7.3.0-1-aurora', log)
+        self.assertIn('systemctl disable initial-setup.service initial-setup-graphical.service', log)
+        self.assertIn('/bin/bash -s -- /', log)
+
+    def test_a_unit_the_first_boot_would_change_fails_the_image(self):
+        for profile, mode in (('debian-kde', 'enable-only'), ('fedora-minimal', 'full')):
+            with self.subTest(profile=profile):
+                change = "Created symlink '/etc/systemd/system/timers.target.wants/fstrim.timer'.\n"
+                result, log, _ = self.run_step('dracut', profile, {'wheel': '', f'preset-{mode}': change})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('first boot cannot apply them', result.stderr)
+                self.assertFalse([line for line in log if line.startswith('dracut')])
+
+    def test_debian_lists_its_packages_with_dpkg(self):
+        result, _, packages = self.run_step('package list', 'debian-kde',
+                                            {'dpkg-query': 'zstd 1.5 arm64\nbash 5.3 arm64\n'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(packages, 'bash 5.3 arm64\nzstd 1.5 arm64\n')
 
 
 if __name__ == '__main__':

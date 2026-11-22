@@ -5,12 +5,14 @@ set -euo pipefail
 image=$(realpath "${1:?raw image required}")
 profile=${2:?installation profile required}
 output=$(realpath -m "${3:?new output directory required}")
+# BEGIN profile
 case $profile in
   fedora-kde|fedora-gnome|fedora-minimal) distribution=fedora backend=dracut;;
   arch-kde|arch-gnome|arch-minimal) distribution=arch backend=mkinitcpio;;
   debian-kde|debian-gnome|debian-minimal) distribution=debian backend=dracut;;
   *) echo 'Unsupported image finalizer profile' >&2; exit 2;;
 esac
+# END profile
 [[ $(id -u) == 0 && $(uname -m) == aarch64 ]] || { echo 'Requires a disposable privileged native AArch64 builder' >&2; exit 2; }
 [[ -f $image && ! -L $image && ! -e $output ]] || exit 2
 mkdir -p "$output"
@@ -66,13 +68,16 @@ touch "$scratch/root/var/lib/aurora/firstboot/pending"
 chroot "$scratch/root" systemctl enable aurora-firstboot.service
 # Aurora owns account setup on tty1; the generic base wizard must not compete.
 chroot "$scratch/root" systemctl mask systemd-firstboot.service
+# BEGIN grub
 # GRUB must never probe other disks or NVMe namespaces; see harden-grub.py.
 # Debian's GRUB has Arch's layout: /boot/grub and /usr/lib/grub/arm64-efi.
 flavor=fedora
 [[ $distribution == fedora ]] || flavor=arch
 python3 "$(dirname -- "${BASH_SOURCE[0]}")/harden-grub.py" "$scratch/root" --flavor "$flavor" \
   --boot-uuid "$boot_uuid" --efi-uuid "$efi_uuid"
+# END grub
 if [[ $backend == dracut ]]; then
+# BEGIN dracut
   preset_mode=full
   initrd=initramfs-KERNEL.img
   if [[ $distribution == fedora ]]; then
@@ -102,6 +107,7 @@ if [[ $backend == dracut ]]; then
   if [[ $distribution == fedora ]]; then
     chroot "$scratch/root" /bin/bash -s -- / < "$(dirname -- "${BASH_SOURCE[0]}")/label-fedora-rootfs"
   fi
+# END dracut
 else
   chroot "$scratch/root" mkinitcpio -P
   # Each installed Mac creates its own pacman master key; only public keyrings ship.
@@ -125,6 +131,7 @@ python3 "$(dirname -- "${BASH_SOURCE[0]}")/prepare-stage2.py" \
   --output "$output/esp/m1n1" --manifest "$output/stage2.json"
 cp "$scratch/root/etc/aurora/image-layout" "$output/image-layout"
 cp "$scratch/root/etc/fstab" "$output/fstab"
+# BEGIN package list
 if [[ $distribution == fedora ]]; then
   chroot "$scratch/root" rpm -qa --qf '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > "$output/packages.txt"
 elif [[ $distribution == debian ]]; then
@@ -132,6 +139,7 @@ elif [[ $distribution == debian ]]; then
 else
   chroot "$scratch/root" pacman -Q > "$output/packages.txt"
 fi
+# END package list
 sync
 # Unmount the filesystems before copying their final byte identities.
 for path in dev proc sys run boot/efi boot ''; do
