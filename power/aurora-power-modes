@@ -14,10 +14,14 @@ clocks:
             that support L1.1/L1.2 (Wi-Fi, Bluetooth, the SD reader) enter
             them.
   platform  every kernel platform-profile handler (/sys/class/platform-profile)
-            follows the profile: low-power, balanced, performance.  On Macs
-            with High Power mode the kernel's performance profile is what
-            tells the SMC to give the fans their full range.  The profile
-            daemons that already drive the class write the same value.
+            follows the profile: low-power, balanced, performance.  Only
+            while the profile daemon does not drive the class itself:
+            tuned-ppd does not, power-profiles-daemon does when it lists its
+            platform_profile driver, and then this leg writes nothing, at
+            stop either.  apple-clpc is left to aurora-power-budget, which
+            hands it the profile (on Macs with High Power mode its
+            performance profile is what tells the SMC to give the fans their
+            full range).
 
 Each leg records the value it found at start and puts that value back outside
 the profiles that change it, and when the daemon stops.  Nothing is written
@@ -128,6 +132,11 @@ class Leg:
         self.applied = value
         return True
 
+    def let_go(self):
+        """Another writer owns the file now: forget what was written here, so
+        neither a later apply() of the same value nor end() writes it."""
+        self.applied = None
+
     def end(self):
         if self.baseline is not None and self.applied not in (None, self.baseline):
             try:
@@ -140,10 +149,16 @@ class Leg:
 
 PLATFORM_PROFILE = '/sys/class/platform-profile'
 PLATFORM_NAMES = {'power-saver': 'low-power', 'balanced': 'balanced', 'performance': 'performance'}
+# Handlers whose power-saver profile is a CPU budget: aurora-power-budget
+# hands them the profile and caps the CPU itself while they do not hold it,
+# so it is their one writer.  A leg here would also put its start-time value
+# back when this daemon stops, under the profile the budget just gave them.
+BUDGET_HANDLERS = ('apple-clpc',)
 
 
 def platform_legs(root=PLATFORM_PROFILE):
-    """One leg per kernel platform-profile handler, with the choices it offers."""
+    """One leg per kernel platform-profile handler, with the choices it offers,
+    except the handlers aurora-power-budget drives."""
     out = []
     try:
         handlers = sorted(os.listdir(root))
@@ -157,6 +172,8 @@ def platform_legs(root=PLATFORM_PROFILE):
             with open(os.path.join(base, 'name')) as f:
                 name = f.read().strip()
         except OSError:
+            continue
+        if name in BUDGET_HANDLERS:
             continue
         values = {p: v for p, v in PLATFORM_NAMES.items() if v in choices}
         out.append(Leg('platform:%s' % name, os.path.join(base, 'profile'), values))
@@ -265,6 +282,55 @@ def active_profile():
         if out.returncode == 0 and out.stdout.startswith('s '):
             return out.stdout[2:].strip().strip('"')
     return None
+
+
+# The power-profiles-daemon driver that writes the kernel's platform profile.
+PPD_PLATFORM_DRIVER = 'platform_profile'
+
+
+def profiles_drive_class(data):
+    """Whether a profile daemon's Profiles property (busctl --json=short)
+    names its platform profile driver: power-profiles-daemon has it as Driver
+    (before 0.20) or PlatformDriver; tuned-ppd's Driver is tuned."""
+    try:
+        profiles = json.loads(data)['data']
+    except (ValueError, KeyError, TypeError):
+        return False
+    if not isinstance(profiles, list):
+        return False
+    for entry in profiles:
+        if not isinstance(entry, dict):
+            continue
+        for key in ('Driver', 'PlatformDriver'):
+            field = entry.get(key)
+            if isinstance(field, dict) and field.get('data') == PPD_PLATFORM_DRIVER:
+                return True
+    return False
+
+
+def daemon_drives_class():
+    """Whether the running profile daemon writes the platform profile itself."""
+    for name, path in PPD:
+        try:
+            out = subprocess.run(['busctl', '--system', '--json=short', 'get-property', name, path, name,
+                                  'Profiles'], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.returncode == 0:
+            return profiles_drive_class(out.stdout)
+    return False
+
+
+def apply_legs(legs, profile, class_driven):
+    """Apply the profile to each leg; the platform legs let go while the
+    profile daemon drives the class.  Returns the names of the legs written."""
+    changed = []
+    for leg in legs:
+        if class_driven and leg.name.startswith('platform:'):
+            leg.let_go()
+        elif profile in PROFILES and leg.apply(profile):
+            changed.append(leg.name)
+    return changed
 
 
 def set_profile(profile):
@@ -400,13 +466,19 @@ def main():
     follow_source = mode in ('battery', 'adapter')
     events = uevents() if follow_source else None
     profile = active_profile()
+    driven = daemon_drives_class()
+    said_driven = False
     source = power_source()
     while True:
         target = sched.update(source, profile)
         if target and set_profile(target):
             log('low_power_mode=%s, power source %s: profile %s -> %s' % (mode, source, profile, target))
             profile = active_profile()
-        changed = [leg.name for leg in legs if profile in PROFILES and leg.apply(profile)]
+        if driven != said_driven and any(leg.name.startswith('platform:') for leg in legs):
+            log('the profile daemon %s the platform profile: platform legs %s' % (
+                ('drives', 'left to it') if driven else ('does not drive', 'follow the profile')))
+        said_driven = driven
+        changed = apply_legs(legs, profile, driven)
         if changed:
             log('profile %s: %s' % (profile, ', '.join('%s=%s' % (leg.name, leg.applied) for leg in legs)))
         write_status({'profile': profile, 'source': source, 'low_power_mode': mode,
@@ -421,6 +493,7 @@ def main():
         ready, _, _ = select.select(watched, [], [], timeout)
         if not ready:
             profile = active_profile()
+            driven = daemon_drives_class()
             source = power_source()
             continue
         if mon and mon.stdout in ready:
@@ -431,6 +504,7 @@ def main():
                 time.sleep(1)
                 mon = monitor()
             profile = active_profile()
+            driven = daemon_drives_class()
         if events in ready and drain_power_supply_events(events):
             source = power_source()
 

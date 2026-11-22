@@ -2,7 +2,9 @@
 
 `aurora-power-budget` gives the desktop's **Power Saver** profile a real CPU
 power limit, the way macOS Low Power Mode does. Balanced and Performance are
-untouched: outside Power Saver the daemon waits on D-Bus and writes nothing.
+untouched: outside Power Saver the daemon waits on D-Bus and caps nothing.
+Where the kernel has its own power modes, the daemon hands the profile to
+them instead (see "When the kernel budgets Power Saver itself").
 
 ## What macOS Low Power Mode does
 
@@ -90,13 +92,35 @@ says so in the journal and stays idle.
 
 ### When the kernel budgets Power Saver itself
 
-On the M5 Pro and Max (T6050) the kernel's CLPC driver registers a platform
-profile (`/sys/class/platform-profile/*/name` reads `apple-clpc`) whose
-low-power profile holds the package to macOS Low Power Mode's measured power
-itself. With that handler present a second budget here would cap the CPU
-twice, so the daemon writes nothing, logs
-`kernel apple-clpc profile handler present; not capping`, and says so in
-`/run/aurora-power-budget/status.json`.
+On the M5 Pro and Max (T6050) and the M4 Max (T6041) the kernel's CLPC driver
+registers a platform profile: `/sys/class/platform-profile/*/name` reads
+`apple-clpc` and `choices` reads `low-power balanced performance`. Its
+low-power profile caps the CPU itself: on the T6050 at 2808 MHz and macOS Low
+Power Mode's measured package power, on the T6041 at 2808 MHz only. On the
+14-inch M5 Pro its performance profile sends macOS's High Power mode record
+to the SMC.
+
+The daemon hands that handler every profile, by the name its `choices` file
+lists (power-saver: `low-power`, else `quiet`, as power-profiles-daemon 0.30
+picks them). tuned-ppd, on Fedora, drives only ACPI's
+`/sys/firmware/acpi/platform_profile`, which a device tree boot never has, so
+without this the handler would stay at `balanced`. power-profiles-daemon,
+with Aurora's class-device patch on Arch Linux ARM and NixOS, writes the
+handler before it announces a profile; the daemon then finds the value there
+and writes nothing.
+
+In Power Saver the daemon does not cap the CPU while the handler reads back
+its power-saver value, since a second budget would cap the CPU twice. If the
+handler refuses the write, reads back something else, or offers no
+power-saver choice, the daemon's own budget applies, as on Macs without a
+handler. Each change is logged once, for example
+`apple-clpc (platform-profile-0): low-power for power-saver`, and
+`/run/aurora-power-budget/status.json` lists `kernel_profiles`. When the
+daemon stops, a handler it set goes back to `balanced`, the kernel's default,
+so a low-power ceiling never outlives it (under tuned-ppd nothing else writes
+the class). A handler that reads a value this daemon did not write, such as
+one power-profiles-daemon set, keeps it. aurora-power-modes leaves
+`apple-clpc` alone, so the handler has one writer.
 
 ## Games
 
@@ -114,17 +138,23 @@ and put back outside those profiles and when the service stops.
 | --- | --- | --- | --- |
 | `rt_floor` (`kernel.sched_util_clamp_min_rt_default`) | 0: realtime threads (threaded IRQs, PipeWire) no longer run their CPU at its top clock | as found | as found |
 | `aspm` (PCIe ASPM policy) | `powersupersave`: Wi-Fi, Bluetooth and SD reader links use L1.1/L1.2 | as found | as found |
-| `platform` (every `/sys/class/platform-profile` handler) | `low-power` | `balanced` | `performance`: on Macs whose kernel knows High Power mode, this tells the SMC to give the fans their full range |
+| `platform` (every `/sys/class/platform-profile` handler except `apple-clpc`) | `low-power` | `balanced` | `performance` |
 
 The `platform` leg is there because tuned-ppd drives only the ACPI
 `platform_profile` file, which Apple device tree boots do not have.
-power-profiles-daemon writes the class itself; the daemon then writes the same
-value.
+power-profiles-daemon writes the class itself when its `Profiles` property
+lists the `platform_profile` driver; the leg then writes nothing, not even at
+stop, so a restart of this daemon (every package upgrade) never puts its
+start-time value back over power-profiles-daemon's choice. `apple-clpc` is the exception: aurora-power-budget hands it the profile,
+because its own Power Saver cap depends on whether the handler holds it (see
+above). A leg here would also put back its start-time value when this daemon
+stops, under the profile aurora-power-budget had just given the handler.
 
 ### Low Power Mode on battery
 
 macOS lets the user run Low Power Mode never, always, only on battery or only
-on the power adapter. `/etc/aurora/power-modes.conf` has the same setting:
+on the power adapter. `/etc/aurora/power-modes.conf` (installed with every
+line commented out, so the defaults apply) has the same setting:
 
 ```
 # never (default, as on macOS) | always | battery | adapter
@@ -174,7 +204,7 @@ to drive yet.
   MacBook Pro M4 Pro, so the profiles do not change them either.
 - **Fans.** The SMC keeps its own fan policy. Where the kernel sends macOS's
   High Power mode record to the SMC (the performance profile), the SMC lets
-  the fans use their full range; the `platform` leg makes that reachable on
+  the fans use their full range; aurora-power-budget makes that reachable on
   Fedora.
 - **Measured feedback.** The model is feed-forward. A one-second correction
   from the SMC package power sensor, and a kernel coordinator (DTPM or a
