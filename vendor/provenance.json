@@ -2,6 +2,6 @@
   "source_repository": "https://github.com/aurora-silicon/omarchy-pkgs",
   "checkout_head": "96d1cbcec74f51e42e6c7910d2722dfbe484fa36",
   "source_path": "omarchy-mac-boot/files/usr/lib/omarchy/initcpio/omarchy-mac-encrypt",
-  "file_sha256": "8b976a4895c9504f42aee20927becae97a7eec91f5e6fba31c9b7065d97fe7d7",
-  "scope": "Based on the captured Btrfs conversion and durable phase journal. Aurora adds guarded recovery of an abruptly interrupted LUKS2 hotzone before resume. The file hash identifies this patched implementation; checkout_head and source_path identify its upstream base."
+  "file_sha256": "1b0b9cbbe71f86b6f4a6233a817f95828a767f7fcbbd284b750ab86d3bddfc01",
+  "scope": "Based on the captured Btrfs conversion and durable phase journal. Aurora adds guarded recovery of an abruptly interrupted LUKS2 hotzone before resume. It also opens the root with discards allowed, stores that flag in the LUKS2 header once after conversion, and writes discard into crypttab. The file hash identifies this patched implementation; checkout_head and source_path identify its upstream base."
 }

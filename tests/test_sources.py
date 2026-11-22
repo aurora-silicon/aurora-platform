@@ -13,6 +13,14 @@ class SourceTests(unittest.TestCase):
         provenance = json.loads((ROOT / 'vendor/provenance.json').read_text())
         self.assertEqual(hashlib.sha256((ROOT / 'vendor/omarchy-mac-encrypt').read_bytes()).hexdigest(), provenance['file_sha256'])
 
+    def test_the_encrypted_root_passes_discards(self):
+        converter = (ROOT / 'vendor/omarchy-mac-encrypt').read_text()
+        self.assertIn("printf 'root UUID=%s none luks,discard\\n'", converter)
+        self.assertIn('cryptsetup open --batch-mode --allow-discards "${persistent[@]}"', converter)
+        self.assertIn('[[ ${STATE_PHASE:-} != encrypted ]] || persistent=(--persistent)', converter)
+        unlock = (ROOT / 'libexec/aurora-initrd-root').read_text()
+        self.assertIn('cryptsetup open --allow-discards --key-file=- "$ROOT_DEV" root', unlock)
+
     def test_installation_is_staged_without_machine_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             subprocess.run(['make', '-s', 'install', 'DESTDIR=' + temporary], cwd=ROOT, check=True)
