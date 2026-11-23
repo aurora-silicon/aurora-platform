@@ -74,6 +74,7 @@ get() {   # the first line of a file; fails quietly if it cannot be read
 # --- configuration ------------------------------------------------------
 
 declare -A CFG=([ENABLED]=yes [FUNCTIONS]="ncm acm" [IPV4]=link-local [CONSOLE]=no
+                [FIREWALL_ZONE]=aurora-usb-gadget
                 [STORAGE_IMAGE]="" [STORAGE_READONLY]=yes [STORAGE_CDROM]=no)
 
 load_conf() {
@@ -194,7 +195,12 @@ build() {
   fi
 
   image=${CFG[STORAGE_IMAGE]}
-  if [[ -n $image && -f $image ]]; then
+  if [[ -n $image ]] && in_home "$image"; then
+    # The service runs with ProtectHome=yes: an image there would work by
+    # hand and be missing at every plug-in. Refuse it the same way both times.
+    log "storage image $image is under /home, /root or /run/user, which the service cannot see; move it (for example to /var/lib/aurora-usb-gadget/); no disk offered"
+    drop_function mass_storage.usb0
+  elif [[ -n $image && -f $image ]]; then
     lun=$G/functions/mass_storage.usb0/lun.0
     mkdir -p "$lun" || return 1
     put "" "$lun/file"
@@ -236,6 +242,7 @@ teardown() {
 insert_storage() {
   local lun=$G/functions/mass_storage.usb0/lun.0 image=${CFG[STORAGE_IMAGE]}
   [[ -n $image && -f $image && -e $lun/file ]] || return 0
+  in_home "$image" && return 0
   [[ -z $(get "$lun/file") ]] || return 0
   put "$image" "$lun/file"
   if [[ $(get "$lun/file") == "$image" ]]; then
@@ -243,6 +250,14 @@ insert_storage() {
   else
     log "the kernel did not take $image as the disk; the host sees no medium"
   fi
+}
+
+# The paths ProtectHome= hides from the service.
+in_home() {
+  case $1 in
+    /home|/home/*|/root|/root/*|/run/user|/run/user/*) return 0 ;;
+  esac
+  return 1
 }
 
 release_storage() {   # let go of the image file while unbound
@@ -259,8 +274,14 @@ write_network() {
   local ipv4=${CFG[IPV4]} tmp
   has_function ncm || return 0
   if [[ -d $RUN/NetworkManager ]] && command -v nmcli >/dev/null; then
-    local method=link-local
+    local method=link-local zone=${CFG[FIREWALL_ZONE]}
     case $ipv4 in shared) method=shared ;; off|none|disabled) method=disabled ;; esac
+    # firewalld zone names are letters, digits, '_' and '-'; anything else
+    # would corrupt the profile, so use the default zone instead.
+    if [[ ! $zone =~ ^[A-Za-z0-9_-]{1,17}$ ]]; then
+      log "FIREWALL_ZONE '$zone' is not a firewalld zone name; using aurora-usb-gadget"
+      zone=aurora-usb-gadget
+    fi
     mkdir -p "${NM_FILE%/*}" || return 0
     tmp=$(mktemp "${NM_FILE%/*}/.aurora-usb-gadget.XXXXXX") || return 0
     cat > "$tmp" <<EOF
@@ -271,6 +292,7 @@ uuid=7d7f1c2e-5a4b-4e8e-9a6c-61757261750a
 type=ethernet
 autoconnect=true
 autoconnect-priority=50
+zone=$zone
 
 [match]
 interface-name=$IFNAME_GLOB
@@ -410,7 +432,15 @@ cmd_down() {
     log "unbound from $udc"
     # A second controller in device mode can take over.
     other=$(udcs | grep -vxF -- "$udc" | head -n 1)
-    [[ -n $other ]] && cmd_up "$other"
+    if [[ -n $other ]]; then
+      cmd_up "$other"
+      return 0
+    fi
+    # Nothing takes over: no network profile or login prompt is left behind.
+    # The gadget stays in configfs, and the next plug-in builds it again.
+    CFG[CONSOLE]=no
+    console_sync
+    remove_network
     return 0
   fi
   [[ -n $cur ]] && put "" "$G/UDC"

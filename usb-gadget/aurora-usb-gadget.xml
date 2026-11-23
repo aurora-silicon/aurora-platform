@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- aurora-usb-gadget (usb-gadget/README.md): the zone of the USB network to a host. -->
+<zone target="ACCEPT">
+  <short>Aurora USB device mode</short>
+  <description>
+    The network to a USB host plugged into this Mac in device mode
+    (aurora-usb-gadget). The host is not trusted: it reaches only SSH,
+    mDNS (for hostname.local), DHCP and DNS (for IPV4=shared) and ICMP on
+    this Mac; everything else to this Mac is refused. Forwarded traffic is
+    accepted, so IPV4=shared can share this Mac's connection. Allow more
+    with firewall-cmd --permanent --zone=aurora-usb-gadget --add-service=...
+  </description>
+  <rule priority="32767">
+    <reject/>
+  </rule>
+  <protocol value="icmp"/>
+  <protocol value="ipv6-icmp"/>
+  <service name="ssh"/>
+  <service name="mdns"/>
+  <service name="dhcp"/>
+  <service name="dns"/>
+</zone>

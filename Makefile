@@ -46,6 +46,7 @@ install-usb-gadget:
 	install -Dm644 usb-gadget/aurora-usb-gadget@.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-usb-gadget@.service
 	install -Dm644 usb-gadget/86-aurora-usb-gadget.rules $(DESTDIR)$(LIBDIR)/udev/rules.d/86-aurora-usb-gadget.rules
 	install -Dm644 usb-gadget/usb-gadget.conf $(DESTDIR)$(SYSCONFDIR)/aurora/usb-gadget.conf
+	install -Dm644 usb-gadget/aurora-usb-gadget.xml $(DESTDIR)$(LIBDIR)/firewalld/zones/aurora-usb-gadget.xml
 	install -Dm644 usb-gadget/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-usb-gadget/README.md
 
 # GameMode defaults (power/GAMEMODE.md): an administrator-level config that

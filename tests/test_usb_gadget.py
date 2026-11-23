@@ -192,6 +192,26 @@ class UsbGadget(unittest.TestCase):
         self.assertFalse(self.g.exists())
         self.assertFalse((self.run_dir / 'NetworkManager/system-connections/aurora-usb-gadget.nmconnection').exists())
 
+    def test_unplug_of_the_last_controller_cleans_up(self):
+        self.udc('a.usb')
+        (self.run_dir / 'NetworkManager').mkdir()
+        self.config('CONSOLE=yes\n')
+        self.run_gadget('up', 'a.usb')
+        profile = self.run_dir / 'NetworkManager/system-connections/aurora-usb-gadget.nmconnection'
+        self.assertTrue(profile.exists())
+        self.assertIn('systemctl --no-block start serial-getty@ttyGS0.service', self.calls())
+        r = self.run_gadget('down', 'a.usb')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.read('UDC'), '')
+        # No network profile or login prompt is left behind for the next host.
+        self.assertFalse(profile.exists())
+        self.assertEqual(self.calls()[-2:], ['systemctl --no-block stop serial-getty@ttyGS0.service',
+                                             'nmcli connection reload'])
+        # The next plug-in builds both again.
+        self.run_gadget('up', 'a.usb')
+        self.assertTrue(profile.exists())
+        self.assertEqual(self.read('UDC'), 'a.usb')
+
     def test_functions_from_config(self):
         self.udc('a.usb')
         self.config('FUNCTIONS=ncm\n')
@@ -260,6 +280,17 @@ class UsbGadget(unittest.TestCase):
         r = self.run_gadget('up', 'a.usb')
         self.assertIn('did not take', r.stdout)
 
+    def test_storage_image_in_home_refused(self):
+        # The service cannot see /home (ProtectHome=yes): refused by hand too.
+        self.udc('a.usb')
+        for image in ('/home/user/disk.img', '/root/disk.img', '/run/user/1000/disk.img'):
+            self.config(f'STORAGE_IMAGE={image}\n')
+            r = self.run_gadget('up')
+            self.assertIn('which the service cannot see', r.stdout)
+            self.assertFalse((self.g / 'functions/mass_storage.usb0').exists())
+            self.assertEqual(self.read('UDC'), 'a.usb')
+            self.run_gadget('down')
+
     def test_storage_image_missing(self):
         self.udc('a.usb')
         self.config('STORAGE_IMAGE=/nonexistent/disk.img\n')
@@ -289,6 +320,34 @@ class UsbGadget(unittest.TestCase):
         self.assertRegex(text, r'\[ipv4\]\nmethod=link-local')
         self.assertRegex(text, r'\[ipv6\]\nmethod=link-local')
         self.assertIn(f'nmcli connection load {path}', self.calls())
+
+    def test_networkmanager_firewall_zone(self):
+        self.udc('a.usb')
+        (self.run_dir / 'NetworkManager').mkdir()
+        self.run_gadget('up')
+        self.assertRegex(self.nm_profile()[1], r'\[connection\]\n(?:[^\[]*\n)?zone=aurora-usb-gadget\n')
+        self.run_gadget('down')
+        self.config('FIREWALL_ZONE=work\n')
+        self.run_gadget('up')
+        self.assertIn('\nzone=work\n', self.nm_profile()[1])
+        self.run_gadget('down')
+        self.config('FIREWALL_ZONE=bad zone\n[ipv4]\n')
+        r = self.run_gadget('up')
+        self.assertIn('not a firewalld zone name', r.stdout)
+        self.assertIn('\nzone=aurora-usb-gadget\n', self.nm_profile()[1])
+
+    def test_firewall_zone_file(self):
+        import xml.etree.ElementTree as ET
+        zone = ET.parse(ROOT / 'usb-gadget/aurora-usb-gadget.xml').getroot()
+        services = {e.get('name') for e in zone.findall('service')}
+        self.assertEqual(services, {'ssh', 'mdns', 'dhcp', 'dns'})
+        # Everything else to this Mac is refused; forwarding (IPV4=shared) is not.
+        self.assertEqual(zone.get('target'), 'ACCEPT')
+        rule = zone.find('rule')
+        self.assertEqual(rule.get('priority'), '32767')
+        self.assertIsNotNone(rule.find('reject'))
+        self.assertIn('aurora-usb-gadget.xml $(DESTDIR)$(LIBDIR)/firewalld/zones/',
+                      (ROOT / 'Makefile').read_text())
 
     def test_networkmanager_shared(self):
         self.udc('a.usb')
@@ -472,7 +531,7 @@ class Integration(unittest.TestCase):
     def test_shipped_config_matches_defaults(self):
         conf = (ROOT / 'usb-gadget/usb-gadget.conf').read_text()
         keys = dict(re.findall(r'^([A-Z0-9_]+)=(.*)$', conf, re.M))
-        self.assertEqual(keys, {'ENABLED': 'yes', 'FUNCTIONS': '"ncm acm"', 'IPV4': 'link-local',
+        self.assertEqual(keys, {'ENABLED': 'yes', 'FUNCTIONS': '"ncm acm"', 'IPV4': 'link-local', 'FIREWALL_ZONE': 'aurora-usb-gadget',
                                 'CONSOLE': 'no', 'STORAGE_IMAGE': '', 'STORAGE_READONLY': 'yes',
                                 'STORAGE_CDROM': 'no'})
 

@@ -15,7 +15,9 @@ role. When a host is attached as the data host, the kernel registers a USB
 device controller under `/sys/class/udc`, and `86-aurora-usb-gadget.rules`
 starts `aurora-usb-gadget@<controller>.service`. That service builds the
 gadget in configfs and binds it. At unplug the controller goes away, the
-service stops (`BindsTo=`) and the gadget is unbound.
+service stops (`BindsTo=`), the gadget is unbound, and the runtime network
+profile and serial login prompt are removed (unless a second controller in
+device mode takes the gadget over).
 
 Use a USB 2 or USB 3 cable. A Thunderbolt or USB4 cable between two
 Thunderbolt-capable computers (two Macs, for example) gives Thunderbolt
@@ -52,7 +54,8 @@ attached. If several do, it lists them and stops. Name a port by its Type-C
 name (`port0`) or by its connector label from the firmware, for example
 `sudo aurora-usb-gadget role device "USB-C Left Back"`. The command prints
 the data role before and after, and exits non-zero if the role has not
-changed after 5 seconds (for example, because the far end refused).
+changed once the port controller has answered (for example, because the far
+end refused). It does not wait or poll.
 
 ## Using it from the host
 
@@ -61,8 +64,14 @@ addresses, plus the MAC address the host's side of the link will have. Both
 stay the same across reboots.
 
 To log in over the network, the Mac must run an SSH server. On Fedora:
-`sudo systemctl enable --now sshd`. Fedora's firewall puts the interface in its
-default zone, which allows SSH; other services need a firewall rule. If Avahi runs on the Mac, as on Fedora
+`sudo systemctl enable --now sshd`. Under NetworkManager the interface goes in
+the firewalld zone `aurora-usb-gadget` (`FIREWALL_ZONE`), not the default zone:
+the host reaches only SSH, mDNS, DHCP, DNS and ICMP on the Mac, and every other
+port is refused. Forwarded traffic is accepted, for `IPV4=shared`.
+`firewall-cmd --get-active-zones` shows it. To offer more, for example a web
+server: `sudo firewall-cmd --permanent --zone=aurora-usb-gadget
+--add-service=http && sudo firewall-cmd --reload`. systemd-networkd sets no
+zone, so there the firewall's default zone applies. If Avahi runs on the Mac, as on Fedora
 desktops, `ssh user@<hostname>.local` works from all three host systems.
 Otherwise use the link-local address:
 
@@ -114,8 +123,9 @@ aurora-usb-gadget up`.
 | `ENABLED` | `yes` | `no` turns device mode off. `systemctl mask aurora-usb-gadget@.service` also does. |
 | `FUNCTIONS` | `"ncm acm"` | Functions offered: `ncm` (network) and `acm` (serial port). |
 | `IPV4` | `link-local` | `link-local`: 169.254.x.x on both sides, as macOS does. `shared`: the Mac is 10.42.0.1, gives the host an address by DHCP and shares its own connection with it (NAT); NetworkManager needs `dnsmasq` for this. `off`: IPv6 link-local only. |
+| `FIREWALL_ZONE` | `aurora-usb-gadget` | firewalld zone of the NetworkManager profile (see above). |
 | `CONSOLE` | `no` | Login prompt on the serial port. |
-| `STORAGE_IMAGE` | empty | Image file offered as a USB disk. |
+| `STORAGE_IMAGE` | empty | Image file offered as a USB disk. Keep it outside `/home`, `/root` and `/run/user` (for example in `/var/lib/aurora-usb-gadget/`): the service runs with `ProtectHome=yes` and cannot see those, so an image there is refused, by hand too. |
 | `STORAGE_READONLY` | `yes` | `no` lets the host write. Never do that with an image that is mounted on the Mac at the same time. |
 | `STORAGE_CDROM` | `no` | Present the image as a CD-ROM (ISO images). |
 
