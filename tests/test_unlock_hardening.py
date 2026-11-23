@@ -131,6 +131,20 @@ class KeyboardTests(unittest.TestCase):
             self.run_keyboard(temporary, 'sync_initrd_keymap', vconsole='KEYMAP=fr\n', extra=stubs)
             self.assertFalse((temporary / 'log').exists())
 
+    def test_debian_initrd_names_are_checked_too(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            (temporary / 'boot').mkdir()
+            (temporary / 'boot/initrd.img-7.3.0-aurora1-ARCH').write_text('initrd')
+            (temporary / 'encrypt.state').write_text('format=1\nphase=finished\n')
+            stubs = f'''flock() {{ :; }}
+                lsinitrd() {{ cat {temporary}/initrd-vconsole; }}
+                dracut() {{ echo "dracut $*" >> {temporary}/log; }}'''
+            (temporary / 'initrd-vconsole').write_text('KEYMAP="de"\n')
+            result = self.run_keyboard(temporary, 'sync_initrd_keymap', vconsole='KEYMAP=fr\n', extra=stubs)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('dracut --regenerate-all --force', (temporary / 'log').read_text())
+
     def test_the_initrd_follows_vconsole_conf(self):
         path = (ROOT / 'systemd/aurora-initrd-keymap.path').read_text()
         self.assertIn('PathChanged=/etc/vconsole.conf', path)

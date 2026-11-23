@@ -21,6 +21,7 @@ loaded from. When the boot filesystem is not on the startup disk, GRUB stops
 with a message instead of scanning.
 """
 import argparse
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -148,14 +149,23 @@ def harden(root, flavor, boot_uuid, efi_uuid, boot_is_root=False, mkimage=None, 
         # still load from the boot filesystem once the stub hands off.
         modules = ["normal", "configfile", "part_gpt", "part_msdos", "fat", "ext2", "probe",
                    "regexp", "search", "search_fs_uuid", "test", "echo", "linux"]
+        # The core is built next to the live one and replaces it only when its
+        # bytes differ (grub-mkimage is reproducible): Debian reapplies this
+        # after every update-grub, and an interrupted write would leave the
+        # Mac without a boot loader.
+        built = core.with_name(core.name + ".new")
         if mkimage:
             # A GRUB outside the target (NixOS keeps it in the store).
-            command = [mkimage, f"--directory={modules_dir}", f"--output={core}"]
+            command = [mkimage, f"--directory={modules_dir}", f"--output={built}"]
         else:
             command = ["chroot", str(root), "grub-mkimage", "--directory=/usr/lib/grub/arm64-efi",
-                       "--output=/boot/efi/EFI/BOOT/BOOTAA64.EFI"]
+                       "--output=/boot/efi/EFI/BOOT/" + built.name]
         subprocess.run([*command, "--format=arm64-efi", "--prefix=/EFI/BOOT", *modules], check=True)
-        changed.append(core)
+        if built.read_bytes() == core.read_bytes():
+            built.unlink()
+        else:
+            os.replace(built, core)
+            changed.append(core)
     if main.is_file():
         write_if_changed(main, harden_main(main.read_text(), efi_uuid), changed)
     return changed

@@ -453,7 +453,9 @@ sync_initrd_keymap() {
   exec 8> "$run_dir/aurora-initrd-keymap.lock"
   flock 8
   wanted=$(console_keymap)
-  for image in "$initrd_dir"/initramfs-*.img; do
+  # dracut names the image initramfs-<kernel>.img. Debian's dracut sets initrdname
+  # in its 01-debian.conf, so there it writes initrd.img-<kernel>.
+  for image in "$initrd_dir"/initramfs-*.img "$initrd_dir"/initrd.img-*; do
     [[ -f $image && $image != *rescue* && $image != *kdump* ]] || continue
     if ! current=$(initrd_keymap "$image"); then
       warn "cannot read the console keymap in $image"
@@ -465,6 +467,9 @@ sync_initrd_keymap() {
   done
   (( stale )) || return 0
   if command -v dracut >/dev/null 2>&1; then
+    # --regenerate-all writes each kernel's image under dracut's configured
+    # name, which on Debian is initrd.img-<kernel> only because its
+    # 01-debian.conf sets initrdname. The tests stub dracut and don't see this.
     dracut --regenerate-all --force && return 0
   elif command -v mkinitcpio >/dev/null 2>&1; then
     mkinitcpio -P && return 0
