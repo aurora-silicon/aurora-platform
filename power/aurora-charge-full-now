@@ -59,7 +59,6 @@ POWER_SUPPLY = '/sys/class/power_supply'
 DERATE = 0.6                # of the adapter's input_power_limit that is assumed to reach the battery
 MIN_RATE = 10.0             # W; never assume a slower charge than this
 MARGIN = 30 * 60            # seconds of slack before the deadline
-FALLBACK_WH = 100.0         # assumed capacity when UPower reports no energy
 
 UPOWER = 'org.freedesktop.UPower'
 UPOWER_PATH = '/org/freedesktop/UPower'
@@ -412,13 +411,46 @@ def charge_rate(p, adapter_w):
     return max(min(rates) if rates else MIN_RATE, MIN_RATE)
 
 
-def plan(p, deadline, now, adapter_w):
-    """When to start so the battery is full by deadline: {start, deadline, deficit_wh, rate_w}."""
-    full, energy = p.get('EnergyFull') or 0, p.get('Energy') or 0
-    if full > 0:
+def read_uint(path):
+    try:
+        with open(path) as f:
+            v = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def capacity_wh(p, root=POWER_SUPPLY):
+    """The battery's full capacity in Wh: UPower's EnergyFull, else the kernel's
+    energy_full, else charge_full x voltage_min_design.  None when none is known:
+    no guessed pack size."""
+    if (p.get('EnergyFull') or 0) > 0:
+        return float(p['EnergyFull'])
+    name = os.path.basename(p.get('NativePath') or '')
+    if not name or name in ('.', '..'):
+        return None
+    base = os.path.join(root, name)
+    uwh = read_uint(os.path.join(base, 'energy_full'))
+    if uwh:
+        return uwh / 1e6
+    uah, uv = read_uint(os.path.join(base, 'charge_full')), read_uint(os.path.join(base, 'voltage_min_design'))
+    if uah and uv:
+        return uah * uv / 1e12
+    return None
+
+
+def plan(p, deadline, now, adapter_w, root=POWER_SUPPLY):
+    """When to start so the battery is full by deadline: {start, deadline, deficit_wh, rate_w},
+    or None when the battery's capacity is unknown."""
+    full = capacity_wh(p, root)
+    if full is None:
+        return None
+    pct = min(max(p.get('Percentage') or 0, 0), 100)
+    energy = p.get('Energy') or 0
+    if (p.get('EnergyFull') or 0) > 0 and energy > 0:
         deficit = max(full - energy, 0.0)
     else:
-        deficit = FALLBACK_WH * max(100 - (p.get('Percentage') or 0), 0) / 100
+        deficit = full * (100 - pct) / 100
     rate = charge_rate(p, adapter_w)
     start = deadline - deficit / rate * 3600 - MARGIN
     return {'deadline': int(deadline), 'start': int(max(start, now)), 'deficit_wh': round(deficit, 2),
@@ -475,7 +507,8 @@ def arm(bus, by, now=None, root=POWER_SUPPLY, schedule_file=None):
         log('arm: %r is not HH:MM' % by)
         return 2
     now = time.time() if now is None else now
-    path, p, why = preflight(bus, read_marker(MARKER), need_adapter=False)
+    marker = read_marker(MARKER)
+    path, p, why = preflight(bus, marker, need_adapter=False)
     clear_schedule(schedule_file)
     try:        # a failed or lingering transient unit would block the new one's name
         RUN(['systemctl', 'reset-failed', SCHEDULE + '.timer', SCHEDULE + '.service'],
@@ -485,7 +518,13 @@ def arm(bus, by, now=None, root=POWER_SUPPLY, schedule_file=None):
     if path is None:
         log('nothing to schedule: %s' % why)
         return 0
-    pl = plan(p, next_deadline(hm[0], hm[1], now), now, adapter_watts(root))
+    if marker is not None:
+        log('nothing to schedule: a one-shot is already charging to full')
+        return 0
+    pl = plan(p, next_deadline(hm[0], hm[1], now), now, adapter_watts(root), root)
+    if pl is None:
+        log('nothing to schedule: the battery reports no capacity, so no start time can be planned')
+        return 1
     log('full by %s: %.1f Wh to go at %.1f W plus %d min margin; start %s' % (
         stamp(pl['deadline']), pl['deficit_wh'], pl['rate_w'], MARGIN // 60,
         'now' if pl['now'] else stamp(pl['start'])))
@@ -552,6 +591,15 @@ def cmd_start(bus, by=None):
         if path is None:
             print(why)
             return 0
+        if marker is not None:
+            # The limit is lifted now: a schedule would not hold it.
+            print('A one-shot is already charging the battery to full. '
+                  '"aurora-charge-full-now cancel" turns the limit back on first.')
+            return 1
+        if capacity_wh(p) is None:
+            print('The battery reports no capacity, so no start time can be planned. '
+                  '"aurora-charge-full-now start" charges to full now.', file=sys.stderr)
+            return 1
         unit = '%s@%02d%02d.service' % (SCHEDULE, hm[0], hm[1])
         rc = systemctl('start', unit)
         if rc != 0:

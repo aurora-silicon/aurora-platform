@@ -458,7 +458,41 @@ class Schedule(Base):
         self.assertEqual(cf.plan(self.bat(State=1, EnergyRate=20.0), d, self.now, 96.0)['rate_w'], 20.0)
         self.assertEqual(cf.plan(self.bat(State=1, EnergyRate=3.0), d, self.now, 96.0)['rate_w'], 10.0)
         self.assertEqual(cf.plan(self.bat(), d, self.now, 12.0)['rate_w'], 10.0)    # 7.2 W derated: floor
-        self.assertEqual(cf.plan(self.bat(EnergyFull=0, Percentage=80.0), d, self.now, None)['deficit_wh'], 20.0)
+
+    def test_capacity_from_the_kernel_when_upower_has_none(self):
+        d = self.now + 86400
+        bat = self.bat(EnergyFull=0, Energy=0, Percentage=80.0, NativePath='macsmc-battery')
+        # No capacity anywhere: no plan, never a guessed pack size.
+        self.assertIsNone(cf.capacity_wh(bat, str(self.sys)))
+        self.assertIsNone(cf.plan(bat, d, self.now, None, str(self.sys)))
+        self.supply('macsmc-battery', 'Battery', charge_full=4000000, voltage_min_design=11400000)
+        self.assertAlmostEqual(cf.capacity_wh(bat, str(self.sys)), 45.6)
+        self.assertEqual(cf.plan(bat, d, self.now, None, str(self.sys))['deficit_wh'], 9.12)
+        (self.sys / 'macsmc-battery' / 'energy_full').write_text('52600000\n')
+        self.assertEqual(cf.plan(bat, d, self.now, None, str(self.sys))['deficit_wh'], 10.52)
+        # A NativePath cannot point outside the power_supply directory.
+        self.assertIsNone(cf.capacity_wh(dict(bat, NativePath='..'), str(self.sys)))
+
+    def test_arm_refuses_without_capacity(self):
+        self.adapter(96)
+        self.assertEqual(self.arm('07:30', EnergyFull=0, Energy=0, NativePath='macsmc-battery'), 1)
+        self.assertFalse(os.path.exists(self.sched))
+        self.assertNotIn('systemd-run', [c[0] for c in self.systemd.calls])
+
+    def test_start_by_while_a_one_shot_runs_is_refused(self):
+        cf.write_marker({'path': BAT, 'native_path': 'macsmc-battery', 'end_threshold': 80}, self.marker)
+        bat = {'ChargeThresholdEnabled': False}                 # the one-shot lifted the limit
+        self.assertEqual(cf.cmd_start(self.up(bat=bat), '07:30'), 1)
+        self.assertEqual(self.systemd.calls, [])
+        # The root side refuses too, whoever starts it.
+        self.assertEqual(self.arm('07:30', **bat), 0)
+        self.assertFalse(os.path.exists(self.sched))
+        self.assertNotIn('systemd-run', [c[0] for c in self.systemd.calls])
+
+    def test_start_by_without_capacity_is_refused(self):
+        bat = self.bat(EnergyFull=0, Energy=0, NativePath='no-such-battery-for-tests')
+        self.assertEqual(cf.cmd_start(self.up(bat=bat), '07:30'), 1)
+        self.assertEqual(self.systemd.calls, [])
 
     def test_arm_far_sets_a_timer(self):
         self.adapter(96)

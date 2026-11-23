@@ -20,4 +20,4 @@ no timers and no blocking D-Bus calls.
 gnome-extensions enable charge-full-now@aurorasilicon.org
 ```
 
-Not yet run on a GNOME Shell session.
+Tested on a headless GNOME Shell 51 session (toggle state follows the service); not yet on a desktop session with a person at it.
