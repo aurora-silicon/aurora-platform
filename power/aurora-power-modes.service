@@ -2,7 +2,9 @@
 Description=Power profile legs beyond the CPU budget, and Low Power Mode scheduling (Apple silicon)
 Documentation=https://github.com/aurora-silicon/aurora-platform/blob/main/power/README.md
 ConditionPathExists=/sys/firmware/devicetree/base/cpus
-After=tuned-ppd.service power-profiles-daemon.service
+# Let multi-user.target pull in this service without waiting for it.
+# The profile provider can start after that target.
+After=multi-user.target tuned-ppd.service power-profiles-daemon.service
 
 [Service]
 Type=simple
