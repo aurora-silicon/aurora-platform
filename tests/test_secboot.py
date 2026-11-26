@@ -166,7 +166,7 @@ class CmdlineTests(TempCase):
         fx = self.fixture()
         r = fx.run('cmdline')
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout, 'root=UUID=x ro rhgb quiet lockdown=integrity\n')
+        self.assertEqual(r.stdout, 'root=UUID=x ro rhgb quiet aurora.vendorfw=none lockdown=integrity\n')
         self.assertIn("removed 'systemd.debug_shell=1'", r.stderr)
         self.assertIn("removed 'panic=10'", r.stderr)
 
@@ -176,7 +176,8 @@ class CmdlineTests(TempCase):
             'root=UUID=x ro systemd.debug_shell=1 panic=10 systemd.watchdog_sec=60 init=/bin/sh\n')
         r = fx.run('cmdline', '--lab')
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout, 'root=UUID=x ro panic=10 systemd.watchdog_sec=60 lockdown=integrity\n')
+        self.assertEqual(r.stdout, 'root=UUID=x ro panic=10 systemd.watchdog_sec=60 aurora.vendorfw=none '
+                                    'lockdown=integrity\n')
         self.assertIn('never ship', r.stderr)
 
     def test_refusal_table(self):
@@ -207,7 +208,7 @@ class CmdlineTests(TempCase):
         (fx.root / 'proc/cmdline').write_text(
             'BOOT_IMAGE=(hd0,gpt2)/vmlinuz-7 root=UUID=x ro initrd=\\initrd lockdown=none\n')
         r = fx.run('cmdline')
-        self.assertEqual(r.stdout, 'root=UUID=x ro lockdown=confidentiality\n')
+        self.assertEqual(r.stdout, 'root=UUID=x ro aurora.vendorfw=none lockdown=confidentiality\n')
         self.assertEqual(r.stderr.count('removed'), 1)
 
     def test_bad_config_value_is_refused(self):
@@ -344,7 +345,7 @@ class UkiTests(TempCase):
         self.assertEqual(opt('--uname'), KVER)
         self.assertEqual(opt('--stub'), str(fx.root / 'usr/lib/systemd/boot/efi/linuxaa64.efi.stub'))
         self.assertEqual(opt('--os-release'), '@' + str(fx.root / 'etc/os-release'))
-        self.assertEqual(opt('--cmdline'), 'root=UUID=x ro rhgb quiet lockdown=integrity')
+        self.assertEqual(opt('--cmdline'), 'root=UUID=x ro rhgb quiet aurora.vendorfw=none lockdown=integrity')
         self.assertNotIn('--devicetree', args)
         sign = fx.calls('sbsign')[0]
         self.assertEqual(sign[sign.index('--key') + 1], str(fx.keys / 'db.key'))
@@ -375,7 +376,7 @@ class UkiTests(TempCase):
                    '--no-sign')
         self.assertEqual(r.returncode, 0, r.stderr)
         args = fx.calls('ukify')[0]
-        self.assertEqual(args[args.index('--cmdline') + 1], 'root=/dev/x panic=5 lockdown=integrity')
+        self.assertEqual(args[args.index('--cmdline') + 1], 'root=/dev/x panic=5 aurora.vendorfw=none lockdown=integrity')
         self.assertEqual([args[i + 1] for i, a in enumerate(args) if a == '--initrd'],
                          [str(fx.root / 'tmp/a.img'), str(fx.root / 'tmp/b.img')])
         self.assertEqual(args[args.index('--linux') + 1], str(fx.root / f'usr/lib/modules/{OLD}/vmlinuz'))
@@ -438,6 +439,82 @@ class UkiTests(TempCase):
         self.assertEqual(sb.newest(['6.9.1', '6.10.0', '6.10.0~rc7']), '6.10.0')
         self.assertEqual(sb.newest([OLD, KVER]), KVER)
         self.assertEqual(sb.vercmp('7.2.10~rc1', '7.2.10'), -1)
+
+
+class VendorFirmwareTests(TempCase):
+    """aurora.vendorfw= binds the ESP's vendor firmware archive to the UKI."""
+
+    def cmdline_of(self, fx):
+        args = fx.calls('ukify')[-1]
+        return args[args.index('--cmdline') + 1].split()
+
+    def archive(self, fx, data):
+        (fx.esp / 'vendorfw').mkdir(parents=True, exist_ok=True)
+        (fx.esp / 'vendorfw/firmware.cpio').write_bytes(data)
+        return 'sha256:' + hashlib.sha256(data).hexdigest()
+
+    def test_no_archive_trusts_none(self):
+        fx = self.fixture()
+        fx.run('keys', 'create')
+        r = fx.run('uki', 'build', KVER)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('aurora.vendorfw=none', self.cmdline_of(fx))
+        self.assertFalse((fx.keys / 'vendorfw.sha256').exists())
+        self.archive(fx, b'')
+        fx.run('uki', 'build', KVER)
+        self.assertIn('aurora.vendorfw=none', self.cmdline_of(fx), 'an empty archive is no archive')
+
+    def test_first_build_pins_the_archive(self):
+        fx = self.fixture()
+        fx.run('keys', 'create')
+        one = self.archive(fx, b'archive one')
+        r = fx.run('cmdline')
+        self.assertIn(f'aurora.vendorfw={one} lockdown=integrity', r.stdout)
+        self.assertFalse((fx.keys / 'vendorfw.sha256').exists(), 'printing the command line pins nothing')
+        r = fx.run('uki', 'build', KVER)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.cmdline_of(fx).count(f'aurora.vendorfw={one}'), 1)
+        pin = fx.keys / 'vendorfw.sha256'
+        self.assertEqual(pin.read_text(), one + '\n')
+        self.assertEqual(stat.S_IMODE(pin.stat().st_mode), 0o600)
+
+    def test_a_changed_archive_keeps_the_pin_until_it_is_removed(self):
+        fx = self.fixture()
+        fx.run('keys', 'create')
+        one = self.archive(fx, b'archive one')
+        fx.run('uki', 'build', KVER)
+        two = self.archive(fx, b'archive two')
+        r = fx.run('uki', 'build', KVER)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f'aurora.vendorfw={one}', self.cmdline_of(fx))
+        self.assertIn('not the one pinned', r.stderr)
+        (fx.keys / 'vendorfw.sha256').unlink()
+        fx.run('uki', 'build', KVER)
+        self.assertIn(f'aurora.vendorfw={two}', self.cmdline_of(fx))
+        self.assertEqual((fx.keys / 'vendorfw.sha256').read_text(), two + '\n')
+
+    def test_a_bad_pin_trusts_none(self):
+        fx = self.fixture()
+        fx.run('keys', 'create')
+        self.archive(fx, b'archive one')
+        (fx.keys / 'vendorfw.sha256').write_text('sha256:XYZ\n')
+        r = fx.run('uki', 'build', KVER)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('aurora.vendorfw=none', self.cmdline_of(fx))
+        self.assertIn('holds no vendor firmware digest', r.stderr)
+
+    def test_an_image_builders_own_binding_is_kept(self):
+        # NixOS binds the archive in its module and passes it on the command line.
+        fx = self.fixture()
+        fx.run('keys', 'create')
+        self.archive(fx, b'archive one')
+        own = 'sha256:' + 'a' * 64
+        (fx.root / 'tmp').mkdir()
+        (fx.root / 'tmp/cmd').write_text(f'root=fstab aurora.vendorfw={own}\n')
+        r = fx.run('uki', 'build', KVER, '--cmdline-file', '/tmp/cmd')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tokens = self.cmdline_of(fx)
+        self.assertEqual([t for t in tokens if t.startswith('aurora.vendorfw=')], [f'aurora.vendorfw={own}'])
 
 
 class SecurePathTests(TempCase):
@@ -566,7 +643,7 @@ class ImageBuilderTests(TempCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         args = fx.calls('ukify')[0]
         self.assertEqual(args[args.index('--cmdline') + 1],
-                         f'root=fstab loglevel=4 init={gen}/init lockdown=integrity')
+                         f'root=fstab loglevel=4 aurora.vendorfw=none init={gen}/init lockdown=integrity')
         self.assertIn("removed 'init=/old'", r.stderr)
         self.assertTrue((fx.root / 'boot/EFI/Linux/aurora-nixos-abc.efi').exists())
 

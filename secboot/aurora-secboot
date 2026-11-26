@@ -401,7 +401,46 @@ def refused(token, lab):
     return None
 
 
-def secure_cmdline(sysobj, cfg, lab=False, source=None, init=None):
+VENDORFW = 'vendorfw/firmware.cpio'
+VENDORFW_PIN = 'vendorfw.sha256'
+
+
+def vendorfw_binding(sysobj, cfg, pin=True):
+    """The aurora.vendorfw= value of the secure-path command line.
+
+    This Mac's vendor firmware archive stays on the ESP, which the UKI's
+    signature does not cover, so the signed command line names the archive
+    the initrd may use: its SHA-256, pinned in KEY_DIR by the first UKI built
+    with it (pin=True), or none. A later change on the ESP keeps the pinned
+    digest, so boots refuse the changed archive until the owner removes the
+    pin."""
+    current = 'none'
+    try:
+        with open(os.path.join(sysobj.esp(cfg), VENDORFW), 'rb') as f:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        if h.digest() != hashlib.sha256(b'').digest():
+            current = 'sha256:' + h.hexdigest()
+    except OSError:
+        pass
+    path = os.path.join(sysobj.key_dir(cfg), VENDORFW_PIN)
+    pinned = sysobj.read(os.path.join(cfg['KEY_DIR'], VENDORFW_PIN))
+    if pinned is None:
+        if pin and current != 'none' and os.path.isdir(sysobj.key_dir(cfg)):
+            atomic_write(path, (current + '\n').encode(), 0o600)
+        return current
+    pinned = pinned.strip()
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', pinned):
+        warn(f'{path} holds no vendor firmware digest: boots refuse the archive on the ESP')
+        return 'none'
+    if current not in ('none', pinned):
+        warn(f'the vendor firmware on the ESP is not the one pinned in {path}: boots refuse it '
+             'until that file is removed and the UKI is built again')
+    return pinned
+
+
+def secure_cmdline(sysobj, cfg, lab=False, source=None, init=None, vendorfw=None):
     if source is not None:
         try:
             with open(source) as f:
@@ -424,6 +463,9 @@ def secure_cmdline(sysobj, cfg, lab=False, source=None, init=None):
             warnings.append(f"removed '{t}' from the secure-path command line: it {why}")
             continue
         tokens.append(t)
+    # An image builder that binds the archive itself (NixOS) passes its own.
+    if vendorfw and not any(t.startswith('aurora.vendorfw=') for t in tokens):
+        tokens.append('aurora.vendorfw=' + vendorfw)
     if init is not None:
         # An init the image builder names (NixOS: the generation's stage 2); it is signed with the rest.
         if not init.startswith('/') or re.search(r'[\s"]', init):
@@ -646,7 +688,8 @@ def cmd_uki_build(sysobj, cfg, args):
             raise Refusal(f'{osrel} does not exist.')
     else:
         osrel = find_first(sysobj, ('/etc/os-release', '/usr/lib/os-release'))
-    cmdline, warnings = secure_cmdline(sysobj, cfg, args.lab, args.cmdline_file, args.init)
+    cmdline, warnings = secure_cmdline(sysobj, cfg, args.lab, args.cmdline_file, args.init,
+                                       vendorfw_binding(sysobj, cfg))
     for w in warnings:
         warn(w)
     if args.lab:
@@ -1740,7 +1783,7 @@ def parser():
 
 
 def print_cmdline(sysobj, cfg, args):
-    line, warnings = secure_cmdline(sysobj, cfg, args.lab)
+    line, warnings = secure_cmdline(sysobj, cfg, args.lab, vendorfw=vendorfw_binding(sysobj, cfg, pin=False))
     for w in warnings:
         warn(w)
     if args.lab:

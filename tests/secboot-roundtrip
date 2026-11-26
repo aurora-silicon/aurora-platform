@@ -25,6 +25,10 @@ echo 'root=UUID=x ro rhgb quiet systemd.debug_shell=1 panic=10' > "$root/etc/ker
 cp "$stub" "$root$stub"
 cp "$image" "$root/usr/lib/modules/$kver/vmlinuz"
 cp "$initrd" "$root/boot/initramfs-$kver.img"
+# A vendor firmware archive on the ESP: the signed command line binds its digest.
+mkdir -p "$root/boot/efi/vendorfw"
+echo 'round trip vendor firmware' > "$root/boot/efi/vendorfw/firmware.cpio"
+vendorfw=sha256:$(sha256sum < "$root/boot/efi/vendorfw/firmware.cpio" | cut -d' ' -f1)
 run() { "${cli[@]}" --root "$root" "$@"; }
 
 run keys create
@@ -34,18 +38,19 @@ uki=$root/boot/efi/EFI/Linux/aurora-0123456789abcdef0123456789abcdef-$kver.efi
 [[ -f $uki ]] || fail 'no UKI'
 grep -q "removed 'systemd.debug_shell=1'" "$work/build.err" || fail 'debug_shell not reported'
 ukify inspect "$uki" --json=short > "$work/inspect.json"
-python3 - "$work/inspect.json" "$kver" <<'EOF'
+python3 - "$work/inspect.json" "$kver" "$vendorfw" <<'EOF'
 import json, sys
 info = json.load(open(sys.argv[1]))
 sections = {k.lstrip('.'): v for k, v in info.items()}
 cmdline = sections['cmdline']['text'].strip()
-assert cmdline == 'root=UUID=x ro rhgb quiet lockdown=integrity', cmdline
+assert cmdline == f'root=UUID=x ro rhgb quiet aurora.vendorfw={sys.argv[3]} lockdown=integrity', cmdline
 assert sections['uname']['text'].strip() == sys.argv[2]
 assert 'dtb' not in sections, 'a devicetree was embedded'
 assert {'linux', 'initrd', 'osrel'} <= set(sections), sorted(sections)
 print('UKI sections:', ' '.join(sorted(sections)))
 print('UKI cmdline:', cmdline)
 EOF
+[[ $(cat "$root/var/lib/aurora/secboot/keys/vendorfw.sha256") == "$vendorfw" ]] || fail 'vendor firmware digest not pinned'
 sbverify --cert "$root/var/lib/aurora/secboot/keys/db.crt" "$uki"
 run uki verify | tee "$work/verify.out"
 grep -q ': verified$' "$work/verify.out" || fail 'uki verify'

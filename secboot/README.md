@@ -67,7 +67,15 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
   `ESP/aurora/secboot/stage2.key`. Running it again does nothing. A key that does not match its public half, or that differs
   from the one already in `KEY_DIR`, is refused and left where it is.
 - `cmdline [--lab]`: the secure-path command line. It starts from `/etc/kernel/cmdline` (else `/proc/cmdline` without
-  `BOOT_IMAGE=` and `initrd=`), removes the tokens below with one warning each, and adds `lockdown=<LOCKDOWN>`.
+  `BOOT_IMAGE=` and `initrd=`), removes the tokens below with one warning each, and adds `aurora.vendorfw=` and
+  `lockdown=<LOCKDOWN>`.
+  `aurora.vendorfw=` binds this Mac's vendor firmware archive (`ESP/vendorfw/firmware.cpio`), which stays on the ESP and
+  outside the UKI's signature: `sha256:<digest>` of the archive, or `none` without one. The initrd then uses only an
+  archive with that digest. The first UKI built with an archive pins its digest in `KEY_DIR/vendorfw.sha256`; later UKIs
+  keep the pinned digest, so a changed archive is refused at boot (with a warning when the UKI is built) until the
+  owner removes that file and builds the UKI again. `cmdline` only reports the binding; `uki build` pins it. A command
+  line that already carries `aurora.vendorfw=` (an image builder that binds the archive itself, as NixOS does) keeps
+  its own.
 - `uki build KVER [--image P] [--initrd P]... [--cmdline-file P] [--init P] [--stub P] [--os-release P] [--lab] [--output P] [--no-sign]`:
   `ukify build` with the stub (`--stub`, else `$AURORA_SECBOOT_STUB`, else
   `/usr/lib/systemd/boot/efi/linuxaa64.efi.stub`), `--uname KVER` and the os-release file (`--os-release P`, else `/etc/os-release`, else `/usr/lib/os-release`; with none, a minimal one naming KVER, so a build sandbox works). `--init P` adds `init=P` after
