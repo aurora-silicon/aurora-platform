@@ -58,7 +58,7 @@ def root_compatible(blob):
     raise ValueError('missing root compatible')
 
 
-def prepare(combined_path, aura_path, output):
+def prepare(combined_path, aura_path, output, member_dir='esp/aurora'):
     combined = combined_path.read_bytes()
     aura = aura_path.read_bytes()
     if not aura or not combined.startswith(aura):
@@ -91,7 +91,7 @@ def prepare(combined_path, aura_path, output):
         name = f'boot-{board}.bin'
         (output / name).write_bytes(data)
         records[board + 'ap'] = {
-            'member': 'esp/m1n1/' + name,
+            'member': member_dir + '/' + name,
             'bytes': len(data),
             'sha256': digest(data),
             'deviceTrees': len(trees),
@@ -111,8 +111,10 @@ if __name__ == '__main__':
     parser.add_argument('--combined', required=True, type=Path)
     parser.add_argument('--aura', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--member-dir', default='esp/aurora',
+                        help='payload directory the members are recorded under (default esp/aurora)')
     parser.add_argument('--manifest', required=True, type=Path)
     args = parser.parse_args()
-    manifest = prepare(args.combined, args.aura, args.output)
+    manifest = prepare(args.combined, args.aura, args.output, args.member_dir)
     args.manifest.write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
     print(f"prepared {len(manifest['boards'])} board payloads from {manifest['deviceTreeCount']} trees")

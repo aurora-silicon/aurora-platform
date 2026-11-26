@@ -15,7 +15,7 @@ covers installs made before that.
   lab Macs, the padding byte for byte against aurora-installer's.
 - An enforcing Stage 1 has never booted on any Mac.
 - **Nothing has been tried on M4 Macs (T8132, such as the MacBook Air J713) or later.** Those Macs need
-  a padded Stage 1 that loads `m1n1/boot-ctxr.bin`. The tool builds that, but no M4 has booted one
+  a padded Stage 1 that loads `aurora/boot-ctxr.bin`. The tool builds that, but no M4 has booted one
   with key checks.
 - Each Linux install and macOS has its own LocalPolicy, so this changes only the install you enrol it
   for. If it goes wrong, macOS and your other installs still boot.
@@ -109,7 +109,7 @@ Keep it in audit through a few kernel and aura updates and check that each Stage
 
 ## Stage 2 updates
 
-Package updates rebuild Stage 2 (`m1n1/boot.bin`, or `m1n1/boot-ctxr.bin` on M4 and later). With
+Package updates rebuild Stage 2 (`aurora/boot.bin`, or `aurora/boot-ctxr.bin` on M4 and later). With
 `KEY_OWNER=owner` and `STAGE2_SIGN=auto`, an updater that supports it hands each new Stage 2 to
 `aurora-secboot stage2 hook`, which signs it before it reaches the ESP. If signing fails the update stops
 and the old Stage 2 stays. Updaters that do this install `/usr/share/aurora/stage2-sign-hook`. With an

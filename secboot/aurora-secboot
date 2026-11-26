@@ -42,8 +42,11 @@ CHOICES = {
     'STAGE2_SIGN': ('auto', 'yes', 'no'),
 }
 STUB = '/usr/lib/systemd/boot/efi/linuxaa64.efi.stub'
-DT_ESP = ('/proc/device-tree/chosen/asahi,efi-system-partition',
-          '/sys/firmware/devicetree/base/chosen/asahi,efi-system-partition')
+# aura names the ESP Stage 1 booted from in /chosen/aurora,efi-system-partition.
+# LEGACY-ASAHI(2027-02-28): aura builds before the rename write only the asahi, name.
+CHOSEN_ESP = ('aurora,efi-system-partition', 'asahi,efi-system-partition')
+DT_ESP = tuple(root + '/chosen/' + name for name in CHOSEN_ESP
+               for root in ('/proc/device-tree', '/sys/firmware/devicetree/base'))
 BOOT_SECURITY = '/sys/firmware/aurora/boot_security'
 EFIVARS = '/sys/firmware/efi/efivars'
 EFI_GLOBAL = '8be4df61-93ca-11d2-aa0d-00e098032b8c'
@@ -918,8 +921,11 @@ S1_FLAVOUR = b'chosen.aurora,stage1-flavour='
 AURA_LOAD = (0x808, b'AURALOAD')
 TRAILER = b'AURSIGT1'
 SIG_TAG = b'aura_sig'
-STAGE2_STANDARD = 'm1n1/boot.bin'
-STAGE2_CONFINED = 'm1n1/boot-ctxr.bin'
+STAGE2_STANDARD = 'aurora/boot.bin'
+STAGE2_CONFINED = 'aurora/boot-ctxr.bin'
+# LEGACY-ASAHI(2027-02-28): a Stage 1 enrolled before the rename chainloads the old path, so
+# updaters keep that file current while it exists, and so does Stage 2 signing.
+STAGE2_LEGACY = {STAGE2_STANDARD: 'm1n1/boot.bin', STAGE2_CONFINED: 'm1n1/boot-ctxr.bin'}
 STAGE1_DIR = 'aurora/stage1'
 STAGE1_STATE = '/var/lib/aurora/secboot/stage1'
 SECVER_MAX = 0xffffffff
@@ -959,6 +965,26 @@ def dt_read(sysobj, rel):
 def dt_str(sysobj, rel):
     raw = dt_read(sysobj, rel)
     return raw.rstrip(b'\0').decode(errors='replace') if raw is not None else None
+
+
+def dt_esp_partuuid(sysobj):
+    """The ESP PARTUUID Stage 1 named: the aurora, property, else the pre-rename one."""
+    for name in CHOSEN_ESP:
+        value = dt_str(sysobj, '/chosen/' + name)
+        if value:
+            return value
+    return None
+
+
+def stage2_with_legacy(path):
+    """path, plus the pre-rename file next to it when it exists (an older Stage 1 still loads it)."""
+    out = [path]
+    for new, old in STAGE2_LEGACY.items():
+        if path.endswith('/' + new) or path == new:
+            legacy = path[:len(path) - len(new)] + old
+            if os.path.exists(legacy):
+                out.append(legacy)
+    return out
 
 
 def soc(sysobj):
@@ -1173,7 +1199,8 @@ def cmd_stage2_sign(sysobj, cfg, args):
         raise Refusal(f'Stage 2 signing is off ({why}).')
     secver = stage2_secver(cfg)
     target = stage2_target(sysobj, cfg, args)
-    paths = [target] + [p for p in (target + '.next',) if os.path.exists(p) and not args.path]
+    targets = [target] if args.path else stage2_with_legacy(target)
+    paths = [p for t in targets for p in [t] + [n for n in (t + '.next',) if os.path.exists(n) and not args.path]]
     for p in paths:
         if not os.path.exists(p):
             raise Refusal(f'{p} does not exist.')
@@ -1194,7 +1221,8 @@ def cmd_stage2_verify(sysobj, cfg, args):
     _, pub = stage2_key(sysobj, cfg)
     target = stage2_target(sysobj, cfg, args)
     bad = 0
-    for p in [target] + [x for x in (target + '.next',) if os.path.exists(x) and not args.path]:
+    targets = [target] if args.path else stage2_with_legacy(target)
+    for p in [q for t in targets for q in [t] + [x for x in (t + '.next',) if os.path.exists(x) and not args.path]]:
         v, kid, secver = stage2_verdict(sysobj, args, p, pub)
         print(f'{p}: {v}' + (f', key id {kid}, secver {secver}' if kid else ''))
         bad |= v != 'verified'
@@ -1202,7 +1230,7 @@ def cmd_stage2_verify(sysobj, cfg, args):
 
 
 def cmd_stage2_hook(sysobj, cfg, args):
-    """update-m1n1 (bootchain.py) hands over each Stage 2 it composed: write it signed when Stage 2
+    """update-aura (bootchain.py) hands over each Stage 2 it composed: write it signed when Stage 2
     signing is on, unchanged otherwise. A refusal fails the update, so the last Stage 2 stays."""
     with open(args.input, 'rb') as f:
         data = f.read()
@@ -1314,20 +1342,24 @@ def cmd_stage1_build(sysobj, cfg, args):
         raise Refusal('the device tree names no Apple chip (apple,tNNNN), so the Stage 1 form is unknown.')
     padded = uses_execute_window(chip)
     stage2_rel = STAGE2_CONFINED if padded else STAGE2_STANDARD
-    esp_uuid = (dt_str(sysobj, '/chosen/asahi,efi-system-partition') or '').strip().lower()
+    esp_uuid = (dt_esp_partuuid(sysobj) or '').strip().lower()
     if args.esp_partuuid:
         if esp_uuid and args.esp_partuuid.lower() != esp_uuid:
             raise Refusal(f'--esp-partuuid {args.esp_partuuid} is not the ESP this boot came from ({esp_uuid}).')
         esp_uuid = args.esp_partuuid.lower()
     if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', esp_uuid):
-        raise Refusal('this boot\'s Stage 1 named no ESP (/chosen/asahi,efi-system-partition); pass --esp-partuuid.')
+        raise Refusal('this boot\'s Stage 1 named no ESP (/chosen/aurora,efi-system-partition); pass --esp-partuuid.')
     esp = sysobj.esp(cfg)
     if not cfg['ESP'] and sysobj.dt_esp_mount() is None:
         raise Refusal(f'the ESP {esp_uuid} is not mounted; mount it (e.g. at /boot/efi) and run this again.')
     stage2 = os.path.join(esp, stage2_rel)
+    legacy_rel = STAGE2_LEGACY[stage2_rel]
+    if not os.path.exists(stage2) and os.path.exists(os.path.join(esp, legacy_rel)):
+        # LEGACY-ASAHI(2027-02-28): an ESP whose updater has not written the new path yet.
+        stage2_rel, stage2 = legacy_rel, os.path.join(esp, legacy_rel)
     if not os.path.exists(stage2):
         if padded:
-            raise Refusal(f'{stage2} does not exist: this M4-or-later Mac needs the confined Stage 2 that update-m1n1 '
+            raise Refusal(f'{stage2} does not exist: this M4-or-later Mac needs the confined Stage 2 that update-aura '
                           'writes with a monitor-free aura, and a padded Stage 1 would load nothing.')
         raise Refusal(f'{stage2} does not exist, so the new Stage 1 would load nothing.')
 
@@ -1724,7 +1756,7 @@ def parser():
         s.add_argument('--path', metavar='PATH', help='this Stage 2 file instead of the one Stage 1 loads')
         s.add_argument('--aura-dir', metavar='DIR')
         s.set_defaults(func=func)
-    s = s2.add_parser('hook', help='used by update-m1n1: write INPUT to OUTPUT, signed when Stage 2 signing is on')
+    s = s2.add_parser('hook', help='used by update-aura: write INPUT to OUTPUT, signed when Stage 2 signing is on')
     s.add_argument('input')
     s.add_argument('output')
     s.add_argument('--aura-dir', metavar='DIR')

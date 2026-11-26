@@ -23,7 +23,7 @@ built with Secure Boot variables (`aurora-secboot seed`) and from Stage 1.
 | `SECURE_PATH` | `no` (default), `yes` | `yes`: the newest verified UKI is `EFI/BOOT/BOOTAA64.EFI`. Set by `enable` and `disable`. |
 | `LOCKDOWN` | `integrity` (default), `confidentiality` | The `lockdown=` value in every UKI. |
 | `KEY_DIR` | `/var/lib/aurora/secboot/keys` | Owner keys. |
-| `ESP` | empty | Empty: the ESP named by the device tree's `/chosen/asahi,efi-system-partition`, else `/boot/efi`. |
+| `ESP` | empty | Empty: the ESP named by the device tree's `/chosen/aurora,efi-system-partition` (or, from aura builds before the rename, `asahi,efi-system-partition`), else `/boot/efi`. |
 | `UKI_BUILD` | `auto` (default), `yes`, `no` | When the distribution hooks build a UKI: `auto` when `db.key` exists or the secure path is on. |
 | `STAGE2_SIGN` | `auto` (default), `yes`, `no` | Whether `stage2 hook` signs the Stage 2 the updater wrote: `auto` when `stage2.key` exists and `KEY_OWNER` is `owner` or `both`. `yes` fails the update when it cannot sign. |
 | `STAGE2_SECVER` | `1` | Security version in Stage 2 signatures. Stage 1 refuses one below its floor. |
@@ -93,7 +93,10 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
   a Stage 1 Mach-O object for this install that trusts `stage2.pub`, ready to enrol from 1TR. User steps:
   [stage1-existing-install.md](stage1-existing-install.md). It reads the chip from the device tree root
   `compatible` (T8132, T6040 and later get the object padded for the execute window and load
-  `m1n1/boot-ctxr.bin`, the others load `m1n1/boot.bin`), and the ESP from `/chosen/asahi,efi-system-partition`.
+  `aurora/boot-ctxr.bin`, the others load `aurora/boot.bin`), and the ESP from `/chosen/aurora,efi-system-partition`.
+  Until 2027-02-28 it also takes the pre-rename forms: the `asahi,` ESP property from older aura builds, and the
+  older Stage 2 path under `m1n1/` when the ESP has no `aurora/` file yet. `stage2 sign` and `stage2 verify`
+  also cover that older file while it exists, because a Stage 1 enrolled before the rename still loads it.
   It fills the image's configuration and key blocks (floor `--min-secver`, default 1; `--enforce` sets the
   enforce flag) and wraps it with aura's tools from `D/tools` (`--aura-dir`, else `$AURORA_SECBOOT_AURA_DIR`,
   else `/usr/share/aura`). The default image is `D/stage1/aura-secure-raw.bin`; a `dev`-flavour image is
@@ -110,7 +113,7 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
 - `stage2 sign [--path P]`: sign the Stage 2 Stage 1 loads (and a staged `.next`) with `stage2.key`, through
   aura's `secboot_sign.py sign-image`; an existing trailer is replaced. Refused when Stage 2 signing is off.
 - `stage2 verify [--path P]`: each file's verdict against `stage2.pub`; exit 1 unless all verify.
-- `stage2 hook IN OUT`: for updaters (update-m1n1's `bootchain.py`): write `IN` to `OUT`, signed when Stage 2
+- `stage2 hook IN OUT`: for updaters (update-aura's `bootchain.py`): write `IN` to `OUT`, signed when Stage 2
   signing is on, unchanged otherwise (also when the configuration is absent, or when the Stage 2's aura is
   older than 1.0.0b11 and cannot skip a trailer, unless `STAGE2_SIGN=yes`). Signing is deterministic, so the
   same input gives the same output. Exit 1 fails the update and the updater keeps the last Stage 2.
