@@ -1113,7 +1113,7 @@ def payload_region(data):
     return data
 
 
-# U-Boot's Secure Boot seed region (aurora-silicon/u-boot, board/apple/mac/uefi-seed.bin): a fixed
+# U-Boot's Secure Boot seed region (aurora-silicon/u-boot aurora-wip, board/apple/mac/uefi-seed.var): a fixed
 # UBOOT_SEED_SIZE bytes of U-Boot's built-in variable seed (CONFIG_EFI_VARIABLES_PRESEED) that end in
 # the marker, the size and the version. U-Boot ships it empty; under an enforcing aura it boots only
 # what UEFI Secure Boot verifies with the keys found there, and nothing else can give it keys.
@@ -1168,7 +1168,7 @@ def fill_uboot_seed(data, seed):
     if len(found) != 1:
         raise Refusal(f'this Stage 2 has {len(found)} U-Boot Secure Boot seed regions, not one: its U-Boot '
                       'is not one that boots only what UEFI Secure Boot verifies under an enforcing aura '
-                      '(aurora-silicon/u-boot with board/apple/mac/uefi-seed.bin), so it is not signed.')
+                      '(aurora-silicon/u-boot aurora-wip with board/apple/mac/uefi-seed.var), so it is not signed.')
     if len(seed) > UBOOT_SEED_SIZE - 32:
         raise Refusal(f'the Secure Boot seed is {len(seed)} bytes; U-Boot holds {UBOOT_SEED_SIZE - 32}.')
     idx, start = found[0]

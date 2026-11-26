@@ -111,7 +111,7 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
   `/etc/aurora/stage2-sign-hook`) or `--sign-stage2-by-hand` is given.
 - `stage2 sign [--path P]`: sign the Stage 2 Stage 1 loads (and a staged `.next`) with `stage2.key`, through
   aura's `secboot_sign.py sign-image`; an existing trailer is replaced. Refused when Stage 2 signing is off.
-  Before signing it puts the `seed` of `KEY_DIR`'s PK, KEK and db in Stage 2's U-Boot (aurora-silicon/u-boot): the
+  Before signing it puts the `seed` of `KEY_DIR`'s PK, KEK and db in Stage 2's U-Boot (aurora-silicon/u-boot `aurora-wip`): the
   fixed 16 KiB region of its built-in variable seed that ends in `AURORA-UEFI-SEED`, raw or inside the gzip member
   update-m1n1 writes. The signature then covers the keys, so Stage 1 checks them with the rest. Signing is refused
   unless the Stage 2 holds exactly one such region, well formed; without UEFI keys the region is left empty, with a

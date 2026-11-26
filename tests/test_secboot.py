@@ -879,7 +879,7 @@ def raw_stage1(flavour='secure', keys=True):
 
 
 def uboot_image(size=None):
-    """A U-Boot stand-in carrying the empty Secure Boot seed region (board/apple/mac/uefi-seed.bin)."""
+    """A U-Boot stand-in carrying the empty Secure Boot seed region (board/apple/mac/uefi-seed.var)."""
     size = size or sb.UBOOT_SEED_SIZE
     region = sb.EMPTY_SEED + bytes(size - 32 - len(sb.EMPTY_SEED)) + sb.UBOOT_SEED_MARKER + \
         struct.pack('<II', size, 1) + bytes(8)
