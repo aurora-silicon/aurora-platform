@@ -410,10 +410,11 @@ def vendorfw_binding(sysobj, cfg, pin=True):
 
     This Mac's vendor firmware archive stays on the ESP, which the UKI's
     signature does not cover, so the signed command line names the archive
-    the initrd may use: its SHA-256, pinned in KEY_DIR by the first UKI built
-    with it (pin=True), or none. A later change on the ESP keeps the pinned
-    digest, so boots refuse the changed archive until the owner removes the
-    pin."""
+    the initrd may use: its SHA-256, or none without one. The first UKI
+    built (pin=True) pins that value in KEY_DIR, none included, and the pin
+    is the only source of it from then on: an archive that is changed, or
+    that appears where none was pinned, is refused at boot until the owner
+    removes the pin."""
     current = 'none'
     try:
         with open(os.path.join(sysobj.esp(cfg), VENDORFW), 'rb') as f:
@@ -427,11 +428,11 @@ def vendorfw_binding(sysobj, cfg, pin=True):
     path = os.path.join(sysobj.key_dir(cfg), VENDORFW_PIN)
     pinned = sysobj.read(os.path.join(cfg['KEY_DIR'], VENDORFW_PIN))
     if pinned is None:
-        if pin and current != 'none' and os.path.isdir(sysobj.key_dir(cfg)):
+        if pin and os.path.isdir(sysobj.key_dir(cfg)):
             atomic_write(path, (current + '\n').encode(), 0o600)
         return current
     pinned = pinned.strip()
-    if not re.fullmatch(r'sha256:[0-9a-f]{64}', pinned):
+    if pinned != 'none' and not re.fullmatch(r'sha256:[0-9a-f]{64}', pinned):
         warn(f'{path} holds no vendor firmware digest: boots refuse the archive on the ESP')
         return 'none'
     if current not in ('none', pinned):
@@ -458,13 +459,19 @@ def secure_cmdline(sysobj, cfg, lab=False, source=None, init=None, vendorfw=None
     for t in split_cmdline(text.replace('\n', ' ')):
         if origin == '/proc/cmdline' and t.split('=', 1)[0] in DROPPED_FROM_PROC:
             continue
+        # The binding comes from the pin alone, never from the command line
+        # this one starts from (after a GRUB boot, /proc/cmdline is the ESP's).
+        if t.startswith('aurora.vendorfw='):
+            if t != f'aurora.vendorfw={vendorfw}':
+                warnings.append(f"removed '{t}' from the secure-path command line: the vendor firmware "
+                                f"binding comes from {VENDORFW_PIN} in KEY_DIR")
+            continue
         why = refused(t, lab)
         if why:
             warnings.append(f"removed '{t}' from the secure-path command line: it {why}")
             continue
         tokens.append(t)
-    # An image builder that binds the archive itself (NixOS) passes its own.
-    if vendorfw and not any(t.startswith('aurora.vendorfw=') for t in tokens):
+    if vendorfw:
         tokens.append('aurora.vendorfw=' + vendorfw)
     if init is not None:
         # An init the image builder names (NixOS: the generation's stage 2); it is signed with the rest.

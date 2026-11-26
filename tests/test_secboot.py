@@ -459,10 +459,27 @@ class VendorFirmwareTests(TempCase):
         r = fx.run('uki', 'build', KVER)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('aurora.vendorfw=none', self.cmdline_of(fx))
-        self.assertFalse((fx.keys / 'vendorfw.sha256').exists())
+        self.assertEqual((fx.keys / 'vendorfw.sha256').read_text(), 'none\n', 'none is pinned too')
         self.archive(fx, b'')
-        fx.run('uki', 'build', KVER)
+        r = fx.run('uki', 'build', KVER)
         self.assertIn('aurora.vendorfw=none', self.cmdline_of(fx), 'an empty archive is no archive')
+        self.assertNotIn('not the one pinned', r.stderr)
+
+    def test_an_archive_that_appears_after_none_is_refused(self):
+        # A routine rebuild must not bless an archive someone put on the ESP later.
+        fx = self.fixture()
+        fx.run('keys', 'create')
+        fx.run('uki', 'build', KVER)
+        self.archive(fx, b'planted archive')
+        r = fx.run('uki', 'build', KVER)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('aurora.vendorfw=none', self.cmdline_of(fx))
+        self.assertIn('not the one pinned', r.stderr)
+        self.assertEqual((fx.keys / 'vendorfw.sha256').read_text(), 'none\n')
+        (fx.keys / 'vendorfw.sha256').unlink()
+        fx.run('uki', 'build', KVER)
+        self.assertIn('aurora.vendorfw=' + 'sha256:' + hashlib.sha256(b'planted archive').hexdigest(),
+                      self.cmdline_of(fx), 'until the owner removes the pin')
 
     def test_first_build_pins_the_archive(self):
         fx = self.fixture()
@@ -503,18 +520,47 @@ class VendorFirmwareTests(TempCase):
         self.assertIn('aurora.vendorfw=none', self.cmdline_of(fx))
         self.assertIn('holds no vendor firmware digest', r.stderr)
 
-    def test_an_image_builders_own_binding_is_kept(self):
-        # NixOS binds the archive in its module and passes it on the command line.
+    def test_no_command_line_binding_overrides_the_pin(self):
+        # After a GRUB boot /proc/cmdline comes from the ESP; nothing there may name the archive.
         fx = self.fixture()
         fx.run('keys', 'create')
-        self.archive(fx, b'archive one')
-        own = 'sha256:' + 'a' * 64
+        one = self.archive(fx, b'archive one')
+        fx.run('uki', 'build', KVER)
+        planted = 'sha256:' + '0' * 64
         (fx.root / 'tmp').mkdir()
-        (fx.root / 'tmp/cmd').write_text(f'root=fstab aurora.vendorfw={own}\n')
+        (fx.root / 'tmp/cmd').write_text(f'root=fstab aurora.vendorfw={planted}\n')
+        sources = {
+            '/etc/kernel/cmdline': lambda: (fx.root / 'etc/kernel/cmdline').write_text(
+                f'root=UUID=x aurora.vendorfw={planted} aurora.vendorfw=\n'),
+            '/proc/cmdline': lambda: ((fx.root / 'etc/kernel/cmdline').unlink(),
+                                      (fx.root / 'proc/cmdline').write_text(
+                                          f'BOOT_IMAGE=/vmlinuz root=UUID=x aurora.vendorfw={planted}\n')),
+            '--cmdline-file': lambda: None,
+        }
+        for origin, prepare in sources.items():
+            with self.subTest(origin=origin):
+                prepare()
+                extra = ('--cmdline-file', '/tmp/cmd') if origin == '--cmdline-file' else ()
+                r = fx.run('uki', 'build', KVER, *extra)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                tokens = self.cmdline_of(fx)
+                self.assertEqual([t for t in tokens if t.startswith('aurora.vendorfw=')], [f'aurora.vendorfw={one}'])
+                self.assertIn(f"removed 'aurora.vendorfw={planted}'", r.stderr)
+                self.assertEqual((fx.keys / 'vendorfw.sha256').read_text(), one + '\n')
+
+    def test_an_image_builders_binding_that_names_the_pin_is_kept_once(self):
+        # NixOS binds the archive in its module from the same pin.
+        fx = self.fixture()
+        fx.run('keys', 'create')
+        one = self.archive(fx, b'archive one')
+        fx.run('uki', 'build', KVER)
+        (fx.root / 'tmp').mkdir()
+        (fx.root / 'tmp/cmd').write_text(f'root=fstab aurora.vendorfw={one}\n')
         r = fx.run('uki', 'build', KVER, '--cmdline-file', '/tmp/cmd')
         self.assertEqual(r.returncode, 0, r.stderr)
         tokens = self.cmdline_of(fx)
-        self.assertEqual([t for t in tokens if t.startswith('aurora.vendorfw=')], [f'aurora.vendorfw={own}'])
+        self.assertEqual([t for t in tokens if t.startswith('aurora.vendorfw=')], [f'aurora.vendorfw={one}'])
+        self.assertNotIn('removed', r.stderr)
 
 
 class SecurePathTests(TempCase):

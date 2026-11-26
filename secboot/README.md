@@ -71,11 +71,14 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
   `lockdown=<LOCKDOWN>`.
   `aurora.vendorfw=` binds this Mac's vendor firmware archive (`ESP/vendorfw/firmware.cpio`), which stays on the ESP and
   outside the UKI's signature: `sha256:<digest>` of the archive, or `none` without one. The initrd then uses only an
-  archive with that digest. The first UKI built with an archive pins its digest in `KEY_DIR/vendorfw.sha256`; later UKIs
-  keep the pinned digest, so a changed archive is refused at boot (with a warning when the UKI is built) until the
-  owner removes that file and builds the UKI again. `cmdline` only reports the binding; `uki build` pins it. A command
-  line that already carries `aurora.vendorfw=` (an image builder that binds the archive itself, as NixOS does) keeps
-  its own.
+  archive with that digest. The first UKI built pins that value in `KEY_DIR/vendorfw.sha256`, `none` included; later
+  UKIs keep the pinned value, so an archive that is changed, or that appears where `none` was pinned, is refused at
+  boot (with a warning when the UKI is built) until the owner removes that file and builds the UKI again. The first
+  build trusts whatever archive the ESP holds at that moment: nothing earlier recorded one to check it against.
+  `cmdline` only reports the binding; `uki build` pins it. The pin is the only source of the binding: an
+  `aurora.vendorfw=` already on the command line it starts from (`/etc/kernel/cmdline`, `/proc/cmdline` or
+  `--cmdline-file`) is removed, with a warning unless it names the pinned value. A tool that rewrites the archive on
+  purpose (a firmware refresh) re-pins it from files it has checked and builds the UKIs again.
 - `uki build KVER [--image P] [--initrd P]... [--cmdline-file P] [--init P] [--stub P] [--os-release P] [--lab] [--output P] [--no-sign]`:
   `ukify build` with the stub (`--stub`, else `$AURORA_SECBOOT_STUB`, else
   `/usr/lib/systemd/boot/efi/linuxaa64.efi.stub`), `--uname KVER` and the os-release file (`--os-release P`, else `/etc/os-release`, else `/usr/lib/os-release`; with none, a minimal one naming KVER, so a build sandbox works). `--init P` adds `init=P` after
