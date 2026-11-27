@@ -1179,13 +1179,13 @@ class Stage1Tests(TempCase):
         # Signed without UEFI keys, the Stage 2's U-Boot has an empty Secure Boot seed.
         r = fx.run('stage1', 'build', '--enforce', '--volume', 'Fedora')
         self.assertEqual(r.returncode, 1)
-        self.assertIn('carries no Secure Boot keys (empty)', r.stderr)
+        self.assertIn('carries no Secure Boot keys', r.stderr)
         self.assertEqual(fx.run('keys', 'create').returncode, 0)
         self.assertEqual(fx.run('stage2', 'sign').returncode, 0)
         # Its keys don't verify shim, the only file U-Boot would boot.
         r = fx.run('stage1', 'build', '--enforce', '--volume', 'Fedora')
         self.assertEqual(r.returncode, 1)
-        self.assertIn('is not a UKI signed with this machine', r.stderr)
+        self.assertIn('is not a UKI that the Secure Boot keys', r.stderr)
         self.assertEqual(fx.run('uki', 'build', KVER).returncode, 0)
         self.assertEqual(fx.run('enable').returncode, 0)
         r = fx.run('stage1', 'build', '--enforce', '--volume', 'Fedora')
@@ -1195,6 +1195,33 @@ class Stage1Tests(TempCase):
         audit_md5 = hashlib.md5((self.objects(fx) / 'stage1-audit.macho').read_bytes()).hexdigest()
         self.assertIn(f'--keep stage1-audit.macho {audit_md5} Fedora stage1-enforce.macho', r.stdout)
         self.assertIn('REFUSES', r.stdout)
+
+    def test_enable_follows_the_keys_in_the_signed_stage2(self):
+        import base64
+        fx = self.ready(owner='both')
+        self.assertEqual(fx.run('keys', 'create').returncode, 0)
+        self.assertEqual(fx.run('stage2', 'sign').returncode, 0)
+        self.assertEqual(fx.run('uki', 'build', KVER).returncode, 0)
+        self.assertEqual(fx.run('enable').returncode, 0)
+        # Aurora's key arrives after Stage 2 was signed: its U-Boot doesn't hold it yet.
+        d = fx.root / 'usr/share/aurora/secboot/aurora-db'
+        d.mkdir(parents=True)
+        cert = d / 'aurora.crt'
+        cert.write_text('-----BEGIN CERTIFICATE-----\n' + base64.encodebytes(b'0\x82FAKE-X509/CN=Aurora').decode() +
+                        '-----END CERTIFICATE-----\n')
+        fx.run('uki', 'build', OLD, '--no-sign')
+        uki = fx.root / 'aurora-signed.efi'
+        subprocess.run([str(fx.bin / 'sbsign'), '--key', '/dev/null', '--cert', str(cert), '--output', str(uki),
+                        str(fx.uki(OLD))], env=fx.env, check=True)
+        self.assertEqual(fx.run('uki', 'verify', '/aurora-signed.efi').returncode, 0)
+        r = fx.run('enable', '--uki', '/aurora-signed.efi')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('stage2 sign', r.stderr)
+        self.assertEqual(fx.run('stage2', 'sign').returncode, 0)
+        r = fx.run('enable', '--uki', '/aurora-signed.efi')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        stage2 = (fx.esp / 'm1n1/boot.bin').read_bytes()
+        self.assertEqual(len(sb.seed_db_certs(stage2)), 2)
 
     def test_enforce_refused_while_stage2_signing_is_off(self):
         fx = self.ready(extra='STAGE2_SIGN=no\n')

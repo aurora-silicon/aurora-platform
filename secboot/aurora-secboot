@@ -776,6 +776,11 @@ def install_loader(sysobj, cfg, uki=None):
                           'run "aurora-secboot uki build <version>" first.')
         kver = newest(verified)
         src = verified[kver]
+    # A Stage 2 already signed with Secure Boot keys boots only what those keys verify.
+    for p, ders in seeded_stage2s(sysobj, cfg):
+        if seed_verdict(src, ders) != 'verified':
+            raise Refusal(f'{src} does not verify with the Secure Boot keys in {p}\'s U-Boot (signed before the keys '
+                          'or KEY_OWNER changed): run "aurora-secboot stage2 sign" first.')
     esp = sysobj.esp(cfg)
     loader, saved = os.path.join(esp, BOOT_LOADER), os.path.join(esp, SAVED_LOADER)
     changes = []
@@ -1235,6 +1240,65 @@ def uboot_seed_state(data):
     return 'owner keys' if names.get('PK', (None, None, b''))[2] else 'empty'
 
 
+def seed_db_certs(data):
+    """The DER certificates in the db of a Stage 2's U-Boot Secure Boot seed: what that U-Boot verifies
+    with under an enforcing Stage 1. [] without a readable seed."""
+    try:
+        found, payload, members = uboot_seed_regions(data)
+    except Refusal:
+        return []
+    if len(found) != 1:
+        return []
+    idx, start = found[0]
+    blob = payload if idx is None else members[idx][2]
+    try:
+        length = struct.unpack_from('<QQII', blob, start)[2]
+        esl = parse_seed(blob[start:start + length]).get('db', (None, None, b''))[2]
+    except (ValueError, struct.error):
+        return []
+    out, at = [], 0
+    while at + 28 <= len(esl):
+        stype, lsize, hsize, ssize = struct.unpack_from('<16sIII', esl, at)
+        if lsize < 28 + hsize or at + lsize > len(esl):
+            break
+        if uuid.UUID(bytes_le=stype) == EFI_CERT_X509 and ssize > 16:
+            body = esl[at + 28 + hsize:at + lsize]
+            out += [body[s + 16:s + ssize] for s in range(0, len(body) - ssize + 1, ssize)]
+        at += lsize
+    return out
+
+
+def seed_verdict(path, ders):
+    """verdict() of path against DER certificates, as from a U-Boot seed."""
+    with tempfile.TemporaryDirectory() as d:
+        files = []
+        for i, der in enumerate(ders):
+            f = os.path.join(d, f'{i}.crt')
+            with open(f, 'w') as out:
+                out.write('-----BEGIN CERTIFICATE-----\n' + base64.encodebytes(der).decode() +
+                          '-----END CERTIFICATE-----\n')
+            files.append(f)
+        return verdict(path, files)
+
+
+def seeded_stage2s(sysobj, cfg):
+    """(path, db certificates) of each ESP Stage 2 (and staged .next) whose U-Boot holds Secure Boot keys."""
+    try:
+        target = stage2_target(sysobj, cfg, argparse.Namespace(path=None))
+    except Refusal:
+        return []
+    out = []
+    for p in (target, target + '.next'):
+        try:
+            with open(p, 'rb') as f:
+                data = f.read()
+        except OSError:
+            continue
+        if uboot_seed_state(data) == 'owner keys':
+            out.append((p, seed_db_certs(data)))
+    return out
+
+
 def aura_signer(sysobj, args):
     """aura's tools/secboot_sign.py as a module: the record format and Ed25519 signing stay aura's."""
     import importlib.util
@@ -1524,16 +1588,17 @@ def cmd_stage1_build(sysobj, cfg, args):
             with open(p, 'rb') as f:
                 seeds.add(uboot_seed_state(f.read()))
         if seeds - {'owner keys', 'none'}:
-            raise Refusal(f'the U-Boot in {stage2} carries no Secure Boot keys ({", ".join(sorted(seeds))}), so under an '
-                          'enforcing Stage 1 it would refuse every boot: run "aurora-secboot keys create", then '
-                          '"aurora-secboot stage2 sign".')
+            what = 'an unreadable Secure Boot seed' if 'unreadable' in seeds else 'no Secure Boot keys'
+            raise Refusal(f'the U-Boot in {stage2} carries {what}, so under an enforcing Stage 1 it would refuse every '
+                          'boot: run "aurora-secboot keys create", then "aurora-secboot stage2 sign".')
         if 'owner keys' in seeds:
             loader = os.path.join(esp, BOOT_LOADER)
-            if not os.path.exists(loader) or not is_uki(loader) or \
-                    verdict(loader, trusted_certs(sysobj, cfg)) != 'verified':
-                raise Refusal(f'{loader} is not a UKI signed with this machine\'s keys, and under an enforcing Stage 1 '
-                              'U-Boot boots only that file, under UEFI Secure Boot: run "aurora-secboot uki build '
-                              '<version>" and "aurora-secboot enable", reboot and check it first.')
+            for p, ders in seeded_stage2s(sysobj, cfg) or [(stage2, [])]:
+                if not os.path.exists(loader) or not is_uki(loader) or seed_verdict(loader, ders) != 'verified':
+                    raise Refusal(f'{loader} is not a UKI that the Secure Boot keys in {p}\'s U-Boot verify, and under '
+                                  'an enforcing Stage 1 U-Boot boots only that file, under UEFI Secure Boot: run '
+                                  '"aurora-secboot uki build <version>", "aurora-secboot enable" and "aurora-secboot '
+                                  'stage2 sign", reboot and check it first.')
         else:
             notes.append(f'the U-Boot in {stage2} has no Secure Boot seed region, so it does not enforce: the checked '
                          'chain ends at U-Boot.')
