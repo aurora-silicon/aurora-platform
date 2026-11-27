@@ -30,6 +30,8 @@ jobs:
       - run: |
           python3 -m unittest discover -s tests
           bash -n libexec/* dracut/97aurora-root/module-setup.sh mkinitcpio/aurora-root tests/loop-conversion tests/loop-rekey tests/selinux-labels tests/selinux-policy images/finalize-image images/label-fedora-rootfs
+          bash -n usb-gadget/aurora-usb-gadget
+          shellcheck usb-gadget/aurora-usb-gadget
           bash -n secboot/92-aurora-secboot.install secboot/aurora-secboot.initcpio-post tests/secboot-roundtrip tests/selinux-secboot
           python3 -m py_compile images/*.py
           python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' secboot/aurora-secboot

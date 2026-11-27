@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+# USB device mode (aurora-platform usb-gadget/README.md).
+# A USB device controller exists only while a USB-C port is in device mode
+# with a host attached. Start the gadget on it; the service stops again
+# (BindsTo=) when the controller goes away at unplug.
+SUBSYSTEM=="udc", TAG+="systemd", ENV{SYSTEMD_ALIAS}="/sys/subsystem/udc/devices/%k", ENV{SYSTEMD_WANTS}+="aurora-usb-gadget@%k.service"
+# NetworkManager's 85-nm-unmanaged.rules leaves USB gadget interfaces to
+# whatever created them. This one is ours: let NetworkManager run it with
+# the profile aurora-usb-gadget writes. Must run after 85-nm-unmanaged.rules.
+SUBSYSTEM=="net", ACTION!="remove", ENV{DEVTYPE}=="gadget", KERNEL=="usbaurora[0-9]*", ENV{NM_UNMANAGED}="0"

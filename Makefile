@@ -5,7 +5,7 @@ SYSCONFDIR ?= /etc
 LOCALSTATEDIR ?= /var
 SELINUX_DEVEL ?= /usr/share/selinux/devel/Makefile
 
-install: install-common install-dracut install-mkinitcpio install-power install-gamemode install-secboot install-secboot-mkinitcpio
+install: install-common install-dracut install-mkinitcpio install-power install-gamemode install-secboot install-secboot-mkinitcpio install-usb-gadget
 
 install-common:
 	install -Dm755 libexec/aurora-initrd-root $(DESTDIR)$(LIBDIR)/aurora/aurora-initrd-root
@@ -39,6 +39,16 @@ install-power:
 	install -Dm644 power/power-modes.conf $(DESTDIR)$(SYSCONFDIR)/aurora/power-modes.conf
 	install -Dm644 power/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/README.md
 	install -Dm644 power/DESIGN.md $(DESTDIR)$(PREFIX)/share/doc/aurora-power-budget/DESIGN.md
+
+# USB device mode: network, serial port and optional disk for a USB host
+# (usb-gadget/README.md). Started by udev; nothing to enable.
+install-usb-gadget:
+	install -Dm755 usb-gadget/aurora-usb-gadget $(DESTDIR)$(PREFIX)/bin/aurora-usb-gadget
+	install -Dm644 usb-gadget/aurora-usb-gadget@.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-usb-gadget@.service
+	install -Dm644 usb-gadget/86-aurora-usb-gadget.rules $(DESTDIR)$(LIBDIR)/udev/rules.d/86-aurora-usb-gadget.rules
+	install -Dm644 usb-gadget/usb-gadget.conf $(DESTDIR)$(SYSCONFDIR)/aurora/usb-gadget.conf
+	install -Dm644 usb-gadget/aurora-usb-gadget.xml $(DESTDIR)$(LIBDIR)/firewalld/zones/aurora-usb-gadget.xml
+	install -Dm644 usb-gadget/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-usb-gadget/README.md
 
 # GameMode defaults (power/GAMEMODE.md): an administrator-level config that
 # GameMode merges over its shipped one. Packages ship it as a config file.
