@@ -10,6 +10,7 @@ See secboot/README.md.
 import argparse
 import base64
 import errno
+import gzip
 import hashlib
 import json
 import os
@@ -874,7 +875,8 @@ def parse_seed(data):
     return out
 
 
-def cmd_seed(sysobj, cfg, args):
+def owner_seed(sysobj, cfg):
+    """The U-Boot variable seed for KEY_DIR's PK, KEK and db certificates, with an empty dbx."""
     kd = sysobj.key_dir(cfg)
     try:
         owner = uuid.UUID(open(os.path.join(kd, 'owner.guid')).read().strip())
@@ -898,8 +900,13 @@ def cmd_seed(sysobj, cfg, args):
             owner = uuid.uuid5(uuid.NAMESPACE_OID, 'aurora-secboot:' + hashlib.sha256(certs[0]).hexdigest()) \
                 if k == 'PK' else owner
         lists[k] = signature_list(certs, owner)
+    return build_seed(lists)
+
+
+def cmd_seed(sysobj, cfg, args):
     out = args.output
-    atomic_write(out, build_seed(lists), 0o644)
+    atomic_write(out, owner_seed(sysobj, cfg), 0o644)
+    kd = sysobj.key_dir(cfg)
     print(f'{out}: PK, KEK, db from {kd}, empty dbx; sha256 {hashlib.sha256(open(out, "rb").read()).hexdigest()}')
     print('Build U-Boot with CONFIG_EFI_VARIABLES_PRESEED and this file as CONFIG_EFI_VAR_SEED_FILE.')
     return 0
@@ -1106,6 +1113,93 @@ def payload_region(data):
     return data
 
 
+# U-Boot's Secure Boot seed region (aurora-silicon/u-boot aurora-wip, board/apple/mac/uefi-seed.var): a fixed
+# UBOOT_SEED_SIZE bytes of U-Boot's built-in variable seed (CONFIG_EFI_VARIABLES_PRESEED) that end in
+# the marker, the size and the version. U-Boot ships it empty; under an enforcing aura it boots only
+# what UEFI Secure Boot verifies with the keys found there, and nothing else can give it keys.
+UBOOT_SEED_MARKER = b'AURORA-UEFI-SEED'
+UBOOT_SEED_SIZE = 16384
+UBOOT_SEED_VERSION = 1
+EMPTY_SEED = struct.pack('<QQII', 0, 0x0161566966456255, 24, 0)
+
+
+def gzip_members(blob):
+    """(start, end, inflated) of each complete gzip member in blob (update-m1n1 gzips U-Boot)."""
+    out, at = [], blob.find(b'\x1f\x8b\x08')
+    while at >= 0:
+        d = zlib.decompressobj(31)
+        try:
+            inflated = d.decompress(blob[at:])
+        except zlib.error:
+            inflated = None
+        if inflated is not None and d.eof:
+            end = len(blob) - len(d.unused_data)
+            out.append((at, end, inflated))
+            at = blob.find(b'\x1f\x8b\x08', end)
+        else:
+            at = blob.find(b'\x1f\x8b\x08', at + 1)
+    return out
+
+
+def uboot_seed_regions(data):
+    """Each seed region of a Stage 2's payloads: (gzip member index or None, start of the region in
+    that blob), and the members. Raises Refusal for a marker without a well-formed region."""
+    payload = payload_region(data)
+    members = gzip_members(payload)
+    found = []
+    for idx, blob in [(None, payload)] + [(i, m[2]) for i, m in enumerate(members)]:
+        at = blob.find(UBOOT_SEED_MARKER)
+        while at >= 0:
+            start = at + 32 - UBOOT_SEED_SIZE
+            size, version = struct.unpack_from('<II', blob, at + 16) if at + 32 <= len(blob) else (0, 0)
+            if size != UBOOT_SEED_SIZE or version != UBOOT_SEED_VERSION or start < 0 or \
+                    struct.unpack_from('<QQ', blob, start) != (0, 0x0161566966456255):
+                raise Refusal('this Stage 2\'s U-Boot has a Secure Boot seed marker without a '
+                              f'{UBOOT_SEED_SIZE}-byte version {UBOOT_SEED_VERSION} region before it.')
+            found.append((idx, start))
+            at = blob.find(UBOOT_SEED_MARKER, at + 1)
+    return found, payload, members
+
+
+def fill_uboot_seed(data, seed):
+    """data, a Stage 2, with seed in its U-Boot's Secure Boot seed region. Signing covers the region,
+    so Stage 1 checks the keys with the rest. Refused unless there is exactly one region."""
+    found, payload, members = uboot_seed_regions(data)
+    if len(found) != 1:
+        raise Refusal(f'this Stage 2 has {len(found)} U-Boot Secure Boot seed regions, not one: its U-Boot '
+                      'is not one that boots only what UEFI Secure Boot verifies under an enforcing aura '
+                      '(aurora-silicon/u-boot aurora-wip with board/apple/mac/uefi-seed.var), so it is not signed.')
+    if len(seed) > UBOOT_SEED_SIZE - 32:
+        raise Refusal(f'the Secure Boot seed is {len(seed)} bytes; U-Boot holds {UBOOT_SEED_SIZE - 32}.')
+    idx, start = found[0]
+    blob = payload if idx is None else members[idx][2]
+    end = start + UBOOT_SEED_SIZE
+    blob = blob[:start] + seed + bytes(UBOOT_SEED_SIZE - 32 - len(seed)) + blob[end - 32:end] + blob[end:]
+    if idx is not None:
+        s, e, _ = members[idx]
+        blob = payload[:s] + gzip.compress(blob, mtime=0) + payload[e:]
+    return data[:len(data) - len(payload)] + blob
+
+
+def uboot_seed_state(data):
+    """What the Secure Boot seed region of a Stage 2's U-Boot holds: 'owner keys', 'empty', 'none'
+    (no region) or 'unreadable'."""
+    try:
+        found, payload, members = uboot_seed_regions(data)
+    except Refusal:
+        return 'unreadable'
+    if len(found) != 1:
+        return 'none' if not found else 'unreadable'
+    idx, start = found[0]
+    blob = payload if idx is None else members[idx][2]
+    _, _, length, _ = struct.unpack_from('<QQII', blob, start)
+    try:
+        names = parse_seed(blob[start:start + length])
+    except (ValueError, struct.error):
+        return 'unreadable'
+    return 'owner keys' if names.get('PK', (None, None, b''))[2] else 'empty'
+
+
 def aura_signer(sysobj, args):
     """aura's tools/secboot_sign.py as a module: the record format and Ed25519 signing stay aura's."""
     import importlib.util
@@ -1127,6 +1221,13 @@ def sign_stage2_bytes(sysobj, cfg, args, data, key, secver):
     # string in aura's own code and refused every Stage 2.
     if b'chosen.aurora,measure-' in payload_region(data):
         raise Refusal('this Stage 2 carries chosen.aurora,measure- lines, which only a loading stage may add.')
+    # U-Boot's Secure Boot keys, signed with the rest so Stage 1 checks them too.
+    try:
+        seed = owner_seed(sysobj, cfg)
+    except Refusal as e:
+        warn(f'U-Boot gets no Secure Boot keys ({e}): under an enforcing Stage 1 it boots nothing')
+        seed = EMPTY_SEED
+    data = fill_uboot_seed(data, seed)
     mod = aura_signer(sysobj, args)
     with open(key, 'rb') as f:
         seed = f.read()
@@ -1196,7 +1297,9 @@ def cmd_stage2_verify(sysobj, cfg, args):
     bad = 0
     for p in [target] + [x for x in (target + '.next',) if os.path.exists(x) and not args.path]:
         v, kid, secver = stage2_verdict(sysobj, args, p, pub)
-        print(f'{p}: {v}' + (f', key id {kid}, secver {secver}' if kid else ''))
+        with open(p, 'rb') as f:
+            seed = uboot_seed_state(f.read())
+        print(f'{p}: {v}' + (f', key id {kid}, secver {secver}' if kid else '') + f'; U-Boot Secure Boot seed: {seed}')
         bad |= v != 'verified'
     return 1 if bad else 0
 
@@ -1535,6 +1638,11 @@ def collect_status(sysobj, cfg):
         _, pub = stage2_key(sysobj, cfg)
         v, kid, secver = stage2_verdict(sysobj, argparse.Namespace(aura_dir=None), target, pub)
         st['stage2'] = {'path': target, 'verdict': v, 'key_id': kid, 'security_version': secver}
+        try:
+            with open(target, 'rb') as f:
+                st['stage2']['uboot_seed'] = uboot_seed_state(f.read())
+        except OSError:
+            st['stage2']['uboot_seed'] = None
     except Refusal:
         pass
     try:
@@ -1592,7 +1700,8 @@ def cmd_status(sysobj, cfg, args):
     if s2:
         print(f'Stage 2 {s2["path"]}: {s2["verdict"]}' +
               (f' (key id {s2["key_id"]}, secver {s2["security_version"]})' if s2['key_id'] else '') +
-              f'; updates: {st["stage2_signing"]}')
+              f'; updates: {st["stage2_signing"]}' +
+              (f'; U-Boot Secure Boot seed: {s2["uboot_seed"]}' if s2.get('uboot_seed') else ''))
     bl = st['boot_loader']
     print('BOOTAA64.EFI: ' + ('absent' if not bl else f'{bl["kind"]}, {bl["verdict"]}' +
                                (', previous loader saved' if bl['saved_loader'] else '')))

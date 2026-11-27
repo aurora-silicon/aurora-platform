@@ -10,8 +10,9 @@ one PE file, signed with the db key that U-Boot's Secure Boot variables trust. G
 command line are then covered by the signature too. The command line inside the UKI always carries `lockdown=integrity` (or
 `lockdown=confidentiality`).
 
-Nothing refuses to boot because of this tool. It builds and signs UKIs and reports verdicts; enforcement comes from a U-Boot
-built with Secure Boot variables (`aurora-secboot seed`) and from Stage 1.
+Nothing refuses to boot because of this tool. It builds and signs UKIs and reports verdicts; enforcement comes from Stage 1
+and from U-Boot: under an enforcing Stage 1, U-Boot boots only `EFI/BOOT/BOOTAA64.EFI` and only when UEFI Secure Boot
+verifies it with the keys in its built-in seed, which `stage2 sign` and `stage2 hook` fill (below).
 
 ## Configuration
 
@@ -86,8 +87,9 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
 - `disable`: puts the saved loader back and sets `SECURE_PATH=no`. When `BOOTAA64.EFI` is already a boot loader, it is kept
   and the stale saved copy is removed.
 - `seed -o FILE`: the U-Boot variable seed (`CONFIG_EFI_VAR_SEED_FILE` with `CONFIG_EFI_VARIABLES_PRESEED`) holding PK, KEK
-  and db from `KEY_DIR` and an empty dbx, for an owner-built U-Boot. Certificates from Microsoft's UEFI and Windows CAs are
-  refused: they would admit every boot loader Microsoft has signed.
+  and db from `KEY_DIR` and an empty dbx. Certificates from Microsoft's UEFI and Windows CAs are refused: they would admit
+  every boot loader Microsoft has signed. Signing Stage 2 puts the same seed in Stage 2's U-Boot; this file is for a
+  U-Boot built by hand.
 
 - `stage1 build --audit|--enforce [--stage1-image P] [--stock-image P] [--rollback P]... [--aura-dir D] [--output-dir D] [--min-secver N] [--esp-partuuid U] [--volume NAME] [--allow-dev-flavour] [--sign-stage2-by-hand]`:
   a Stage 1 Mach-O object for this install that trusts `stage2.pub`, ready to enrol from 1TR. User steps:
@@ -109,7 +111,13 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
   `/etc/aurora/stage2-sign-hook`) or `--sign-stage2-by-hand` is given.
 - `stage2 sign [--path P]`: sign the Stage 2 Stage 1 loads (and a staged `.next`) with `stage2.key`, through
   aura's `secboot_sign.py sign-image`; an existing trailer is replaced. Refused when Stage 2 signing is off.
-- `stage2 verify [--path P]`: each file's verdict against `stage2.pub`; exit 1 unless all verify.
+  Before signing it puts the `seed` of `KEY_DIR`'s PK, KEK and db in Stage 2's U-Boot (aurora-silicon/u-boot `aurora-wip`): the
+  fixed 16 KiB region of its built-in variable seed that ends in `AURORA-UEFI-SEED`, raw or inside the gzip member
+  update-m1n1 writes. The signature then covers the keys, so Stage 1 checks them with the rest. Signing is refused
+  unless the Stage 2 holds exactly one such region, well formed; without UEFI keys the region is left empty, with a
+  warning, and under an enforcing Stage 1 that U-Boot boots nothing.
+- `stage2 verify [--path P]`: each file's verdict against `stage2.pub` and what its U-Boot seed holds (`owner keys`,
+  `empty`, `none` or `unreadable`); exit 1 unless all verify.
 - `stage2 hook IN OUT`: for updaters (update-m1n1's `bootchain.py`): write `IN` to `OUT`, signed when Stage 2
   signing is on, unchanged otherwise (also when the configuration is absent, or when the Stage 2's aura is
   older than 1.0.0b11 and cannot skip a trailer, unless `STAGE2_SIGN=yes`). Signing is deterministic, so the

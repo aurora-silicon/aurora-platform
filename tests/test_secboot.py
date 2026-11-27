@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -877,9 +878,18 @@ def raw_stage1(flavour='secure', keys=True):
     return bytes(raw)
 
 
-def stage2_image(old=False, lines=b'chosen.x=1\n'):
+def uboot_image(size=None):
+    """A U-Boot stand-in carrying the empty Secure Boot seed region (board/apple/mac/uefi-seed.var)."""
+    size = size or sb.UBOOT_SEED_SIZE
+    region = sb.EMPTY_SEED + bytes(size - 32 - len(sb.EMPTY_SEED)) + sb.UBOOT_SEED_MARKER + \
+        struct.pack('<II', size, 1) + bytes(8)
+    return b'u-boot code ' * 64 + region + b'u-boot data ' * 64
+
+
+def stage2_image(old=False, lines=b'chosen.x=1\n', uboot='gzip'):
     """An aura Stage 2 laid out like the build (footprint = image size, STACKBOT at its end); a
-    current one holds the measure line format string in its code, as aura's does."""
+    current one holds the measure line format string in its code, as aura's does. U-Boot follows
+    the DTBs gzipped, as update-m1n1 writes it."""
     head = bytearray(0x10000)
     head[0x808:0x810] = b'AURALOAD'
     struct.pack_into('<IIQ', head, 0x810, 1, 1, len(head))
@@ -888,7 +898,22 @@ def stage2_image(old=False, lines=b'chosen.x=1\n'):
         head[0x9100:0x9117] = b'aurora,boot-security-v1'
         head[0x9200:0x9220] = b'chosen.aurora,measure-%d=%s;%s;\0'
     head[-8:] = b'STACKBOT'
-    return bytes(head) + b'\xd0\x0d\xfe\xed' + bytes(60) + b'\x1f\x8b' + bytes(30) + lines
+    payload = {'gzip': gzip.compress(uboot_image(), mtime=0), 'raw': uboot_image(),
+               'none': gzip.compress(b'an older u-boot' * 64, mtime=0),
+               'twice': gzip.compress(uboot_image(), mtime=0) * 2,
+               'malformed': gzip.compress(uboot_image(8192), mtime=0)}[uboot]
+    return bytes(head) + b'\xd0\x0d\xfe\xed' + bytes(60) + payload + lines
+
+
+def uboot_seed(stage2):
+    """The variables in a Stage 2's U-Boot seed region (sb.parse_seed form)."""
+    found, payload, members = sb.uboot_seed_regions(stage2)
+    assert len(found) == 1, found
+    idx, start = found[0]
+    blob = payload if idx is None else members[idx][2]
+    assert blob[start + sb.UBOOT_SEED_SIZE - 32:].startswith(sb.UBOOT_SEED_MARKER)
+    length = struct.unpack_from('<QQII', blob, start)[2]
+    return sb.parse_seed(blob[start:start + length])
 
 
 def key_block(obj):
@@ -1109,6 +1134,65 @@ class Stage1Tests(TempCase):
         self.assertEqual(st['stage1']['flavour'], 'secure')
         self.assertEqual(st['stage2']['verdict'], 'verified')
         self.assertIn('Stage 1: policy audit, secure flavour', fx.run('status').stdout)
+
+    def test_signing_puts_the_owner_keys_in_u_boot(self):
+        # Under an enforcing aura U-Boot boots only what Secure Boot verifies with the keys in its
+        # seed region; filled before signing, they are covered by the signature Stage 1 checks.
+        fx = self.ready()
+        self.assertEqual(fx.run('keys', 'create').returncode, 0)
+        sysobj = sb.System(str(fx.root))
+        want = sb.parse_seed(sb.owner_seed(sysobj, sysobj.config()))
+        for uboot in ('gzip', 'raw'):
+            with self.subTest(uboot=uboot):
+                boot = fx.esp / 'm1n1/boot.bin'
+                boot.write_bytes(stage2_image(uboot=uboot))
+                r = fx.run('stage2', 'sign')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                data = boot.read_bytes()
+                self.assertEqual(uboot_seed(data[:sb.read_trailer(data)[0]]), want)
+                self.assertEqual(set(want), {'PK', 'KEK', 'db', 'dbx'})
+                v = fx.run('stage2', 'verify')
+                self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
+                self.assertIn('U-Boot Secure Boot seed: owner keys', v.stdout)
+        src, dst = fx.root / 'in.bin', fx.root / 'out.bin'
+        src.write_bytes(stage2_image())
+        fx.run('stage2', 'hook', '/in.bin', '/out.bin')
+        first = dst.read_bytes()
+        self.assertEqual(uboot_seed(first[:sb.read_trailer(first)[0]]), want)
+        fx.run('stage2', 'hook', '/in.bin', '/out.bin')
+        self.assertEqual(dst.read_bytes(), first, 'the hook stays deterministic')
+
+    def test_a_u_boot_without_exactly_one_seed_region_is_not_signed(self):
+        fx = self.ready()
+        fx.run('keys', 'create')
+        boot = fx.esp / 'm1n1/boot.bin'
+        for uboot, why in (('none', '0 U-Boot Secure Boot seed regions'),
+                           ('twice', '2 U-Boot Secure Boot seed regions'),
+                           ('malformed', 'without a 16384-byte version 1 region')):
+            with self.subTest(uboot=uboot):
+                boot.write_bytes(stage2_image(uboot=uboot))
+                before = boot.read_bytes()
+                r = fx.run('stage2', 'sign')
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(why, r.stderr)
+                self.assertEqual(boot.read_bytes(), before)
+                src, dst = fx.root / 'in.bin', fx.root / 'out.bin'
+                src.write_bytes(before)
+                dst.unlink(missing_ok=True)
+                r = fx.run('stage2', 'hook', '/in.bin', '/out.bin')
+                self.assertEqual(r.returncode, 1)
+                self.assertFalse(dst.exists(), 'a refused hook writes nothing; the last Stage 2 stays')
+
+    def test_without_uefi_keys_u_boot_gets_an_empty_seed(self):
+        fx = self.ready()
+        boot = fx.esp / 'm1n1/boot.bin'
+        boot.write_bytes(stage2_image())
+        r = fx.run('stage2', 'sign')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('U-Boot gets no Secure Boot keys', r.stderr)
+        data = boot.read_bytes()
+        self.assertEqual(uboot_seed(data[:sb.read_trailer(data)[0]]), {})
+        self.assertIn('U-Boot Secure Boot seed: empty', fx.run('stage2', 'verify').stdout)
 
     def test_stage2_hook(self):
         fx = self.ready()
