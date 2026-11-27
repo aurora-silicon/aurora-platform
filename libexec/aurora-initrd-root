@@ -37,9 +37,17 @@ property=${AURORA_ESP_PROPERTY:-/sys/firmware/devicetree/base/chosen/asahi,efi-s
 [[ -r $property ]] || { echo 'Apple EFI partition handoff is missing' >&2; exit 1; }
 ESP_PARTUUID=$(tr -d '\000' < "$property")
 [[ $ESP_PARTUUID =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || exit 1
-udevadm settle
 ESP_DEVICE=/dev/disk/by-partuuid/$ESP_PARTUUID
 udevadm wait --timeout=60 "$ESP_DEVICE"
+# Boot and the root are partitions of the ESP's disk, which the kernel
+# announces in the same partition scan. Wait for udev to finish each of that
+# disk's partitions (their /dev/disk links included) rather than for every
+# device in the queue.
+ESP_DISK=$(lsblk -ndo PKNAME "$ESP_DEVICE")
+[[ -n $ESP_DISK ]] || { echo 'The handed-off EFI partition has no parent disk' >&2; exit 1; }
+mapfile -t ESP_DISK_PARTITIONS < <(lsblk -lnpo NAME,TYPE "/dev/$ESP_DISK" | awk '$2 == "part" { print $1 }')
+(( ${#ESP_DISK_PARTITIONS[@]} > 0 )) || exit 1
+udevadm wait --timeout=60 "${ESP_DISK_PARTITIONS[@]}"
 ESP_UUID=$(blkid -c /dev/null -s UUID -o value "$ESP_DEVICE")
 [[ $ESP_UUID =~ ^[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}$ ]] || exit 1
 
@@ -218,7 +226,7 @@ omarchy_mac_encrypt_open_continue() {
     answer=$(systemd-ask-password --timeout=0 --id=aurora-root 'Unlock Aurora root:') || return 1
     if printf '%s' "$answer" | cryptsetup open --key-file=- "$ROOT_DEV" root; then
       unset answer
-      udevadm settle
+      udevadm wait --timeout=60 /dev/mapper/root
       aurora_verify_opened_root
       omarchy_mac_encrypt_point_sysroot
       return
