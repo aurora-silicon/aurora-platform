@@ -41,8 +41,9 @@ new_fixture() {
   [[ -z $loop ]] || losetup -d "$loop"
   loop=$(losetup --find --show --partscan "$scratch/$name/disk.raw")
   [[ $loop =~ ^/dev/loop[0-9]+$ ]] || exit 1
-  udevadm settle
+  # losetup returns after the partition scan, with the node in place.
   root=${loop}p1
+  [[ -b $root ]]
   dd if=/dev/urandom of="$scratch/$name/boot/omarchy/luks-key" bs=64 count=1 status=none
   # The converter formats with the temporary key in slot 0.
   cryptsetup luksFormat --batch-mode --type luks2 --key-slot 0 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
