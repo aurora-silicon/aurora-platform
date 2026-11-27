@@ -19,6 +19,7 @@ install-common:
 	install -Dm644 systemd/aurora-initrd-root.service $(DESTDIR)$(LIBDIR)/aurora/initrd/aurora-initrd-root.service
 	install -Dm644 systemd/aurora-root-sysroot.conf $(DESTDIR)$(LIBDIR)/aurora/initrd/aurora-root-sysroot.conf
 	install -Dm644 systemd/aurora-root-mapper.conf $(DESTDIR)$(LIBDIR)/aurora/initrd/aurora-root-mapper.conf
+	install -Dm644 systemd/aurora-static-nodes.conf $(DESTDIR)$(LIBDIR)/aurora/initrd/aurora-static-nodes.conf
 	install -Dm644 systemd/aurora-firstboot.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-firstboot.service
 	install -Dm644 systemd/aurora-disk-rekey.service $(DESTDIR)$(LIBDIR)/systemd/system/aurora-disk-rekey.service
 	install -Dm644 systemd/aurora-initrd-keymap.path $(DESTDIR)$(LIBDIR)/systemd/system/aurora-initrd-keymap.path
