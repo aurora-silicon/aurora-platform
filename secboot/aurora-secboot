@@ -34,6 +34,7 @@ DEFAULTS = {
     'UKI_BUILD': 'auto',
     'STAGE2_SIGN': 'auto',
     'STAGE2_SECVER': '1',
+    'AURORA_DB': '/usr/share/aurora/secboot/aurora-db',
 }
 CHOICES = {
     'KEY_OWNER': ('aurora', 'owner', 'both'),
@@ -348,17 +349,41 @@ def is_uki(path):
 
 
 def verdict(path, cert):
-    """verified | unsigned | other-key | not-pe."""
+    """verified | unsigned | other-key | not-pe. cert is one certificate file or a list of them;
+    verified means one of them verifies the image."""
     info = pe_info(path)
     if info is None:
         return 'not-pe'
     if not info[1]:
         return 'unsigned'
-    if not cert or not os.path.exists(cert):
-        return 'other-key'
-    r = subprocess.run([tool('sbverify', 'sbsigntools'), '--cert', cert, path],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return 'verified' if r.returncode == 0 else 'other-key'
+    for c in [cert] if isinstance(cert, str) or cert is None else cert:
+        if not c or not os.path.exists(c):
+            continue
+        r = subprocess.run([tool('sbverify', 'sbsigntools'), '--cert', c, path],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode == 0:
+            return 'verified'
+    return 'other-key'
+
+
+def aurora_db_certs(sysobj, cfg):
+    """Aurora's UKI signing certificates (each *.crt in AURORA_DB), which KEY_OWNER=both trusts next to
+    the owner's db key. Empty while Aurora has no UKI signing key."""
+    d = sysobj.path(cfg['AURORA_DB'])
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith('.crt') and not n.startswith('.'))
+    except OSError:
+        return []
+    return [os.path.join(d, n) for n in names if os.path.isfile(os.path.join(d, n))]
+
+
+def trusted_certs(sysobj, cfg):
+    """The db certificates a UKI may verify with on this machine: the owner's db.crt, and under
+    KEY_OWNER=both also Aurora's."""
+    out = [os.path.join(sysobj.key_dir(cfg), 'db.crt')]
+    if cfg['KEY_OWNER'] == 'both':
+        out += aurora_db_certs(sysobj, cfg)
+    return out
 
 
 # --- command line ----------------------------------------------------------------------------
@@ -709,9 +734,9 @@ def cmd_uki_remove(sysobj, cfg, args):
 
 
 def cmd_uki_verify(sysobj, cfg, args):
-    cert = os.path.join(sysobj.key_dir(cfg), 'db.crt')
-    if not os.path.exists(cert):
-        raise Refusal(f'there is no {cert} to verify against' +
+    cert = [c for c in trusted_certs(sysobj, cfg) if os.path.exists(c)]
+    if not cert:
+        raise Refusal(f'there is no {os.path.join(sysobj.key_dir(cfg), "db.crt")} to verify against' +
                       (' (KEY_OWNER=aurora keeps no owner keys).' if cfg['KEY_OWNER'] == 'aurora' else '.'))
     paths = args.paths or [p for _, p in sorted(ukis(sysobj, cfg).items())]
     if not paths:
@@ -731,14 +756,16 @@ def install_loader(sysobj, cfg, uki=None):
     if cfg['KEY_OWNER'] == 'aurora':
         raise Refusal('KEY_OWNER=aurora: the secure path waits for Aurora-signed UKIs, '
                       'and this machine holds no key to sign its own.')
-    cert = os.path.join(sysobj.key_dir(cfg), 'db.crt')
-    if not os.path.exists(cert):
-        raise Refusal(f'there is no {cert}; run "aurora-secboot keys create" first.')
+    owner_cert = os.path.join(sysobj.key_dir(cfg), 'db.crt')
+    if not os.path.exists(owner_cert):
+        raise Refusal(f'there is no {owner_cert}; run "aurora-secboot keys create" first.')
+    cert = trusted_certs(sysobj, cfg)
     if uki:
         if not os.path.exists(uki):
             raise Refusal(f'{uki} does not exist.')
         if not is_uki(uki) or verdict(uki, cert) != 'verified':
-            raise Refusal(f'{uki} is not a UKI signed with {cert}.')
+            raise Refusal(f'{uki} is not a UKI signed with {owner_cert}' +
+                          (' or an Aurora key in ' + sysobj.path(cfg['AURORA_DB']) if len(cert) > 1 else '') + '.')
         src, kver = uki, os.path.basename(uki)
     else:
         have = ukis(sysobj, cfg)
@@ -749,6 +776,11 @@ def install_loader(sysobj, cfg, uki=None):
                           'run "aurora-secboot uki build <version>" first.')
         kver = newest(verified)
         src = verified[kver]
+    # A Stage 2 already signed with Secure Boot keys boots only what those keys verify.
+    for p, ders in seeded_stage2s(sysobj, cfg):
+        if seed_verdict(src, ders) != 'verified':
+            raise Refusal(f'{src} does not verify with the Secure Boot keys in {p}\'s U-Boot (signed before the keys '
+                          'or KEY_OWNER changed): run "aurora-secboot stage2 sign" first.')
     esp = sysobj.esp(cfg)
     loader, saved = os.path.join(esp, BOOT_LOADER), os.path.join(esp, SAVED_LOADER)
     changes = []
@@ -891,6 +923,14 @@ def owner_seed(sysobj, cfg):
             raise Refusal(f'{crt} is missing; run "aurora-secboot keys create" first.')
         if not certs:
             raise Refusal(f'{crt} holds no PEM certificate.')
+        if k == 'db' and cfg['KEY_OWNER'] == 'both':
+            # Both: U-Boot also boots what Aurora signs. PK and KEK stay the owner's.
+            for extra in aurora_db_certs(sysobj, cfg):
+                with open(extra) as f:
+                    more = pem_certs(f.read())
+                if not more:
+                    raise Refusal(f'{extra} holds no PEM certificate.')
+                certs += more
         for der in certs:
             for ca in MICROSOFT_CAS:
                 if ca in der:
@@ -1200,6 +1240,65 @@ def uboot_seed_state(data):
     return 'owner keys' if names.get('PK', (None, None, b''))[2] else 'empty'
 
 
+def seed_db_certs(data):
+    """The DER certificates in the db of a Stage 2's U-Boot Secure Boot seed: what that U-Boot verifies
+    with under an enforcing Stage 1. [] without a readable seed."""
+    try:
+        found, payload, members = uboot_seed_regions(data)
+    except Refusal:
+        return []
+    if len(found) != 1:
+        return []
+    idx, start = found[0]
+    blob = payload if idx is None else members[idx][2]
+    try:
+        length = struct.unpack_from('<QQII', blob, start)[2]
+        esl = parse_seed(blob[start:start + length]).get('db', (None, None, b''))[2]
+    except (ValueError, struct.error):
+        return []
+    out, at = [], 0
+    while at + 28 <= len(esl):
+        stype, lsize, hsize, ssize = struct.unpack_from('<16sIII', esl, at)
+        if lsize < 28 + hsize or at + lsize > len(esl):
+            break
+        if uuid.UUID(bytes_le=stype) == EFI_CERT_X509 and ssize > 16:
+            body = esl[at + 28 + hsize:at + lsize]
+            out += [body[s + 16:s + ssize] for s in range(0, len(body) - ssize + 1, ssize)]
+        at += lsize
+    return out
+
+
+def seed_verdict(path, ders):
+    """verdict() of path against DER certificates, as from a U-Boot seed."""
+    with tempfile.TemporaryDirectory() as d:
+        files = []
+        for i, der in enumerate(ders):
+            f = os.path.join(d, f'{i}.crt')
+            with open(f, 'w') as out:
+                out.write('-----BEGIN CERTIFICATE-----\n' + base64.encodebytes(der).decode() +
+                          '-----END CERTIFICATE-----\n')
+            files.append(f)
+        return verdict(path, files)
+
+
+def seeded_stage2s(sysobj, cfg):
+    """(path, db certificates) of each ESP Stage 2 (and staged .next) whose U-Boot holds Secure Boot keys."""
+    try:
+        target = stage2_target(sysobj, cfg, argparse.Namespace(path=None))
+    except Refusal:
+        return []
+    out = []
+    for p in (target, target + '.next'):
+        try:
+            with open(p, 'rb') as f:
+                data = f.read()
+        except OSError:
+            continue
+        if uboot_seed_state(data) == 'owner keys':
+            out.append((p, seed_db_certs(data)))
+    return out
+
+
 def aura_signer(sysobj, args):
     """aura's tools/secboot_sign.py as a module: the record format and Ed25519 signing stay aura's."""
     import importlib.util
@@ -1481,6 +1580,28 @@ def cmd_stage1_build(sysobj, cfg, args):
         if s1.get('verdict') != 'verified' or s1.get('key_id') != kid:
             raise Refusal(f'this boot\'s Stage 1 recorded Stage 2 as {s1.get("verdict")} (key id {s1.get("key_id")}), '
                           f'not verified with key {kid}: sign Stage 2, reboot and check again before enforcing.')
+        # Under an enforcing Stage 1, a U-Boot with a Secure Boot seed region (aurora-silicon/u-boot#78) boots
+        # only EFI/BOOT/BOOTAA64.EFI, and only when UEFI Secure Boot verifies it with the keys in that region.
+        # Without keys, or with a boot loader they do not verify, every boot would reset.
+        seeds = set()
+        for p in [stage2] + ([nxt] if os.path.exists(nxt) else []):
+            with open(p, 'rb') as f:
+                seeds.add(uboot_seed_state(f.read()))
+        if seeds - {'owner keys', 'none'}:
+            what = 'an unreadable Secure Boot seed' if 'unreadable' in seeds else 'no Secure Boot keys'
+            raise Refusal(f'the U-Boot in {stage2} carries {what}, so under an enforcing Stage 1 it would refuse every '
+                          'boot: run "aurora-secboot keys create", then "aurora-secboot stage2 sign".')
+        if 'owner keys' in seeds:
+            loader = os.path.join(esp, BOOT_LOADER)
+            for p, ders in seeded_stage2s(sysobj, cfg) or [(stage2, [])]:
+                if not os.path.exists(loader) or not is_uki(loader) or seed_verdict(loader, ders) != 'verified':
+                    raise Refusal(f'{loader} is not a UKI that the Secure Boot keys in {p}\'s U-Boot verify, and under '
+                                  'an enforcing Stage 1 U-Boot boots only that file, under UEFI Secure Boot: run '
+                                  '"aurora-secboot uki build <version>", "aurora-secboot enable" and "aurora-secboot '
+                                  'stage2 sign", reboot and check it first.')
+        else:
+            notes.append(f'the U-Boot in {stage2} has no Secure Boot seed region, so it does not enforce: the checked '
+                         'chain ends at U-Boot.')
     elif signing is None:
         notes.append(f'Stage 2 signing is off ({why}); the audit Stage 1 will record Stage 2 as unsigned.')
 
@@ -1607,7 +1728,8 @@ def collect_status(sysobj, cfg):
     st['lockdown'] = m.group(1) if m else None
     esp = sysobj.esp(cfg)
     st['esp'] = esp
-    cert = os.path.join(kd, 'db.crt')
+    cert = trusted_certs(sysobj, cfg)
+    st['aurora_db'] = aurora_db_certs(sysobj, cfg) if cfg['KEY_OWNER'] == 'both' else []
     images = []
     for kver, p in sorted(ukis(sysobj, cfg).items(), key=lambda kv: [int(x) if x.isdigit() else x for x in
                                                                     re.findall(r'\d+|\D+', kv[0])]):
@@ -1680,6 +1802,10 @@ def cmd_status(sysobj, cfg, args):
     print(f'config: {sysobj.config_name}{"" if st["config_present"] else " (absent, defaults)"}: ' +
           ' '.join(f'{k}={c[k]}' for k in DEFAULTS))
     print(f'key owner: {c["KEY_OWNER"]}')
+    if c['KEY_OWNER'] == 'both':
+        print(f'Aurora UKI keys in {c["AURORA_DB"]}: ' +
+              (', '.join(os.path.basename(x) for x in st['aurora_db']) if st['aurora_db'] else
+               'none yet, so only UKIs signed with the owner key verify'))
     have = [k for k, v in st['keys'].items() if v]
     print(f'keys in {st["key_dir"]}: {", ".join(have) if have else "none"}' +
           (f' (Stage 2 key id {st["stage2_key_id"]})' if st['stage2_key_id'] else ''))

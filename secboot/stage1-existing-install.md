@@ -128,7 +128,10 @@ It refuses unless all of these hold:
 - the Stage 2 on the ESP (and an `aura-try` trial, if one is staged) is signed with your key, at or above
   the floor; no trial is armed;
 - Stage 2 signing is on and the updater signs (or you pass `--sign-stage2-by-hand` and promise to sign
-  after every update).
+  after every update);
+- when the Stage 2's U-Boot has a Secure Boot seed region (aurora-silicon/u-boot#78), that region holds
+  your keys (`keys create`, then `stage2 sign`) and `EFI/BOOT/BOOTAA64.EFI` is a UKI they verify
+  (`uki build`, `enable`): under an enforcing Stage 1 that U-Boot boots nothing else.
 
 It writes `stage1-enforce.macho` with the audit object as its rollback. Enrol it from 1TR the same way.
 From then on this install's Stage 1 starts only a Stage 2 signed with your key, and the secure flavour
@@ -154,5 +157,5 @@ you enrol another Stage 1 from 1TR.
 Root on this install can still sign with the key. Another OS on the disk can't make this install boot
 its Stage 2 any more, but it can still wipe the install or make itself the default startup disk and show
 a lookalike unlock prompt, so check which volume you start. U-Boot Secure Boot with your own keys and
-signed UKIs (`aurora-secboot seed`, `uki build`, `enable`) are the next steps after enforce; see
-[README.md](README.md).
+signed UKIs (`keys create`, `uki build`, `enable`, `stage2 sign`) come before enforce whenever the
+Stage 2's U-Boot has a Secure Boot seed region; see [own-keys.md](own-keys.md) and [README.md](README.md).

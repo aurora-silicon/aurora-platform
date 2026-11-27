@@ -14,13 +14,15 @@ Nothing refuses to boot because of this tool. It builds and signs UKIs and repor
 and from U-Boot: under an enforcing Stage 1, U-Boot boots only `EFI/BOOT/BOOTAA64.EFI` and only when UEFI Secure Boot
 verifies it with the keys in its built-in seed, which `stage2 sign` and `stage2 hook` fill (below).
 
+Short guide for owners who chose their own keys at install: [own-keys.md](own-keys.md).
+
 ## Configuration
 
 `/etc/aurora/secboot.conf`, shell `KEY=value` lines, `#` comments:
 
 | key | values | meaning |
 |---|---|---|
-| `KEY_OWNER` | `aurora` (default), `owner`, `both` | Who signs. Under `aurora` the machine holds no private key: Aurora signs what it ships, local UKIs stay unsigned and `enable` is refused. |
+| `KEY_OWNER` | `aurora` (default), `owner`, `both` | Who signs. Under `aurora` the machine holds no private key: Aurora signs what it ships, local UKIs stay unsigned and `enable` is refused. Under `both` a UKI verifies with the owner's db key or with one of Aurora's UKI keys in `AURORA_DB`, and the U-Boot seed's db holds all of them. |
 | `SECURE_PATH` | `no` (default), `yes` | `yes`: the newest verified UKI is `EFI/BOOT/BOOTAA64.EFI`. Set by `enable` and `disable`. |
 | `LOCKDOWN` | `integrity` (default), `confidentiality` | The `lockdown=` value in every UKI. |
 | `KEY_DIR` | `/var/lib/aurora/secboot/keys` | Owner keys. |
@@ -28,6 +30,7 @@ verifies it with the keys in its built-in seed, which `stage2 sign` and `stage2 
 | `UKI_BUILD` | `auto` (default), `yes`, `no` | When the distribution hooks build a UKI: `auto` when `db.key` exists or the secure path is on. |
 | `STAGE2_SIGN` | `auto` (default), `yes`, `no` | Whether `stage2 hook` signs the Stage 2 the updater wrote: `auto` when `stage2.key` exists and `KEY_OWNER` is `owner` or `both`. `yes` fails the update when it cannot sign. |
 | `STAGE2_SECVER` | `1` | Security version in Stage 2 signatures. Stage 1 refuses one below its floor. |
+| `AURORA_DB` | `/usr/share/aurora/secboot/aurora-db` | Directory of Aurora's UKI signing certificates (PEM, `*.crt`) that `KEY_OWNER=both` trusts. Empty until Aurora signs UKIs; until then `both` verifies only what the owner signs. |
 
 ## Keys
 
@@ -87,7 +90,7 @@ of `/etc/aurora/secboot.conf`. When the configuration file is a symlink or not w
 - `disable`: puts the saved loader back and sets `SECURE_PATH=no`. When `BOOTAA64.EFI` is already a boot loader, it is kept
   and the stale saved copy is removed.
 - `seed -o FILE`: the U-Boot variable seed (`CONFIG_EFI_VAR_SEED_FILE` with `CONFIG_EFI_VARIABLES_PRESEED`) holding PK, KEK
-  and db from `KEY_DIR` and an empty dbx. Certificates from Microsoft's UEFI and Windows CAs are refused: they would admit
+  and db from `KEY_DIR` and an empty dbx (under `KEY_OWNER=both`, db also holds every certificate in `AURORA_DB`). Certificates from Microsoft's UEFI and Windows CAs are refused: they would admit
   every boot loader Microsoft has signed. Signing Stage 2 puts the same seed in Stage 2's U-Boot; this file is for a
   U-Boot built by hand.
 

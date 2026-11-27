@@ -55,6 +55,7 @@ install-secboot:
 	install -Dm644 secboot/secboot.conf $(DESTDIR)$(SYSCONFDIR)/aurora/secboot.conf
 	install -Dm644 secboot/README.md $(DESTDIR)$(PREFIX)/share/doc/aurora-secboot/README.md
 	install -Dm644 secboot/stage1-existing-install.md $(DESTDIR)$(PREFIX)/share/doc/aurora-secboot/stage1-existing-install.md
+	install -Dm644 secboot/own-keys.md $(DESTDIR)$(PREFIX)/share/doc/aurora-secboot/own-keys.md
 	install -dm700 $(DESTDIR)$(LOCALSTATEDIR)/lib/aurora/secboot
 
 # Arch Linux ARM: build the UKI after mkinitcpio.
