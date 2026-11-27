@@ -147,6 +147,14 @@ if [[ -s $stage1_macho ]]; then
 else
   echo "Warning: no ${stage1_macho#"$scratch/root"} in the image; the ESP has no aurora/stage1.macho" >&2
 fi
+# The secure-flavour Stage 1 object, which holds a key block. The installer enrolls it,
+# with this install's configuration copied in, when the owner chooses their own key.
+# Only aura packages that build that flavour ship it; without it the installer offers
+# only Aurora-managed keys.
+stage1_secure=$scratch/root/usr/share/aura/stage1/aura-secure-boot.macho
+if [[ -s $stage1_secure && -s $stage1_macho ]]; then
+  install -Dm644 "$stage1_secure" "$output/esp/aurora/stage1-secure.macho"
+fi
 python3 "$(dirname -- "${BASH_SOURCE[0]}")/prepare-stage2.py" \
   --combined "$output/esp/m1n1/boot.bin" \
   --aura "$scratch/root/usr/lib/asahi-boot/m1n1.bin" \

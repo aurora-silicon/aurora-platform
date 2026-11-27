@@ -52,6 +52,16 @@ class Stage1Tests(unittest.TestCase):
         self.assertEqual(esp, {'stage1.bin': b'raw'})
         self.assertIn('Warning: no /usr/share/aura/stage1/aura-boot.macho', result.stderr)
 
+    def test_the_secure_stage1_object_reaches_the_esp_beside_the_common_one(self):
+        result, esp = self.run_block({'aura-raw.bin': b'raw', 'aura-boot.macho': b'macho',
+                                      'aura-secure-boot.macho': b'secure'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(esp, {'stage1.bin': b'raw', 'stage1.macho': b'macho', 'stage1-secure.macho': b'secure'})
+        # The installer needs the common object to copy this install's configuration from.
+        result, esp = self.run_block({'aura-raw.bin': b'raw', 'aura-secure-boot.macho': b'secure'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(esp, {'stage1.bin': b'raw'})
+
     def test_stage1_bin_is_still_required(self):
         result, _ = self.run_block({'aura-boot.macho': b'macho'})
         self.assertNotEqual(result.returncode, 0)
