@@ -1,0 +1,25 @@
+// Let the active local user start and cancel the one-shot charge to full,
+// and plan or clear a "full by HH:MM" schedule, without a password.  This
+// mirrors UPower's own action for the charge limit,
+// org.freedesktop.UPower.enable-charging-limit (allow_active = yes): the
+// service only lifts that limit through UPower and always puts it back.
+// systemd checks StartTransientUnit with the same unit and verb "start"; it
+// refuses a transient unit whose name has an installed unit file or template,
+// so the two start grants below cannot be used to create transient units.
+polkit.addRule(function(action, subject) {
+    if (action.id != "org.freedesktop.systemd1.manage-units" ||
+        !subject.local || !subject.active)
+        return polkit.Result.NOT_HANDLED;
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if (unit == "aurora-charge-full-now.service" && (verb == "start" || verb == "stop"))
+        return polkit.Result.YES;
+    // The planner; the instance is the time of day (HHMM), checked here and again by the program.
+    if (/^aurora-charge-full-now-schedule@([01][0-9]|2[0-3])[0-5][0-9]\.service$/.test(unit) &&
+        verb == "start")
+        return polkit.Result.YES;
+    // The transient timer the planner arms; only stopping it (cancel).
+    if (unit == "aurora-charge-full-now-schedule.timer" && verb == "stop")
+        return polkit.Result.YES;
+    return polkit.Result.NOT_HANDLED;
+});

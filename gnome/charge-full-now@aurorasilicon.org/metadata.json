@@ -1,0 +1,7 @@
+{
+  "uuid": "charge-full-now@aurorasilicon.org",
+  "name": "Charge to Full Now",
+  "description": "A quick settings toggle that charges the battery to 100 % once while UPower's charge limit (Preserve Battery Health) is on. Needs aurora-charge-full-now.",
+  "shell-version": ["50", "51"],
+  "url": "https://github.com/aurora-silicon/aurora-platform/tree/main/gnome"
+}

@@ -1,0 +1,745 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+"""Charge to Full Now: charge the battery to 100 % once, then put the limit back.
+
+macOS offers "Charge to Full Now" while its charge limit or Optimised Battery
+Charging holds the battery below full.  On Linux the limit belongs to UPower
+(GNOME Settings > Power > Preserve Battery Health calls the battery's
+EnableChargeThreshold method; UPower writes charge_control_*_threshold and
+keeps the on/off state in /var/lib/upower/charging-threshold-status).  This
+program does the one-shot through the same method, so UPower and GNOME always
+show what the hardware does:
+
+  1. write a marker (/var/lib/aurora/charge-full-now/active) first,
+  2. EnableChargeThreshold(false): the battery charges,
+  3. wait, on UPower and logind signals, until the battery is full, the
+     adapter goes away, the user turns the limit back on, the one-shot is
+     cancelled or the 12 h ceiling passes,
+  4. EnableChargeThreshold(true) and remove the marker.
+
+UPower persists the disabled state while the one-shot runs.  The marker makes
+every way out put the limit back: the service's ExecStopPost runs "restore"
+when the process dies, and aurora-charge-full-now-restore.service runs it at
+boot when a reboot or power loss came first.
+
+Commands:
+  start      ask systemd to start aurora-charge-full-now.service
+  start --by HH:MM
+             keep the limit and start the one-shot so that the battery is
+             full by the next HH:MM (local time), as macOS Optimised Charging
+             finishes before the usual unplug time
+  cancel     stop the one-shot and clear a schedule; the limit comes back
+  status     the one-shot state, battery and limit (--json for programs)
+  run        the one-shot itself (the service's ExecStart)
+  restore    put the limit back if a marker says it is ours (ExecStopPost, boot)
+  arm HHMM   plan and arm the schedule (aurora-charge-full-now-schedule@HHMM.service)
+  fire       the schedule's timer went off: start the one-shot
+
+Nothing here is specific to a machine: any battery for which UPower reports
+ChargeThresholdSupported works.
+"""
+
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+UNIT = 'aurora-charge-full-now.service'
+MARKER = '/var/lib/aurora/charge-full-now/active'
+CEILING = 12 * 3600         # seconds; the longest a one-shot may hold the limit off
+SETTLE = 60                 # seconds restore waits for UPower to list the battery at boot
+
+# "start --by HH:MM": hold the limit, start the one-shot early enough to be full by then.
+SCHEDULE = 'aurora-charge-full-now-schedule'        # transient .timer and .service, made by arm
+SCHEDULE_FILE = '/run/aurora-charge-full-now/schedule.json'
+POWER_SUPPLY = '/sys/class/power_supply'
+DERATE = 0.6                # of the adapter's input_power_limit that is assumed to reach the battery
+MIN_RATE = 10.0             # W; never assume a slower charge than this
+MARGIN = 30 * 60            # seconds of slack before the deadline
+
+UPOWER = 'org.freedesktop.UPower'
+UPOWER_PATH = '/org/freedesktop/UPower'
+DEVICE = 'org.freedesktop.UPower.Device'
+TYPE_BATTERY = 2
+STATE_NAMES = {0: 'unknown', 1: 'charging', 2: 'discharging', 3: 'empty',
+               4: 'fully-charged', 5: 'pending-charge', 6: 'pending-discharge'}
+STATE_FULL = 4
+
+# Why a one-shot ended.  Every reason but LIMIT_ON puts the limit back.
+FULL, UNPLUGGED, LIMIT_ON, CANCELLED, TIMEOUT, GONE = (
+    'full', 'unplugged', 'limit-on', 'cancelled', 'timeout', 'battery-gone')
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def boottime():
+    """Seconds on a clock that keeps counting through suspend."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+class Cancelled(Exception):
+    pass
+
+
+# ---- UPower over busctl ---------------------------------------------------
+
+def _unwrap(value):
+    """busctl --json=short wraps each variant as {"type": t, "data": d}."""
+    if isinstance(value, dict) and set(value) == {'type', 'data'}:
+        return value['data']
+    return value
+
+
+class UPowerBus:
+    """The few UPower calls this program needs, through busctl.
+
+    busctl is what the other power daemons here use; it needs no Python D-Bus
+    binding.  wait() blocks on a busctl monitor (root only) for UPower
+    property changes, device additions, UPower restarts and logind's
+    PrepareForSleep, so a resume from s2idle wakes the loop as well.
+    """
+
+    MATCHES = (
+        "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',"
+        "path_namespace='%s'" % UPOWER_PATH,
+        "type='signal',interface='%s',member='DeviceAdded'" % UPOWER,
+        "type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged',arg0='%s'" % UPOWER,
+        "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'",
+    )
+
+    def __init__(self, runner=subprocess.run):
+        self.runner = runner
+        self.mon = None
+
+    def _busctl(self, *args):
+        try:
+            out = self.runner(['busctl', '--system', '--json=short'] + list(args),
+                              capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log('busctl %s: %s' % (' '.join(args[:4]), e))
+            return None
+        if out.returncode != 0:
+            log('busctl %s: %s' % (' '.join(args[:4]), out.stderr.strip()))
+            return None
+        if not out.stdout.strip():
+            return ()           # a method without a reply value, e.g. EnableChargeThreshold
+        try:
+            return json.loads(out.stdout).get('data')
+        except ValueError:
+            return None
+
+    def devices(self):
+        data = self._busctl('call', UPOWER, UPOWER_PATH, UPOWER, 'EnumerateDevices')
+        return list(data[0]) if data else []
+
+    def props(self, path):
+        data = self._busctl('call', UPOWER, path, 'org.freedesktop.DBus.Properties', 'GetAll', 's', DEVICE)
+        if not data:
+            return None
+        return {k: _unwrap(v) for k, v in data[0].items()}
+
+    def on_battery(self):
+        data = self._busctl('get-property', UPOWER, UPOWER_PATH, UPOWER, 'OnBattery')
+        return bool(data)
+
+    def enable_threshold(self, path, enabled):
+        return self._busctl('call', UPOWER, path, DEVICE, 'EnableChargeThreshold', 'b',
+                            'true' if enabled else 'false') is not None
+
+    def _monitor(self):
+        args = ['busctl', '--system', 'monitor'] + ['--match=%s' % m for m in self.MATCHES]
+        try:
+            return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        except OSError as e:
+            log('busctl monitor: %s' % e)
+            return None
+
+    def watch(self):
+        """Start listening before the first read, so no change is lost."""
+        if self.mon is None:
+            self.mon = self._monitor()
+
+    def wait(self, timeout):
+        """Block until a signal arrives or timeout seconds pass."""
+        if self.mon is None or self.mon.stdout is None:
+            # No monitor (not root, busctl missing): fall back to a slow re-read.
+            time.sleep(min(timeout, 60))
+            return
+        ready, _, _ = select.select([self.mon.stdout], [], [], max(timeout, 0))
+        if not ready:
+            return
+        if not os.read(self.mon.stdout.fileno(), 65536):
+            self.mon.wait()
+            self.mon.stdout.close()
+            time.sleep(1)
+            self.mon = self._monitor()
+
+    def close(self):
+        if self.mon is not None:
+            self.mon.terminate()
+            try:
+                self.mon.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.mon.kill()
+                self.mon.wait()
+            if self.mon.stdout is not None:
+                self.mon.stdout.close()
+            self.mon = None
+
+
+# ---- the marker -----------------------------------------------------------
+
+def read_marker(path=MARKER):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, PermissionError):
+        return None         # PermissionError: an unprivileged status or start; the service sees it
+    except (OSError, ValueError):
+        return {}           # present but damaged: still ours
+
+
+def write_marker(info, path=MARKER):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(info, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def remove_marker(path=MARKER):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+# ---- policy ---------------------------------------------------------------
+
+def find_battery(bus, prefer=None):
+    """(path, props) of the system battery UPower can limit, else of any system battery."""
+    found = []
+    for path in bus.devices():
+        p = bus.props(path)
+        if not p or p.get('Type') != TYPE_BATTERY or not p.get('PowerSupply') or not p.get('IsPresent', True):
+            continue
+        found.append((path, p))
+    if prefer:
+        for path, p in found:
+            if prefer in (path, p.get('NativePath')):
+                return path, p
+    found.sort(key=lambda item: not item[1].get('ChargeThresholdSupported'))
+    return found[0] if found else (None, None)
+
+
+def is_full(p):
+    return p.get('State') == STATE_FULL or p.get('Percentage', 0) >= 100
+
+
+def describe(p):
+    return '%.0f %% %s' % (p.get('Percentage', 0), STATE_NAMES.get(p.get('State'), 'unknown'))
+
+
+def preflight(bus, marker, need_adapter=True):
+    """(path, props, message): path is None when there is nothing to do."""
+    path, p = find_battery(bus)
+    if path is None:
+        return None, None, 'no battery: nothing to charge'
+    if not p.get('ChargeThresholdSupported'):
+        return None, p, 'UPower cannot limit this battery\'s charge: it always charges to full'
+    if not p.get('ChargeThresholdEnabled') and marker is None:
+        return None, p, ('the charge limit is off: the battery already charges to full '
+                         '(Settings > Power > Preserve Battery Health)')
+    if is_full(p):
+        return None, p, 'the battery is full (%s)' % describe(p)
+    if need_adapter and bus.on_battery():
+        return None, p, 'connect the power adapter first; the battery is at %s' % describe(p)
+    return path, p, None
+
+
+def ended(p, on_battery):
+    """The reason the one-shot is over, or None while it should go on."""
+    if p is None:
+        return GONE
+    if p.get('ChargeThresholdEnabled'):
+        return LIMIT_ON
+    if is_full(p):
+        return FULL
+    if on_battery:
+        return UNPLUGGED
+    return None
+
+
+def charge_full(bus, marker_path=MARKER, ceiling=CEILING, clock=boottime):
+    """The one-shot.  Returns the exit status."""
+    bus.watch()
+    marker = read_marker(marker_path)
+    path, p, why = preflight(bus, marker)
+    if path is None:
+        log(why)
+        if marker is not None:
+            return restore(bus, marker_path, settle=0)
+        return 0
+    end, native = p.get('ChargeEndThreshold'), p.get('NativePath')
+    write_marker({'path': path, 'native_path': native, 'end_threshold': end,
+                  'started': int(time.time()), 'ceiling': ceiling}, marker_path)
+    if p.get('ChargeThresholdEnabled') and not bus.enable_threshold(path, False):
+        log('UPower refused to lift the charge limit')
+        remove_marker(marker_path)
+        return 1
+    log('charging to full once from %s; the %s %% limit comes back when the battery is full '
+        'or the adapter is unplugged' % (describe(p), end))
+    deadline = clock() + ceiling
+    reason = None
+    try:
+        while True:
+            p = bus.props(path)
+            if p is None:           # UPower restarting, or the battery went away
+                path, p = find_battery(bus, prefer=native or path)
+            reason = ended(p, bus.on_battery())
+            if reason is None and clock() >= deadline:
+                reason = TIMEOUT
+            if reason is not None:
+                break
+            bus.wait(deadline - clock())
+    except Cancelled:
+        reason = CANCELLED
+    log('one-shot over: %s%s' % (reason, ' at %s' % describe(p) if p else ''))
+    if reason == LIMIT_ON:      # the user turned the limit back on: it is UPower's again
+        remove_marker(marker_path)
+        return 0
+    return restore(bus, marker_path, settle=0)
+
+
+def restore(bus, marker_path=MARKER, settle=SETTLE, clock=boottime):
+    """Put the limit back if the marker says this program lifted it."""
+    marker = read_marker(marker_path)
+    if marker is None:
+        return 0
+    bus.watch()
+    deadline = clock() + settle
+    while True:
+        path, p = find_battery(bus, prefer=marker.get('native_path') or marker.get('path'))
+        if path is not None or clock() >= deadline:
+            break
+        bus.wait(deadline - clock())     # UPower still enumerating at boot
+    if path is None:
+        log('restore: UPower lists no battery; keeping %s for the next try' % marker_path)
+        return 1
+    if not p.get('ChargeThresholdSupported'):
+        log('restore: UPower no longer offers a charge limit on %s' % path)
+        remove_marker(marker_path)
+        return 0
+    if not p.get('ChargeThresholdEnabled') and not bus.enable_threshold(path, True):
+        log('restore: UPower refused to turn the charge limit back on; keeping %s' % marker_path)
+        return 1
+    remove_marker(marker_path)
+    log('charge limit back on (%s %%)' % p.get('ChargeEndThreshold'))
+    return 0
+
+
+# ---- schedules: start --by HH:MM ----------------------------------------
+
+def parse_by(text):
+    """(hour, minute) from "HH:MM" or "HHMM", else None."""
+    text = (text or '').strip()
+    digits = text.replace(':', '', 1) if len(text) == 5 and text[2] == ':' else text
+    if len(digits) != 4 or not digits.isdigit():
+        return None
+    h, m = int(digits[:2]), int(digits[2:])
+    if h > 23 or m > 59:
+        return None
+    return h, m
+
+
+def next_deadline(h, m, now):
+    """Epoch seconds of the next local HH:MM strictly after now."""
+    t = time.localtime(now)
+    for days in range(0, 3):
+        cand = time.mktime((t.tm_year, t.tm_mon, t.tm_mday + days, h, m, 0, 0, 0, -1))
+        if cand > now:
+            return cand
+    raise ValueError('no next %02d:%02d' % (h, m))
+
+
+def adapter_watts(root=POWER_SUPPLY):
+    """The largest input_power_limit (W) of an online power adapter, else None."""
+    best = None
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for name in names:
+        base = os.path.join(root, name)
+        try:
+            with open(os.path.join(base, 'type')) as f:
+                if f.read().strip() == 'Battery':
+                    continue
+            with open(os.path.join(base, 'online')) as f:
+                if f.read().strip() != '1':
+                    continue
+            with open(os.path.join(base, 'input_power_limit')) as f:
+                watts = int(f.read().strip()) / 1e6
+        except (OSError, ValueError):
+            continue
+        if watts > 0 and (best is None or watts > best):
+            best = watts
+    return best
+
+
+def charge_rate(p, adapter_w):
+    """A conservative charge power in W: the lower of the derated adapter limit
+    and UPower's present rate while charging, never below MIN_RATE."""
+    rates = []
+    if adapter_w:
+        rates.append(adapter_w * DERATE)
+    if p.get('State') == 1 and (p.get('EnergyRate') or 0) > 0:
+        rates.append(p['EnergyRate'])
+    return max(min(rates) if rates else MIN_RATE, MIN_RATE)
+
+
+def read_uint(path):
+    try:
+        with open(path) as f:
+            v = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def capacity_wh(p, root=POWER_SUPPLY):
+    """The battery's full capacity in Wh: UPower's EnergyFull, else the kernel's
+    energy_full, else charge_full x voltage_min_design.  None when none is known:
+    no guessed pack size."""
+    if (p.get('EnergyFull') or 0) > 0:
+        return float(p['EnergyFull'])
+    name = os.path.basename(p.get('NativePath') or '')
+    if not name or name in ('.', '..'):
+        return None
+    base = os.path.join(root, name)
+    uwh = read_uint(os.path.join(base, 'energy_full'))
+    if uwh:
+        return uwh / 1e6
+    uah, uv = read_uint(os.path.join(base, 'charge_full')), read_uint(os.path.join(base, 'voltage_min_design'))
+    if uah and uv:
+        return uah * uv / 1e12
+    return None
+
+
+def plan(p, deadline, now, adapter_w, root=POWER_SUPPLY):
+    """When to start so the battery is full by deadline: {start, deadline, deficit_wh, rate_w},
+    or None when the battery's capacity is unknown."""
+    full = capacity_wh(p, root)
+    if full is None:
+        return None
+    pct = min(max(p.get('Percentage') or 0, 0), 100)
+    energy = p.get('Energy') or 0
+    if (p.get('EnergyFull') or 0) > 0 and energy > 0:
+        deficit = max(full - energy, 0.0)
+    else:
+        deficit = full * (100 - pct) / 100
+    rate = charge_rate(p, adapter_w)
+    start = deadline - deficit / rate * 3600 - MARGIN
+    return {'deadline': int(deadline), 'start': int(max(start, now)), 'deficit_wh': round(deficit, 2),
+            'rate_w': round(rate, 1), 'now': start <= now}
+
+
+# ---- the command line -----------------------------------------------------
+
+RUN = subprocess.run        # replaced in tests
+
+
+def systemctl(*args):
+    try:
+        out = RUN(['systemctl'] + list(args), text=True, capture_output=True)
+    except OSError as e:
+        log('systemctl: %s' % e)
+        return 1
+    if out.returncode != 0 and out.stderr.strip():
+        log(out.stderr.strip())
+    return out.returncode
+
+
+def unit_active(unit=UNIT):
+    try:
+        out = RUN(['systemctl', 'is-active', unit], text=True, capture_output=True)
+    except OSError:
+        return 'unknown'
+    return out.stdout.strip() or 'unknown'
+
+
+def clear_schedule(schedule_file=None):
+    """Stop a pending schedule timer; returns True if one was pending."""
+    schedule_file = schedule_file or SCHEDULE_FILE
+    pending = unit_active(SCHEDULE + '.timer') in ('active', 'activating')
+    if pending:
+        systemctl('stop', SCHEDULE + '.timer')
+    try:
+        os.unlink(schedule_file)
+    except OSError:
+        pass        # an unprivileged cancel cannot; status ignores it once the timer is gone
+    return pending
+
+
+def stamp(t):
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t))
+
+
+def arm(bus, by, now=None, root=POWER_SUPPLY, schedule_file=None):
+    """Plan "full by HH:MM" and arm the timer, as root.  The limit is never touched here:
+    only the one-shot service lifts it, with its own restore paths."""
+    schedule_file = schedule_file or SCHEDULE_FILE
+    hm = parse_by(by)
+    if hm is None:
+        log('arm: %r is not HH:MM' % by)
+        return 2
+    now = time.time() if now is None else now
+    marker = read_marker(MARKER)
+    path, p, why = preflight(bus, marker, need_adapter=False)
+    clear_schedule(schedule_file)
+    try:        # a failed or lingering transient unit would block the new one's name
+        RUN(['systemctl', 'reset-failed', SCHEDULE + '.timer', SCHEDULE + '.service'],
+            text=True, capture_output=True)
+    except OSError:
+        pass
+    if path is None:
+        log('nothing to schedule: %s' % why)
+        return 0
+    if marker is not None:
+        log('nothing to schedule: a one-shot is already charging to full')
+        return 0
+    pl = plan(p, next_deadline(hm[0], hm[1], now), now, adapter_watts(root), root)
+    if pl is None:
+        log('nothing to schedule: the battery reports no capacity, so no start time can be planned')
+        return 1
+    log('full by %s: %.1f Wh to go at %.1f W plus %d min margin; start %s' % (
+        stamp(pl['deadline']), pl['deficit_wh'], pl['rate_w'], MARGIN // 60,
+        'now' if pl['now'] else stamp(pl['start'])))
+    if pl['now']:
+        return 0 if systemctl('start', '--no-block', UNIT) == 0 else 1
+    try:
+        os.makedirs(os.path.dirname(schedule_file), exist_ok=True)
+        with open(schedule_file + '.tmp', 'w') as f:
+            json.dump(pl, f)
+        os.chmod(schedule_file + '.tmp', 0o644)
+        os.replace(schedule_file + '.tmp', schedule_file)
+    except OSError as e:
+        log('arm: %s' % e)
+    try:
+        out = RUN(['systemd-run', '--unit=' + SCHEDULE, '--on-calendar=' + stamp(pl['start']),
+                   '--timer-property=AccuracySec=1min',
+                   '--description=Charge the battery to full by %s' % stamp(pl['deadline']),
+                   '/usr/bin/aurora-charge-full-now', 'fire'],
+                  text=True, capture_output=True)
+        rc = out.returncode
+        if rc != 0:
+            log('systemd-run: %s' % out.stderr.strip())
+    except OSError as e:
+        log('systemd-run: %s' % e)
+        rc = 1
+    if rc != 0:
+        try:
+            os.unlink(schedule_file)
+        except OSError:
+            pass
+        return 1
+    return 0
+
+
+def fire(schedule_file=None):
+    schedule_file = schedule_file or SCHEDULE_FILE
+    try:
+        os.unlink(schedule_file)
+    except OSError:
+        pass
+    log('scheduled charge to full: starting %s' % UNIT)
+    return 0 if systemctl('start', '--no-block', UNIT) == 0 else 1
+
+
+def read_schedule(schedule_file=None):
+    schedule_file = schedule_file or SCHEDULE_FILE
+    if unit_active(SCHEDULE + '.timer') not in ('active', 'activating'):
+        return None
+    try:
+        with open(schedule_file) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def cmd_start(bus, by=None):
+    marker = read_marker(MARKER)
+    if by is not None:
+        hm = parse_by(by)
+        if hm is None:
+            print('--by wants a time of day, HH:MM (24 h)', file=sys.stderr)
+            return 2
+        path, p, why = preflight(bus, marker, need_adapter=False)
+        if path is None:
+            print(why)
+            return 0
+        if marker is not None:
+            # The limit is lifted now: a schedule would not hold it.
+            print('A one-shot is already charging the battery to full. '
+                  '"aurora-charge-full-now cancel" turns the limit back on first.')
+            return 1
+        if capacity_wh(p) is None:
+            print('The battery reports no capacity, so no start time can be planned. '
+                  '"aurora-charge-full-now start" charges to full now.', file=sys.stderr)
+            return 1
+        unit = '%s@%02d%02d.service' % (SCHEDULE, hm[0], hm[1])
+        rc = systemctl('start', unit)
+        if rc != 0:
+            print('could not start %s (systemctl exit %d)' % (unit, rc), file=sys.stderr)
+            return 1
+        sch = read_schedule()
+        if sch:
+            print('The %s %% limit holds until %s, so the battery is full by %s '
+                  '(%.0f Wh at %.0f W, 30 min margin). "aurora-charge-full-now cancel" clears it.'
+                  % (p.get('ChargeEndThreshold'), stamp(sch['start'])[:16], stamp(sch['deadline'])[:16],
+                     sch['deficit_wh'], sch['rate_w']))
+        elif unit_active() in ('active', 'activating'):
+            print('Not enough time left before %02d:%02d: charging to full now.' % hm)
+        else:
+            print('See "journalctl -u %s" for the plan.' % unit)
+        return 0
+    path, p, why = preflight(bus, marker)
+    if path is None:
+        print(why)
+        return 0
+    clear_schedule()            # starting now replaces a schedule
+    rc = systemctl('start', UNIT)
+    if rc != 0:
+        print('could not start %s (systemctl exit %d)' % (UNIT, rc), file=sys.stderr)
+        return 1
+    print('Charging to full once (now %s). The %s %% limit comes back when the battery is full '
+          'or the adapter is unplugged; "aurora-charge-full-now cancel" ends it now.'
+          % (describe(p), p.get('ChargeEndThreshold')))
+    return 0
+
+
+def cmd_cancel():
+    had_schedule = clear_schedule()
+    if unit_active() not in ('active', 'activating'):
+        print('schedule cleared' if had_schedule else 'no charge to full is running or scheduled')
+        return 0
+    rc = systemctl('stop', UNIT)
+    if rc != 0:
+        print('could not stop %s (systemctl exit %d)' % (UNIT, rc), file=sys.stderr)
+        return 1
+    print('cancelled; the charge limit is back on')
+    return 0
+
+
+def status(bus, active, marker, schedule=None):
+    path, p = find_battery(bus)
+    out = {'active': active in ('active', 'activating'), 'unit': active, 'marker': marker,
+           'battery': None, 'schedule': None}
+    if schedule is not None:
+        out['schedule'] = {'by': schedule.get('deadline'), 'start_at': schedule.get('start'),
+                           'deficit_wh': schedule.get('deficit_wh'), 'rate_w': schedule.get('rate_w')}
+    if path is not None:
+        out['battery'] = {
+            'path': path,
+            'percentage': p.get('Percentage'),
+            'state': STATE_NAMES.get(p.get('State'), 'unknown'),
+            'limit_supported': bool(p.get('ChargeThresholdSupported')),
+            'limit_enabled': bool(p.get('ChargeThresholdEnabled')),
+            'end_threshold': p.get('ChargeEndThreshold'),
+        }
+    return out
+
+
+def cmd_status(bus, as_json):
+    st = status(bus, unit_active(), read_marker(MARKER), read_schedule())
+    if as_json:
+        print(json.dumps(st))
+        return 0
+    b = st['battery']
+    if b is None:
+        print('battery: none')
+    else:
+        print('battery: %.0f %% %s' % (b['percentage'] or 0, b['state']))
+        if not b['limit_supported']:
+            print('limit: not supported')
+        else:
+            print('limit: %s (%s %%)' % ('on' if b['limit_enabled'] else 'off', b['end_threshold']))
+    if st['active']:
+        started = (st['marker'] or {}).get('started')
+        print('charge to full: running%s' % (
+            ' since %s' % time.strftime('%Y-%m-%d %H:%M', time.localtime(started)) if started else ''))
+    elif st['marker'] is not None:
+        print('charge to full: interrupted; the limit comes back at the next restore')
+    else:
+        print('charge to full: not running')
+    sch = st['schedule']
+    if sch is not None:
+        if sch.get('by'):
+            print('scheduled: full by %s, starts %s' % (stamp(sch['by'])[:16], stamp(sch['start_at'])[:16]))
+        else:
+            print('scheduled: yes')
+    return 0
+
+
+USAGE = 'usage: aurora-charge-full-now start [--by HH:MM] | cancel | status [--json]'
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ('start', 'cancel', 'status', 'run', 'restore', 'arm', 'fire'):
+        print(USAGE, file=sys.stderr)
+        return 2
+    cmd, rest = argv[1], argv[2:]
+    if cmd == 'start' and rest and (rest[0] != '--by' or len(rest) != 2):
+        print(USAGE, file=sys.stderr)
+        return 2
+    if cmd == 'arm' and len(rest) != 1:
+        print(USAGE, file=sys.stderr)
+        return 2
+    if cmd == 'fire':
+        return fire()
+    bus = UPowerBus()
+    if cmd == 'start':
+        return cmd_start(bus, rest[1] if rest else None)
+    if cmd == 'cancel':
+        return cmd_cancel()
+    if cmd == 'status':
+        return cmd_status(bus, '--json' in rest)
+    if cmd == 'arm':
+        return arm(bus, rest[0])
+
+    def cancel(*_):
+        # Once: the restore that follows must not be interrupted by a second signal.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        raise Cancelled()
+
+    try:
+        if cmd == 'run':
+            signal.signal(signal.SIGTERM, cancel)
+            signal.signal(signal.SIGINT, cancel)
+            try:
+                rc = charge_full(bus, MARKER)
+            except Cancelled:           # cancelled before or after the wait loop
+                rc = restore(bus, MARKER, settle=0)
+        else:
+            rc = restore(bus, MARKER)
+    finally:
+        bus.close()
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
