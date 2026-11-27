@@ -747,6 +747,114 @@ class SeedTests(TempCase):
         self.assertIn('keys create', r.stderr)
 
 
+class BothTests(TempCase):
+    """KEY_OWNER=both: the owner's db key and Aurora's UKI keys in AURORA_DB."""
+
+    def aurora_cert(self, fx, name='aurora-uki.crt'):
+        import base64
+        d = fx.root / 'usr/share/aurora/secboot/aurora-db'
+        d.mkdir(parents=True, exist_ok=True)
+        der = b'0\x82FAKE-X509/CN=Aurora UKI ' + name.encode()
+        (d / name).write_text('-----BEGIN CERTIFICATE-----\n' + base64.b64encode(der).decode() +
+                              '\n-----END CERTIFICATE-----\n')
+        return d / name, der
+
+    def aurora_signed(self, fx, cert):
+        """This machine's unsigned UKI, signed as Aurora would sign it (with Aurora's certificate)."""
+        fx.run('uki', 'build', KVER, '--no-sign')
+        out = fx.root / 'aurora-signed.efi'
+        r = subprocess.run([str(fx.bin / 'sbsign'), '--key', '/dev/null', '--cert', str(cert), '--output', str(out),
+                            str(fx.uki())], env=fx.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return out
+
+    @staticmethod
+    def arg(path):
+        return '/' + path.name
+
+    def test_seed_db_holds_the_owner_key_then_aurora_keys(self):
+        fx = self.fixture(owner='both')
+        fx.run('keys', 'create')
+        _, aurora = self.aurora_cert(fx)
+        r = fx.run('seed', '-o', '/seed.var')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        v = sb.parse_seed((fx.root / 'seed.var').read_bytes())
+        owner = sb.pem_certs((fx.keys / 'db.crt').read_text())[0]
+        db, at, ders = v['db'][2], 0, []
+        while at < len(db):
+            _, lsize, _, ssize = struct.unpack_from('<16sIII', db, at)
+            ders.append(db[at + 44:at + lsize])
+            at += lsize
+        self.assertEqual(ders, [owner, aurora])
+        for k in ('PK', 'KEK'):
+            self.assertEqual(v[k][2][44:], sb.pem_certs((fx.keys / f'{k}.crt').read_text())[0])
+
+    def test_owner_mode_ignores_aurora_keys(self):
+        fx = self.fixture(owner='owner')
+        fx.run('keys', 'create')
+        cert, _ = self.aurora_cert(fx)
+        fx.run('seed', '-o', '/seed.var')
+        v = sb.parse_seed((fx.root / 'seed.var').read_bytes())
+        self.assertEqual(v['db'][2][44:], sb.pem_certs((fx.keys / 'db.crt').read_text())[0])
+        uki = self.aurora_signed(fx, cert)
+        r = fx.run('uki', 'verify', self.arg(uki))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('other-key', r.stdout)
+
+    def test_a_uki_signed_by_aurora_or_the_owner_verifies(self):
+        fx = self.fixture(owner='both')
+        fx.run('keys', 'create')
+        cert, _ = self.aurora_cert(fx)
+        uki = self.aurora_signed(fx, cert)
+        self.assertEqual(fx.run('uki', 'verify', self.arg(uki)).returncode, 0)
+        fx.run('uki', 'build', OLD)
+        r = fx.run('uki', 'verify', str(fx.uki(OLD)), self.arg(uki))
+        self.assertEqual(r.returncode, 0, r.stdout)
+        fx.run('uki', 'build', OLD, '--no-sign')
+        r = fx.run('uki', 'verify', str(fx.uki(OLD)))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('unsigned', r.stdout)
+        r = fx.run('enable', '--uki', self.arg(uki))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((fx.esp / 'EFI/BOOT/BOOTAA64.EFI').read_bytes(), uki.read_bytes())
+
+    def test_a_stranger_signed_uki_is_refused(self):
+        fx = self.fixture(owner='both')
+        fx.run('keys', 'create')
+        self.aurora_cert(fx)
+        stranger = fx.base / 'stranger.crt'
+        stranger.write_text('-----BEGIN CERTIFICATE-----\nMIIstranger\n-----END CERTIFICATE-----\n')
+        uki = self.aurora_signed(fx, stranger)
+        r = fx.run('uki', 'verify', self.arg(uki))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('other-key', r.stdout)
+        r = fx.run('enable', '--uki', self.arg(uki))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('an Aurora key in', r.stderr)
+
+    def test_status_names_aurora_keys(self):
+        fx = self.fixture(owner='both')
+        fx.run('keys', 'create')
+        self.assertIn('none yet, so only UKIs signed with the owner key verify', fx.run('status').stdout)
+        self.aurora_cert(fx)
+        self.assertIn('Aurora UKI keys in /usr/share/aurora/secboot/aurora-db: aurora-uki.crt', fx.run('status').stdout)
+        st = json.loads(fx.run('status', '--json').stdout)
+        self.assertEqual([os.path.basename(p) for p in st['aurora_db']], ['aurora-uki.crt'])
+
+    def test_seed_refuses_a_microsoft_ca_among_aurora_keys(self):
+        import base64
+        fx = self.fixture(owner='both')
+        fx.run('keys', 'create')
+        d = fx.root / 'usr/share/aurora/secboot/aurora-db'
+        d.mkdir(parents=True)
+        der = b'0\x82' + b'CN=Microsoft Corporation UEFI CA 2011'
+        (d / 'ms.crt').write_text('-----BEGIN CERTIFICATE-----\n' + base64.b64encode(der).decode() +
+                                  '\n-----END CERTIFICATE-----\n')
+        r = fx.run('seed', '-o', '/seed.var')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('Microsoft Corporation UEFI CA', r.stderr)
+
+
 class HookTests(TempCase):
     def plugin(self, fx, *args, env=None):
         env = {**fx.env, 'AURORA_SECBOOT_ROOT': str(fx.root),
@@ -1068,6 +1176,18 @@ class Stage1Tests(TempCase):
         (fx.esp / 'aura-try').write_bytes(b'armed\nm1n1/boot.bin.next\n')
         self.assertIn('trial is armed', fx.run('stage1', 'build', '--enforce').stderr)
         (fx.esp / 'aura-try').unlink()
+        # Signed without UEFI keys, the Stage 2's U-Boot has an empty Secure Boot seed.
+        r = fx.run('stage1', 'build', '--enforce', '--volume', 'Fedora')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('carries no Secure Boot keys (empty)', r.stderr)
+        self.assertEqual(fx.run('keys', 'create').returncode, 0)
+        self.assertEqual(fx.run('stage2', 'sign').returncode, 0)
+        # Its keys don't verify shim, the only file U-Boot would boot.
+        r = fx.run('stage1', 'build', '--enforce', '--volume', 'Fedora')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('is not a UKI signed with this machine', r.stderr)
+        self.assertEqual(fx.run('uki', 'build', KVER).returncode, 0)
+        self.assertEqual(fx.run('enable').returncode, 0)
         r = fx.run('stage1', 'build', '--enforce', '--volume', 'Fedora')
         self.assertEqual(r.returncode, 0, r.stderr)
         obj = (self.objects(fx) / 'stage1-enforce.macho').read_bytes()
@@ -1276,6 +1396,7 @@ class InstallTests(unittest.TestCase):
                                      'usr/lib/kernel/install.d/92-aurora-secboot.install',
                                      'usr/lib/systemd/system/aurora-secboot-adopt.service',
                                      'usr/share/doc/aurora-secboot/README.md',
+                                     'usr/share/doc/aurora-secboot/own-keys.md',
                                      'usr/share/doc/aurora-secboot/stage1-existing-install.md'])
             self.assertEqual(stat.S_IMODE((Path(tmp) / 'var/lib/aurora/secboot').stat().st_mode), 0o700)
             self.assertTrue(os.access(Path(tmp) / 'usr/bin/aurora-secboot', os.X_OK))
