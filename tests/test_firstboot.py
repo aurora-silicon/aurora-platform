@@ -164,6 +164,38 @@ class UnitTests(unittest.TestCase):
         # set -e must stay in force, so each attempt runs as its own process.
         self.assertIn('until "$BASH" "${BASH_SOURCE[0]}" --attempt "$mode"; do', script)
 
+    def release(self, splash):
+        """Run release_splash against a stand-in splash process; return (seconds, log)."""
+        script = (ROOT / 'libexec/aurora-firstboot').read_text()
+        functions = re.search(r'(?ms)^wait_exit\(\) \{.*?^release_splash\(\) \{.*?^\}$', script).group(0)
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / 'log'
+            result = subprocess.run(['bash', '-c', f"""
+                set -euo pipefail
+                {splash} &
+                splash=$!
+                log() {{ echo "$*" >> {log}; }}
+                plymouth() {{ return 1; }}
+                pgrep() {{ echo "$splash"; }}
+                {functions}
+                start=$EPOCHREALTIME
+                release_splash
+                echo "$start $EPOCHREALTIME"
+                """], capture_output=True, text=True, check=True)
+            start, end = map(float, result.stdout.split())
+            return end - start, log.read_text() if log.exists() else ''
+
+    def test_the_splash_wait_ends_when_the_splash_exits(self):
+        # The pidfd wait returns when the process exits, with no polling step.
+        elapsed, log = self.release('sleep 0.3')
+        self.assertLess(elapsed, 3)
+        self.assertNotIn('stopping', log)
+        # A splash that never exits is stopped after the 5 s bound.
+        elapsed, log = self.release('sleep 60')
+        self.assertGreaterEqual(elapsed, 5)
+        self.assertLess(elapsed, 9)
+        self.assertIn('stopping the boot splash', log)
+
     def test_unit_leaves_tty1_to_the_splash(self):
         # systemd's TTYReset/TTYVHangup on tty1 cut Plymouth off its keyboard,
         # so the splash's disk-password prompt never saw a keystroke.
