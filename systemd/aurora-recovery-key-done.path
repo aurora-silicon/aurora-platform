@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for the owner's confirmation of the disk recovery key
+ConditionPathExists=/var/lib/aurora/firstboot/recovery-key
+
+[Path]
+PathExists=/run/aurora-recovery-key/acknowledged
+
+[Install]
+WantedBy=multi-user.target

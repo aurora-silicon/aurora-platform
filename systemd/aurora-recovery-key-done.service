@@ -1,0 +1,6 @@
+[Unit]
+Description=Delete the stored copies of the disk recovery key once it was shown
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/aurora/aurora-recovery-key --acknowledged

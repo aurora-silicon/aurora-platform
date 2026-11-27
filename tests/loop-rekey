@@ -27,7 +27,7 @@ password='disposable owner password'
 # The rekey reaches only the fixture's files; systemctl, localectl and the
 # logger are recorded instead of acting on this machine.
 mkdir -p "$scratch/bin"
-for tool in systemctl localectl logger; do
+for tool in systemctl localectl logger dracut; do
   printf '#!/bin/bash\nprintf "%%s %%s\\n" %s "$*" >> %s/calls\n' "$tool" "$scratch" > "$scratch/bin/$tool"
   chmod 0755 "$scratch/bin/$tool"
 done
@@ -88,9 +88,14 @@ new_fixture fresh
 [[ $(slots) == 0 ]]
 cp "$FIXTURE/boot/omarchy/luks-key" "$scratch/temporary-key"
 rekey
-[[ $(slots) == 1 ]]
+[[ $(slots) == '1 2' ]]
 printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$ROOT_DEVICE"
 ! cryptsetup open --test-passphrase --key-file "$scratch/temporary-key" "$ROOT_DEVICE" 2>/dev/null
+# A recovery key, as FileVault makes one, in its own keyslot; shown once later.
+grep -Eqx '([A-HJ-NP-Z2-9]{4}-){5}[A-HJ-NP-Z2-9]{4}' "$FIXTURE/state/recovery-key"
+[[ $(stat -c %a "$FIXTURE/state/recovery-key") == 600 ]]
+cryptsetup open --test-passphrase --key-slot 2 --key-file "$FIXTURE/state/recovery-key" "$ROOT_DEVICE"
+grep -qx 'systemctl start --no-block aurora-recovery-key.service' "$scratch/calls"
 for file in state/luks-key boot/omarchy/luks-key boot/omarchy/luks-header-before-recovery.bin rekey/password; do
   [[ ! -e $FIXTURE/$file ]] || { echo "$file survived the rekey" >&2; exit 1; }
 done
@@ -104,7 +109,7 @@ grep -qx 'systemctl start --no-block aurora-initrd-keymap.service' "$scratch/cal
 # A repeated hand-over finds nothing to do.
 printf '%s' "$password" > "$FIXTURE/rekey/password"
 rekey
-[[ $(slots) == 1 ]]
+[[ $(slots) == '1 2' ]]
 printf 'PASS enrolment, temporary keyslot and key file retirement, hook retirement\n'
 
 # 2. An owner slot already holding another password is never replaced, and the
@@ -128,7 +133,131 @@ new_fixture resumed
 printf '%s' "$password" | cryptsetup luksAddKey --batch-mode --key-slot 1 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
   --key-file "$FIXTURE/boot/omarchy/luks-key" "$ROOT_DEVICE" -
 rekey
-[[ $(slots) == 1 ]]
+[[ $(slots) == '1 2' ]]
 [[ ! -e $FIXTURE/boot/omarchy/luks-key && -f $FIXTURE/state/disk-rekeyed ]]
 printf 'PASS an interrupted rekey resumes\n'
+# 4-5. The Secure Enclave path. This worker has no enclave, so a stand-in for
+#    aurora-sep-fde keeps the same contract on the real LUKS2 header (a
+#    keyslot per token, tokens of type aurora-sep with a role, the recovery
+#    key written once to --recovery-key-file, remove-passphrase refusing
+#    token slots) and the driver's sysfs report is a fixture. What the
+#    enclave itself does is qualified on hardware.
+cat > "$scratch/bin/aurora-sep-fde" <<'FAKE'
+#!/bin/bash
+set -euo pipefail
+cmd=$1; shift
+user='' keyfile='' pwfile='' rkfile='' replace=0
+while (( $# > 1 )); do
+  case $1 in
+    --user) user=$2; shift ;;
+    --unlock-key-file) keyfile=$2; shift ;;
+    --password-file) pwfile=$2; shift ;;
+    --recovery-key-file) rkfile=$2; shift ;;
+    --replace) replace=1 ;;
+    --owner|--quiet) ;;
+  esac
+  shift
+done
+dev=$1
+fast=(--pbkdf pbkdf2 --pbkdf-force-iterations 1000)
+token_slots() {
+  cryptsetup luksDump --dump-json-metadata "$dev" | python3 -c '
+import json,sys; print(" ".join(s for t in json.load(sys.stdin)["tokens"].values() for s in t["keyslots"]))'
+}
+add() { # role user secretfile
+  local before after slot
+  before=$(cryptsetup luksDump --dump-json-metadata "$dev" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["keyslots"]))')
+  cryptsetup luksAddKey --batch-mode "${fast[@]}" --key-file "$keyfile" "$dev" "$3"
+  after=$(cryptsetup luksDump --dump-json-metadata "$dev" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["keyslots"]))')
+  slot=$(comm -13 <(tr ' ' '\n' <<<"$before" | sort) <(tr ' ' '\n' <<<"$after" | sort))
+  printf '{"type":"aurora-sep","keyslots":["%s"],"aurora_sep_mode":"password","aurora_sep_role":"%s","aurora_sep_user":"%s"}' \
+    "$slot" "$1" "$2" | cryptsetup token import "$dev"
+}
+case $cmd in
+  enroll) add user "$user" "$pwfile" ;;
+  recovery)
+    (( replace == 0 )) || { echo 'stand-in: --replace is not modelled' >&2; exit 1; }
+    head -c 18 /dev/urandom | base32 | tr -d = | head -c 24 > "$rkfile.raw"
+    add recovery '' "$rkfile.raw"
+    mv "$rkfile.raw" "$rkfile" ;;
+  test)
+    cryptsetup open --test-passphrase --key-file "${pwfile:-$rkfile}" "$dev" ;;
+  remove-passphrase)
+    slot=$( { cryptsetup open --test-passphrase --verbose --key-file "$keyfile" "$dev" 2>&1 || true; } |
+      sed -n 's/^Key slot \([0-9]*\) unlocked\.$/\1/p')
+    [[ -n $slot && " $(token_slots) " != *" $slot "* ]] || exit 1
+    cryptsetup luksKillSlot --batch-mode "$dev" "$slot" ;;
+  *) exit 2 ;;
+esac
+FAKE
+chmod 0755 "$scratch/bin/aurora-sep-fde"
+printf '#!/bin/bash\nprintf "keystore_only:Key-store-only attach (1); also per-user key bags (2) (int)\\n"\n' > "$scratch/bin/modinfo"
+printf '#!/bin/bash\n[[ $1 == passwd && $2 == alice ]] && { echo alice:x:1000:1000::/home/alice:/bin/bash; exit 0; }\nexec /usr/bin/getent "$@"\n' > "$scratch/bin/getent"
+chmod 0755 "$scratch/bin/modinfo" "$scratch/bin/getent"
+
+sep_fixture() {
+  local guard=$1
+  mkdir -p "$FIXTURE/sys/apple-sep.sep/diag"
+  printf 'open\n' > "$FIXTURE/sys/apple-sep.sep/diag/keystore"
+  printf 'xart_writes=1 provision_keybag=1 xart_guard=%s trusted_keys=1 filevault_api=1 xarm_trace=0 refkey_v2=1 identity_override=1\n' \
+    "$guard" > "$FIXTURE/sys/apple-sep.sep/diag/policy"
+  printf 'alice\n' > "$FIXTURE/rekey/user"
+}
+sep_rekey() {
+  (
+    export AURORA_SEP_FDE="$scratch/bin/aurora-sep-fde" AURORA_SEP_DEVICES="$FIXTURE/sys" AURORA_SEP_KEYSTORE_WAIT=2
+    export AURORA_DRACUT_CONF_DIR="$FIXTURE/dracut.conf.d" AURORA_MKINITCPIO_CONF="$FIXTURE/none"
+    rekey
+  )
+}
+tokens() {
+  cryptsetup luksDump --dump-json-metadata "$ROOT_DEVICE" |
+    python3 -c 'import json,sys; print(" ".join(sorted(t["aurora_sep_role"] for t in json.load(sys.stdin)["tokens"].values())))'
+}
+
+# 4. An enclave that can open the root in the initrd: the password is sealed,
+#    not stored as a passphrase, a recovery key is made, the temporary key goes.
+new_fixture sealed
+sep_fixture 0
+cp "$FIXTURE/boot/omarchy/luks-key" "$scratch/temporary-key"
+sep_rekey
+[[ $(tokens) == 'recovery user' ]]
+[[ $(slots) == '1 2' ]]
+! cryptsetup open --test-passphrase --key-file "$scratch/temporary-key" "$ROOT_DEVICE" 2>/dev/null
+[[ -f $FIXTURE/state/disk-sealed && -f $FIXTURE/state/disk-rekeyed ]]
+[[ $(stat -c %a "$FIXTURE/state/recovery-key") == 600 && $(stat -c %s "$FIXTURE/state/recovery-key") == 24 ]]
+cryptsetup open --test-passphrase --key-file "$FIXTURE/state/recovery-key" "$ROOT_DEVICE"
+grep -qx alice "$FIXTURE/state/recovery-key-user"
+grep -qx 'phase=finished' "$FIXTURE/boot/omarchy/encrypt.state"
+for file in state/luks-key boot/omarchy/luks-key boot/omarchy/luks-header-before-recovery.bin rekey/password rekey/user; do
+  [[ ! -e $FIXTURE/$file ]] || { echo "$file survived the seal" >&2; exit 1; }
+done
+grep -qx 'systemctl enable aurora-recovery-key.service aurora-recovery-key-done.path' "$scratch/calls"
+# The initramfs is told to load the enclave driver for the sealed root, and rebuilt.
+grep -qx 'add_dracutmodules+=" aurora-sep "' "$FIXTURE/dracut.conf.d/90-aurora-sep-root.conf"
+grep -qx 'aurora_sep_password_unlock="yes"' "$FIXTURE/dracut.conf.d/90-aurora-sep-root.conf"
+grep -qx 'dracut --regenerate-all --force' "$scratch/calls"
+grep -qx 'systemctl start --no-block aurora-recovery-key.service' "$scratch/calls"
+# The recovery key is shown once on the console, then every stored copy goes.
+printf '\n' | env AURORA_FIRSTBOOT_STATE="$FIXTURE/state" AURORA_RECOVERY_HANDOFF="$FIXTURE/run/handoff" \
+  PATH="$scratch/bin:$PATH" bash "$repo/libexec/aurora-recovery-key" --console > "$scratch/shown"
+grep -q 'Your recovery key' "$scratch/shown"
+[[ ! -e $FIXTURE/state/recovery-key && -f $FIXTURE/state/recovery-key-shown ]]
+# A repeated hand-over finds nothing to do.
+printf '%s' "$password" > "$FIXTURE/rekey/password"
+sep_rekey
+[[ $(tokens) == 'recovery user' && $(slots) == '1 2' ]]
+printf 'PASS Secure Enclave seal, recovery key shown once, temporary key retired\n'
+
+# 5. An enclave behind the xART guard cannot open a user's bag in the initrd:
+#    the password becomes a LUKS passphrase, as before.
+new_fixture guarded
+sep_fixture 1
+sep_rekey
+[[ $(slots) == '1 2' && -z $(tokens) && ! -e $FIXTURE/state/disk-sealed ]]
+[[ ! -e $FIXTURE/dracut.conf.d/90-aurora-sep-root.conf ]]
+grep -qx alice "$FIXTURE/state/recovery-key-user"
+printf '%s' "$password" | cryptsetup open --test-passphrase --key-slot 1 --key-file=- "$ROOT_DEVICE"
+printf 'PASS a guarded enclave keeps the passphrase path\n'
 echo 'PASS loop rekey'
+
