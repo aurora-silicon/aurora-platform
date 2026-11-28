@@ -205,7 +205,7 @@ omarchy_mac_encrypt_open_continue() {
     omarchy_mac_encrypt_point_sysroot
     return
   fi
-  local key=$BOOT_MNT/omarchy/luks-key answer attempt
+  local key=$BOOT_MNT/omarchy/luks-key answer attempt cache_key
   if [[ -f $key && ! -L $key && $(stat -c %s "$key") -eq $KEY_BYTES ]]; then
     BOOT_KEY=$key
     if omarchy_mac_encrypt_open; then
@@ -215,12 +215,21 @@ omarchy_mac_encrypt_open_continue() {
     fi
   fi
   for attempt in 1 2 3; do
-    # Match systemd-cryptsetup's short-lived cache for GDM's pam_gdm handoff.
-    answer=$(systemd-ask-password --timeout=0 --id=aurora-root --keyname=cryptsetup 'Unlock Aurora root:') || return 1
+    # Do not cache answers until cryptsetup has verified them.
+    answer=$(systemd-ask-password --timeout=0 --id=aurora-root 'Unlock Aurora root:') || return 1
     if printf '%s' "$answer" | cryptsetup open --key-file=- "$ROOT_DEV" root; then
-      unset answer
       udevadm settle
       aurora_verify_opened_root
+      # Replace the payload: systemd appends only distinct answers, which can
+      # leave a stale last entry for pam_gdm even after a successful retry.
+      # Match systemd's user:cryptsetup key in root's user keyring and its
+      # default 150-second expiry (src/shared/ask-password-api.c).
+      if cache_key=$(printf '%s' "$answer" | keyctl padd user cryptsetup @u 2>/dev/null); then
+        if ! keyctl timeout "$cache_key" 150 2>/dev/null; then
+          keyctl revoke "$cache_key" 2>/dev/null || true
+        fi
+      fi
+      unset answer
       omarchy_mac_encrypt_point_sysroot
       return
     fi

@@ -4,7 +4,7 @@ check() { [[ -f /etc/aurora/image-layout ]] || return 1; return 0; }
 depends() { echo 'systemd crypt btrfs'; }
 install() {
   local binary unit layout=${AURORA_IMAGE_LAYOUT:-/etc/aurora/image-layout}
-  for binary in bash cryptsetup btrfs blkid lsblk awk findmnt mount umount readlink stat modprobe \
+  for binary in bash cryptsetup keyctl btrfs blkid lsblk awk findmnt mount umount readlink stat modprobe \
     mkdir chmod dd date cat mv sync install grep sed kill sleep tr; do
     inst_binary "$(command -v "$binary")" || return 1
   done
