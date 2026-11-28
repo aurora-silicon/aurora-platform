@@ -215,7 +215,8 @@ omarchy_mac_encrypt_open_continue() {
     fi
   fi
   for attempt in 1 2 3; do
-    answer=$(systemd-ask-password --timeout=0 --id=aurora-root 'Unlock Aurora root:') || return 1
+    # Match systemd-cryptsetup's short-lived cache for GDM's pam_gdm handoff.
+    answer=$(systemd-ask-password --timeout=0 --id=aurora-root --keyname=cryptsetup 'Unlock Aurora root:') || return 1
     if printf '%s' "$answer" | cryptsetup open --key-file=- "$ROOT_DEV" root; then
       unset answer
       udevadm settle
